@@ -1950,6 +1950,15 @@ html.control-glass-svg-ok #visual-guide-btn:hover{
 .gesture-legend{font-size:10px;color:rgba(255,255,255,.4);margin-top:6px;line-height:1.5}
 #hand-canvas{position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:22;opacity:0;transition:opacity .35s}
 #hand-canvas.show{opacity:1}
+.mobile-gesture-btn{display:none;position:fixed;right:14px;bottom:calc(env(safe-area-inset-bottom,0px) + 92px);z-index:24;width:46px;height:46px;border:1px solid rgba(255,255,255,.16);border-radius:50%;background:rgba(10,12,18,.44);box-shadow:0 14px 38px rgba(0,0,0,.32),inset 0 1px 0 rgba(255,255,255,.22);backdrop-filter:blur(22px) saturate(1.25);-webkit-backdrop-filter:blur(22px) saturate(1.25);align-items:center;justify-content:center;padding:0;touch-action:manipulation;transition:transform .22s,opacity .22s,background .22s,border-color .22s,box-shadow .22s}
+.mobile-gesture-btn:active{transform:scale(.94)}
+.mobile-gesture-btn.active{border-color:rgba(235,210,154,.62);background:rgba(235,210,154,.22);box-shadow:0 16px 44px rgba(235,210,154,.18),inset 0 1px 0 rgba(255,255,255,.28)}
+.mobile-gesture-btn.loading{opacity:.72}
+.mobile-gesture-icon{position:relative;width:22px;height:16px;border:2px solid rgba(255,255,255,.86);border-radius:6px;box-sizing:border-box}
+.mobile-gesture-icon::before{content:'';position:absolute;left:4px;top:-6px;width:9px;height:5px;border:2px solid rgba(255,255,255,.86);border-bottom:0;border-radius:5px 5px 0 0}
+.mobile-gesture-icon::after{content:'';position:absolute;left:50%;top:50%;width:7px;height:7px;border:2px solid rgba(255,255,255,.86);border-radius:50%;transform:translate(-50%,-50%)}
+body.mobile-optimized .mobile-gesture-btn{display:flex}
+body.controls-visible.mobile-optimized .mobile-gesture-btn{bottom:calc(env(safe-area-inset-bottom,0px) + 132px)}
 
 /* ============================================================ */
 /*  响应式                                                        */
@@ -1957,6 +1966,9 @@ html.control-glass-svg-ok #visual-guide-btn:hover{
 @media (max-width:720px){
   #fx-panel,#playlist-panel{right:12px;left:12px;width:auto;top:76px;bottom:auto}
   #top-right{right:12px}
+  body.mobile-optimized #bottom-handle{bottom:calc(env(safe-area-inset-bottom,0px) + 10px);width:190px;height:34px}
+  body.mobile-optimized #bottom-handle span{width:128px;height:5px}
+  body.mobile-optimized .gesture-hud{bottom:calc(env(safe-area-inset-bottom,0px) + 144px);width:calc(100vw - 34px);border-radius:14px}
 }
 @media (max-width:520px){
   .preset-grid,.fx-toggle-grid{grid-template-columns:1fr}
@@ -2538,6 +2550,7 @@ html.control-glass-svg-ok #visual-guide-btn:hover{
   </defs>
 </svg>
 <button id="bottom-handle" type="button" aria-label="展开播放器控制台" title="播放器控制台"><span></span></button>
+<button id="mobile-gesture-btn" class="mobile-gesture-btn" type="button" aria-label="摄像头手势" aria-pressed="false" title="摄像头手势"><span class="mobile-gesture-icon" aria-hidden="true"></span></button>
 <div id="bottom-bar">
   <div id="mini-queue-popover" class="mini-queue-popover" onclick="event.stopPropagation()">
     <div class="mini-queue-head">
@@ -5450,7 +5463,7 @@ function scheduleControlsHide(delay) {
   controlsHideTimer = setTimeout(function(){
     controlsHideTimer = null;
     if (!controlsHovering) setControlsHidden(true);
-  }, delay == null ? 480 : delay);
+  }, delay == null ? (isMobileInteractionShell() ? 2600 : 480) : delay);
 }
 
 function revealBottomControls(delay) {
@@ -5460,7 +5473,7 @@ function revealBottomControls(delay) {
   if (bar) bar.classList.add('visible');
   wakeBottomHandle();
   setControlsHidden(false);
-  if (controlsAutoHide) scheduleControlsHide(delay == null ? 520 : delay);
+  if (controlsAutoHide) scheduleControlsHide(delay == null ? (isMobileInteractionShell() ? 2800 : 520) : delay);
 }
 
 function updateControlsChromeState() {
@@ -5509,7 +5522,7 @@ function toggleBottomControlsFromHandle() {
   var bar = document.getElementById('bottom-bar');
   if (!bar || document.body.classList.contains('home-controls-locked')) return;
   if (isBottomControlsSuppressedForShelf()) return;
-  revealBottomControls(900);
+  revealBottomControls(isMobileInteractionShell() ? 3200 : 900);
 }
 
 function updateControlsAutoHideFromPointer(x, y) {
@@ -5665,13 +5678,201 @@ var particlePointerLocalHit = new THREE.Vector3();
 var particlePointerQuat = new THREE.Quaternion();
 var particlePointerFrame = { dirty:false, ndcX:0, ndcY:0 };
 var CLICK_THRESHOLD = 6;  // 像素, 拖动 > 6px 视为 drag
-var UI_HIT_SELECTOR = '#search-area,#top-right,#fullscreen-diy-zone,#fx-panel,#fx-fab,#fx-fab-hide-btn,#playlist-panel,#bottom-bar,#thumb-wrap,#empty-home,#visual-guide,#trial-banner,#source-fallback-notice,.modal-mask,#toast,#ai-depth-chip,#beat-chip,#drop-overlay';
+var UI_HIT_SELECTOR = '#search-area,#top-right,#fullscreen-diy-zone,#fx-panel,#fx-fab,#fx-fab-hide-btn,#playlist-panel,#bottom-bar,#bottom-handle,#mobile-gesture-btn,#thumb-wrap,#empty-home,#visual-guide,#trial-banner,#source-fallback-notice,.modal-mask,#toast,#ai-depth-chip,#beat-chip,#drop-overlay';
 
 function isPointerOverUi(e) {
   if (!e) return false;
   var el = document.elementFromPoint(e.clientX, e.clientY);
   return !!(el && el.closest && el.closest(UI_HIT_SELECTOR));
 }
+
+function isTouchInteractionShell() {
+  if (window.desktopWindow && window.desktopWindow.isAndroid) return true;
+  if (document.documentElement.classList.contains('android-shell-root')) return true;
+  if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return true;
+  return false;
+}
+
+function isMobileInteractionShell() {
+  if (isTouchInteractionShell()) return true;
+  return innerWidth <= 720;
+}
+
+function syncMobileInteractionClass() {
+  if (!document.body) return;
+  document.body.classList.toggle('mobile-optimized', isMobileInteractionShell());
+}
+
+function syncMobileGestureButton(loading) {
+  var btn = document.getElementById('mobile-gesture-btn');
+  if (!btn) return;
+  var active = (fx && fx.cam === 'gesture') || (typeof gestureActive !== 'undefined' && gestureActive);
+  btn.classList.toggle('active', !!active);
+  btn.classList.toggle('loading', !!loading);
+  btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  btn.title = active ? '关闭摄像头手势' : '摄像头手势';
+}
+
+function toggleMobileGestureMode(e) {
+  if (e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+  setCamMode(fx && fx.cam === 'gesture' ? 'off' : 'gesture');
+  revealBottomControls(2400);
+}
+
+function closeMobileOverlayPanels() {
+  if (typeof closeMiniQueue === 'function') closeMiniQueue();
+  if (typeof toggleFxPanel === 'function') toggleFxPanel(false);
+  if (typeof togglePlaylistPanel === 'function') togglePlaylistPanel(false);
+}
+
+var mobileStagePointer = {
+  active: false,
+  pointerId: null,
+  startX: 0,
+  startY: 0,
+  lastX: 0,
+  lastY: 0,
+  lastT: 0,
+  edge: '',
+  dragging: false,
+  tapAt: 0,
+  tapX: 0,
+  tapY: 0
+};
+
+function initMobileInteractionLogic() {
+  syncMobileInteractionClass();
+  window.addEventListener('resize', syncMobileInteractionClass, { passive:true });
+  if (window.matchMedia) {
+    try {
+      var coarseQuery = window.matchMedia('(pointer: coarse)');
+      if (coarseQuery.addEventListener) coarseQuery.addEventListener('change', syncMobileInteractionClass);
+      else if (coarseQuery.addListener) coarseQuery.addListener(syncMobileInteractionClass);
+    } catch (e) {}
+  }
+  var gestureBtn = document.getElementById('mobile-gesture-btn');
+  if (gestureBtn) gestureBtn.addEventListener('click', toggleMobileGestureMode);
+  syncMobileGestureButton();
+  if (!window.PointerEvent) return;
+
+  function isMobilePointer(e) {
+    return isMobileInteractionShell() && e && e.isPrimary !== false && e.pointerType !== 'mouse';
+  }
+
+  window.addEventListener('pointerdown', function(e){
+    if (!isMobilePointer(e)) return;
+    var overUi = isPointerOverUi(e);
+    if (overUi) {
+      if (e.clientY > innerHeight - 72) revealBottomControls(3200);
+      return;
+    }
+    var edge = '';
+    var systemBackInset = 28;
+    var sideRail = Math.min(96, Math.max(58, innerWidth * 0.09));
+    if (e.clientX >= systemBackInset && e.clientX <= sideRail) edge = 'left';
+    else if (e.clientX <= innerWidth - systemBackInset && e.clientX >= innerWidth - sideRail) edge = 'right';
+    else if (e.clientY > innerHeight - 72) edge = 'bottom';
+    mobileStagePointer.active = true;
+    mobileStagePointer.pointerId = e.pointerId;
+    mobileStagePointer.startX = mobileStagePointer.lastX = e.clientX;
+    mobileStagePointer.startY = mobileStagePointer.lastY = e.clientY;
+    mobileStagePointer.lastT = performance.now();
+    mobileStagePointer.edge = edge;
+    mobileStagePointer.dragging = false;
+    queueParticlePointerFrame(e.clientX, e.clientY);
+    if (!edge) {
+      markRenderInteraction('mobile-stage-touch', 1200);
+      idleGuidePointerDown(e);
+    }
+  }, { passive:true, capture:true });
+
+  window.addEventListener('pointermove', function(e){
+    if (!mobileStagePointer.active || e.pointerId !== mobileStagePointer.pointerId) return;
+    if (!isMobilePointer(e)) return;
+    var dxTotal = e.clientX - mobileStagePointer.startX;
+    var dyTotal = e.clientY - mobileStagePointer.startY;
+    var moved = Math.hypot(dxTotal, dyTotal);
+    if (moved > CLICK_THRESHOLD) mobileStagePointer.dragging = true;
+    if (!mobileStagePointer.edge && !isPointerOverUi(e)) {
+      var nowMove = performance.now();
+      var dt = Math.max(1 / 120, Math.min(0.08, (nowMove - mobileStagePointer.lastT) / 1000 || 1 / 60));
+      var dx = e.clientX - mobileStagePointer.lastX;
+      var dy = e.clientY - mobileStagePointer.lastY;
+      if (mobileStagePointer.dragging) {
+        unlockCenteredView();
+        applyParticleSpinDrag(dx, dy, dt);
+        markRenderInteraction('mobile-stage-drag', 900);
+        if (e.cancelable) e.preventDefault();
+      }
+      idleGuidePointerMove(e);
+      queueParticlePointerFrame(e.clientX, e.clientY);
+      mobileStagePointer.lastX = e.clientX;
+      mobileStagePointer.lastY = e.clientY;
+      mobileStagePointer.lastT = nowMove;
+    }
+  }, { passive:false, capture:true });
+
+  window.addEventListener('pointerup', function(e){
+    if (!mobileStagePointer.active || e.pointerId !== mobileStagePointer.pointerId) return;
+    if (!isMobilePointer(e)) return;
+    var dx = e.clientX - mobileStagePointer.startX;
+    var dy = e.clientY - mobileStagePointer.startY;
+    var dist = Math.hypot(dx, dy);
+    var handled = false;
+
+    if (mobileStagePointer.edge === 'left' && dx > 72 && Math.abs(dy) < 92) {
+      openPlaylistPanelTab((playQueue && playQueue.length) ? 'queue' : 'playlists', false);
+      revealBottomControls(2200);
+      handled = true;
+    } else if (mobileStagePointer.edge === 'right' && dx < -72 && Math.abs(dy) < 92) {
+      toggleFxPanel(true);
+      revealBottomControls(2200);
+      handled = true;
+    } else if (mobileStagePointer.edge === 'bottom' && dy < -44) {
+      revealBottomControls(3600);
+      handled = true;
+    } else if (dy > 82 && dist > 90) {
+      closeMobileOverlayPanels();
+      handled = true;
+    }
+
+    if (!handled && !mobileStagePointer.edge && !isPointerOverUi(e)) {
+      if (!mobileStagePointer.dragging && dist <= CLICK_THRESHOLD + 3) {
+        var nowTap = performance.now();
+        var isDoubleTap = mobileStagePointer.tapAt &&
+          nowTap - mobileStagePointer.tapAt < 330 &&
+          Math.hypot(e.clientX - mobileStagePointer.tapX, e.clientY - mobileStagePointer.tapY) < 34;
+        if (isDoubleTap && typeof togglePlay === 'function') {
+          mobileStagePointer.tapAt = 0;
+          togglePlay();
+        } else {
+          mobileStagePointer.tapAt = nowTap;
+          mobileStagePointer.tapX = e.clientX;
+          mobileStagePointer.tapY = e.clientY;
+          revealBottomControls(3200);
+        }
+      } else if (mobileStagePointer.dragging) {
+        revealBottomControls(1800);
+      }
+    }
+
+    if (!mobileStagePointer.edge) idleGuidePointerUp();
+    mobileStagePointer.active = false;
+    mobileStagePointer.pointerId = null;
+  }, { passive:true, capture:true });
+
+  window.addEventListener('pointercancel', function(e){
+    if (!mobileStagePointer.active || e.pointerId !== mobileStagePointer.pointerId) return;
+    if (!mobileStagePointer.edge) idleGuidePointerUp();
+    mobileStagePointer.active = false;
+    mobileStagePointer.pointerId = null;
+  }, { passive:true, capture:true });
+}
+
+initMobileInteractionLogic();
 
 function particleLocalPointFromNdc(ndcX, ndcY, out) {
   particlePointerNdc.set(ndcX, ndcY);
@@ -5814,6 +6015,10 @@ renderer.domElement.addEventListener('wheel', function(e){
 // 双击屏幕回正 — 不命中卡片时
 renderer.domElement.addEventListener('dblclick', function(e){
   if (isPointerOverUi(e)) return;
+  if (isTouchInteractionShell()) {
+    e.preventDefault();
+    return;
+  }
   if (freeCamera && freeCamera.locked) {
     resetFreeCameraToDefault();
     resetSkullPresetView(false, { smooth:true, keepLyricLock:true });
@@ -21822,6 +22027,7 @@ function updateFxInputs() {
   document.querySelectorAll('#shelf-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.shelf === fx.shelf); });
   updateShelfControlUi();
   document.querySelectorAll('#cam-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.cam === fx.cam); });
+  syncMobileGestureButton();
   refreshPresetGrid();
   updateLyricColorControls();
   updateLyricHighlightControls();
@@ -22937,6 +23143,7 @@ function setCamMode(m) {
   if (m === 'head') m = 'gesture'; // v8: 头部追踪已下线, 兼容旧设置
   fx.cam = m;
   document.querySelectorAll('#cam-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.cam === m); });
+  syncMobileGestureButton(m === 'gesture');
   if (m === 'off') stopGestureControl();
   else if (m === 'gesture') startGestureControl();
   saveLyricLayout();
@@ -25452,7 +25659,11 @@ var handCanvas = null, handCanvasCtx = null;
 var HAND_SMOOTH_ALPHA = 0.35;
 
 async function startGestureControl() {
-  if (gestureActive) return;
+  if (gestureActive) {
+    syncMobileGestureButton(false);
+    return;
+  }
+  syncMobileGestureButton(true);
   showToast('正在加载手势识别…');
   try {
     await loadScriptOnce('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
@@ -25478,18 +25689,28 @@ async function startGestureControl() {
     handCanvasCtx = handCanvas.getContext('2d');
     resizeHandCanvas();
     handCanvas.classList.add('show');
+    syncMobileGestureButton(false);
     showToast('手势已开启: 手掌推开 · 捏合旋转 · 握拳收束');
     showGestureHUD('待命', 0, '把手放进视野');
   } catch (e) {
     console.warn('Gesture failed:', e);
     showToast('手势启动失败 (需要摄像头权限)');
+    try { if (gestureCamera && gestureCamera.stop) gestureCamera.stop(); } catch(cleanErr){}
+    try { if (gestureVideo && gestureVideo.srcObject) gestureVideo.srcObject.getTracks().forEach(function(t){ t.stop(); }); } catch(cleanErr2){}
+    try { if (gestureVideo) gestureVideo.remove(); } catch(cleanErr3){}
+    gestureVideo = null; gestureHands = null; gestureCamera = null; gestureActive = false;
     fx.cam = 'off';
     document.querySelectorAll('#cam-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.cam === 'off'); });
+    syncMobileGestureButton(false);
+    saveLyricLayout();
   }
 }
 
 function stopGestureControl() {
-  if (!gestureActive) return;
+  if (!gestureActive) {
+    syncMobileGestureButton(false);
+    return;
+  }
   try { if (gestureCamera && gestureCamera.stop) gestureCamera.stop(); } catch(e){}
   try { if (gestureVideo && gestureVideo.srcObject) gestureVideo.srcObject.getTracks().forEach(function(t){ t.stop(); }); } catch(e){}
   try { if (gestureVideo) gestureVideo.remove(); } catch(e){}
@@ -25502,11 +25723,13 @@ function stopGestureControl() {
   gestureGrip.value = 0;
   gestureGrip.target = 0;
   gestureGrip.openness = 1;
-  document.getElementById('gesture-hud').classList.remove('show');
+  var gestureHud = document.getElementById('gesture-hud');
+  if (gestureHud) gestureHud.classList.remove('show');
   if (handCanvas) {
     handCanvas.classList.remove('show');
     if (handCanvasCtx) handCanvasCtx.clearRect(0, 0, handCanvas.width, handCanvas.height);
   }
+  syncMobileGestureButton(false);
 }
 
 function resizeHandCanvas() {

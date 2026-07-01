@@ -1,7 +1,9 @@
 package com.mineradio.android;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
@@ -13,6 +15,7 @@ import android.view.Window;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -45,6 +48,7 @@ public class MainActivity extends Activity {
     private static final int NODE_PORT = 3000;
     private static final int REQUEST_LOGIN = 9101;
     private static final int REQUEST_IMPORT_JSON = 9102;
+    private static final int REQUEST_CAMERA_PERMISSION = 9103;
     private static boolean nodeStarted = false;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -53,6 +57,7 @@ public class MainActivity extends Activity {
     private ProgressBar progressBar;
     private String pendingLoginToken;
     private String pendingImportToken;
+    private PermissionRequest pendingWebPermissionRequest;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -104,8 +109,42 @@ public class MainActivity extends Activity {
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, true);
         view.setWebViewClient(new WebViewClient());
-        view.setWebChromeClient(new WebChromeClient());
+        view.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                runOnUiThread(() -> handleWebPermissionRequest(request));
+            }
+
+            @Override
+            public void onPermissionRequestCanceled(PermissionRequest request) {
+                if (pendingWebPermissionRequest == request) {
+                    pendingWebPermissionRequest = null;
+                }
+            }
+        });
         view.addJavascriptInterface(new AndroidBridge(), "MineradioAndroid");
+    }
+
+    private void handleWebPermissionRequest(PermissionRequest request) {
+        if (request == null || !hasVideoCaptureResource(request)) {
+            if (request != null) request.deny();
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            request.grant(new String[] { PermissionRequest.RESOURCE_VIDEO_CAPTURE });
+            return;
+        }
+        pendingWebPermissionRequest = request;
+        requestPermissions(new String[] { Manifest.permission.CAMERA }, REQUEST_CAMERA_PERMISSION);
+    }
+
+    private boolean hasVideoCaptureResource(PermissionRequest request) {
+        String[] resources = request.getResources();
+        if (resources == null) return false;
+        for (String resource : resources) {
+            if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource)) return true;
+        }
+        return false;
     }
 
     private void startNodeAndLoad() {
@@ -314,6 +353,21 @@ public class MainActivity extends Activity {
             "window.__mineradioAndroidResolve && window.__mineradioAndroidResolve("
                 + JSONObject.quote(token) + "," + payload.toString() + ");",
             null));
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_CAMERA_PERMISSION) return;
+        PermissionRequest request = pendingWebPermissionRequest;
+        pendingWebPermissionRequest = null;
+        if (request == null) return;
+        boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (granted) {
+            request.grant(new String[] { PermissionRequest.RESOURCE_VIDEO_CAPTURE });
+        } else {
+            request.deny();
+        }
     }
 
     @Override
