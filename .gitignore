@@ -45,3 +45,15 @@ tmp/
 *.png.tmp
 verification/
 screenshots/
+
+# Android local build and portable toolchain
+android/.gradle/
+android/app/.cxx/
+android/app/build/
+android/app/libnode/
+android/app/src/main/assets/nodejs-project.*
+android/app/src/main/jniLibs/
+android/app/src/main/res/drawable/icon.png
+tools/
+work/
+outputs/
