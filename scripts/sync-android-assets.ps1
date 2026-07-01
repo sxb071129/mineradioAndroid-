@@ -10,6 +10,22 @@ $libnodeUrl = 'https://github.com/nodejs-mobile/nodejs-mobile/releases/download/
 $stage = Join-Path $root 'work\android-nodejs-project'
 $zipPath = Join-Path $assets 'nodejs-project.zip'
 $versionPath = Join-Path $assets 'nodejs-project.version'
+$androidSdk = $env:ANDROID_SDK_ROOT
+if (-not $androidSdk) {
+  $androidSdk = Join-Path $root 'tools\android-sdk'
+}
+$ndkRoot = $env:ANDROID_NDK_HOME
+if (-not $ndkRoot) {
+  $ndkRoot = Get-ChildItem -Directory (Join-Path $androidSdk 'ndk') |
+    Sort-Object Name -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+}
+$llvmPrebuilt = Get-ChildItem -Directory (Join-Path $ndkRoot 'toolchains\llvm\prebuilt') |
+  Select-Object -First 1 -ExpandProperty FullName
+$cxxRuntimeTriples = @{
+  'arm64-v8a' = 'aarch64-linux-android'
+  'x86_64' = 'x86_64-linux-android'
+}
 
 if (-not (Test-Path $libnodeSource)) {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $libnodeZip) | Out-Null
@@ -36,6 +52,11 @@ foreach ($abi in @('arm64-v8a', 'x86_64')) {
   $abiDir = Join-Path $app "src\main\jniLibs\$abi"
   New-Item -ItemType Directory -Force -Path $abiDir | Out-Null
   Copy-Item -Force (Join-Path $libnodeSource "bin\$abi\libnode.so") (Join-Path $abiDir 'libnode.so')
+  $cxxRuntime = Join-Path $llvmPrebuilt "sysroot\usr\lib\$($cxxRuntimeTriples[$abi])\libc++_shared.so"
+  if (-not (Test-Path $cxxRuntime)) {
+    throw "Missing C++ shared runtime for $abi at $cxxRuntime"
+  }
+  Copy-Item -Force $cxxRuntime (Join-Path $abiDir 'libc++_shared.so')
 }
 
 Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
@@ -50,7 +71,24 @@ foreach ($file in @('server.js', 'dj-analyzer.js', 'package.json', 'package-lock
 }
 
 Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -CompressionLevel Optimal
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$stageRoot = (Resolve-Path $stage).Path.TrimEnd('\') + '\'
+$archive = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+  Get-ChildItem -LiteralPath $stage -Recurse -Force |
+    Where-Object { -not $_.PSIsContainer } |
+    ForEach-Object {
+      $entryName = $_.FullName.Substring($stageRoot.Length).Replace('\', '/')
+      [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+        $archive,
+        $_.FullName,
+        $entryName,
+        [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+    }
+} finally {
+  $archive.Dispose()
+}
 
 $hash = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant()
 Set-Content -Path $versionPath -Value $hash -Encoding ASCII

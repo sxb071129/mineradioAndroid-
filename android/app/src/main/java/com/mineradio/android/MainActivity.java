@@ -116,12 +116,20 @@ public class MainActivity extends Activity {
                 if (!nodeStarted) {
                     nodeStarted = true;
                     Thread nodeThread = new Thread(() -> {
-                        String[] args = new String[] {
-                            "node",
-                            new File(projectDir, "android-main.js").getAbsolutePath()
-                        };
-                        String[] env = nodeEnvironment(projectDir);
-                        NodeRuntime.startNodeWithArguments(args, env);
+                        try {
+                            String[] args = new String[] {
+                                "node",
+                                new File(projectDir, "android-main.js").getAbsolutePath()
+                            };
+                            String[] env = nodeEnvironment(projectDir);
+                            int exitCode = NodeRuntime.startNodeWithArguments(args, env);
+                            if (exitCode != 0) {
+                                showStartupFailure("Node service exited with code " + exitCode);
+                            }
+                        } catch (Throwable error) {
+                            nodeStarted = false;
+                            showStartupFailure(error.getMessage());
+                        }
                     }, "Mineradio-Node");
                     nodeThread.setDaemon(false);
                     nodeThread.start();
@@ -132,10 +140,15 @@ public class MainActivity extends Activity {
                     statusView.setVisibility(android.view.View.GONE);
                     webView.loadUrl("http://127.0.0.1:" + NODE_PORT + "/");
                 });
-            } catch (Exception e) {
-                runOnUiThread(() -> statusView.setText("Startup failed: " + e.getMessage()));
+            } catch (Throwable e) {
+                showStartupFailure(e.getMessage());
             }
         });
+    }
+
+    private void showStartupFailure(String message) {
+        String detail = message == null || message.isEmpty() ? "unknown error" : message;
+        runOnUiThread(() -> statusView.setText("Startup failed: " + detail));
     }
 
     private File prepareNodeProject() throws Exception {
@@ -160,6 +173,7 @@ public class MainActivity extends Activity {
         env.put("NODE_ENV", "production");
         env.put("HOST", "127.0.0.1");
         env.put("PORT", String.valueOf(NODE_PORT));
+        env.put("TMPDIR", getCacheDir().getAbsolutePath());
         env.put("COOKIE_FILE", new File(getFilesDir(), ".cookie").getAbsolutePath());
         env.put("QQ_COOKIE_FILE", new File(getFilesDir(), ".qq-cookie").getAbsolutePath());
         env.put("KUGOU_COOKIE_FILE", new File(getFilesDir(), ".kugou-cookie").getAbsolutePath());

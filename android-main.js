@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 process.chdir(__dirname);
@@ -17,5 +18,10 @@ try {
 } catch (error) {
   console.warn("[Android] environment load skipped:", error.message);
 }
+
+const androidTempDir = process.env.TMPDIR || path.join(__dirname, ".tmp");
+fs.mkdirSync(androidTempDir, { recursive: true });
+process.env.TMPDIR = androidTempDir;
+os.tmpdir = () => androidTempDir;
 
 require("./server.js");
