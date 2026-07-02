@@ -99,6 +99,11 @@ body.custom-background-override #album-bg{opacity:0!important}
 #canvas-container canvas{display:block;width:100%!important;height:100%!important}
 #canvas-container:focus,#canvas-container:focus-visible,#canvas-container canvas:focus,#canvas-container canvas:focus-visible,html:focus,html:focus-visible,body:focus,body:focus-visible{outline:none!important;box-shadow:none!important}
 #canvas-container canvas{outline:none!important;border:0!important}
+html,body,*{-webkit-tap-highlight-color:rgba(0,0,0,0)!important}
+button,a,input,select,textarea,label,[role="button"],[tabindex],[onclick],.ctrl-btn,.icon-btn,.home-card,.home-tile,.home-chip,.song-action-btn,.queue-item,.mini-queue-item{touch-action:manipulation;-webkit-tap-highlight-color:rgba(0,0,0,0)!important}
+button,input[type="button"],input[type="submit"],input[type="reset"]{-webkit-appearance:none;appearance:none}
+button:focus,a:focus,input:focus,select:focus,textarea:focus,[role="button"]:focus,[tabindex]:focus{outline:none!important}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[role="button"]:focus-visible,[tabindex]:focus-visible{outline:none!important}
 body.render-deep-sleep #canvas-container,body.render-deep-sleep #idle-guide-canvas,body.render-deep-sleep #splash-canvas,body.render-deep-sleep #hand-canvas{opacity:0!important;visibility:hidden!important}
 body.splash-active:not(.splash-revealing) #canvas-container{opacity:.16;transform:scale(1)}
 body.splash-active.splash-revealing #canvas-container{opacity:1;transform:scale(1)}
@@ -347,6 +352,27 @@ body.empty-home-active.controls-visible #empty-home{bottom:128px}
 @media (max-width:620px){#empty-home{top:146px;bottom:44px;width:calc(100vw - 24px)}.home-hero{padding:20px;border-radius:22px}.home-hero-inner{display:flex;flex-direction:column}.home-visual{display:none}.home-mosaic{display:none}.home-grid{grid-template-columns:1fr}.home-tile-row{grid-template-columns:repeat(2,minmax(0,1fr))}.home-tile-cover{height:auto;aspect-ratio:1}.home-tile-sub{display:block}.home-card-art{width:88px;height:88px}.home-card-title,.home-card-sub{max-width:68%}}
 .home-visual.generated{height:74px!important;max-width:300px!important;align-self:center!important}
 @media (max-height:760px){.home-visual.generated{height:64px!important;max-width:260px!important}}
+@media (orientation:portrait){
+  body.mobile-optimized #empty-home,body.android-shell #empty-home{top:124px;bottom:116px;width:calc(100vw - 28px);overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:0 0 18px}
+  body.mobile-optimized .empty-home-shell,body.android-shell .empty-home-shell{height:auto;min-height:100%;display:flex;flex-direction:column;gap:12px;overflow:visible;padding-bottom:0}
+  body.mobile-optimized .home-hero,body.android-shell .home-hero{grid-row:auto;min-height:0;padding:20px;border-radius:22px}
+  body.mobile-optimized .home-hero-inner,body.android-shell .home-hero-inner{grid-template-columns:minmax(0,1fr)}
+  body.mobile-optimized .home-visual,body.android-shell .home-visual,body.mobile-optimized .home-mosaic,body.android-shell .home-mosaic{display:none!important}
+  body.mobile-optimized .home-grid,body.android-shell .home-grid{grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px}
+  body.mobile-optimized .home-hero,body.android-shell .home-hero,body.mobile-optimized .home-card,body.android-shell .home-card,body.mobile-optimized .home-rail,body.android-shell .home-rail,body.mobile-optimized .home-tile,body.android-shell .home-tile{width:100%;max-width:100%;min-width:0}
+  body.mobile-optimized .home-rail,body.android-shell .home-rail{min-height:0;overflow:visible;display:flex;flex-direction:column}
+  body.mobile-optimized .home-tile-row,body.android-shell .home-tile-row{display:flex;flex-direction:column;gap:10px;min-height:0;height:auto;width:100%;max-width:100%;overflow:visible;scroll-snap-type:y proximity;padding-right:0}
+  body.mobile-optimized .home-tile,body.android-shell .home-tile{display:grid;grid-template-columns:84px minmax(0,1fr);grid-template-rows:auto auto;column-gap:12px;row-gap:4px;align-items:center;min-height:104px;padding:10px 12px;border-radius:18px;scroll-snap-align:start}
+  body.mobile-optimized .home-tile-cover,body.android-shell .home-tile-cover{grid-row:1 / span 2;width:84px;height:84px;aspect-ratio:auto;margin:0;border-radius:14px}
+  body.mobile-optimized .home-tile-title,body.android-shell .home-tile-title{align-self:end;font-size:13px;line-height:1.25;-webkit-line-clamp:1}
+  body.mobile-optimized .home-tile-sub,body.android-shell .home-tile-sub{display:block;align-self:start;margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+}
+@media (orientation:portrait) and (max-width:620px){
+  body.mobile-optimized #empty-home,body.android-shell #empty-home{top:118px;bottom:112px;width:calc(100vw - 22px)}
+  body.mobile-optimized .home-grid,body.android-shell .home-grid{grid-template-columns:1fr}
+  body.mobile-optimized .home-tile,body.android-shell .home-tile{grid-template-columns:78px minmax(0,1fr);min-height:98px}
+  body.mobile-optimized .home-tile-cover,body.android-shell .home-tile-cover{width:78px;height:78px}
+}
 
 /* ---------- 顶部右侧按钮 ---------- */
 #top-right{position:fixed;z-index:10;top:24px;right:24px;display:flex;align-items:center;gap:10px}
@@ -456,6 +482,42 @@ body.desktop-shell.desktop-fullscreen .home-mosaic-cell.has-cover,html:fullscree
 }
 body.desktop-shell.empty-home-active.controls-visible #empty-home{bottom:126px}
 @media (max-height:760px){body.desktop-shell.empty-home-active.controls-visible #empty-home{bottom:106px}}
+@media (orientation:portrait){
+  body.android-shell.desktop-shell #empty-home,body.mobile-optimized.desktop-shell #empty-home{left:14px;right:14px;top:124px;bottom:116px;width:auto;max-width:none;transform:translateY(18px) scale(.992);overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:0 0 18px}
+  body.android-shell.desktop-shell.empty-home-active #empty-home,body.mobile-optimized.desktop-shell.empty-home-active #empty-home{transform:translateY(0) scale(1)}
+  body.android-shell.desktop-shell.controls-visible #empty-home,body.mobile-optimized.desktop-shell.controls-visible #empty-home{bottom:calc(env(safe-area-inset-bottom,0px) + clamp(190px,28vh,310px))}
+  body.android-shell.desktop-shell .empty-home-shell,body.mobile-optimized.desktop-shell .empty-home-shell{height:auto;min-height:100%;display:flex!important;flex-direction:column;gap:10px;overflow:visible;padding-bottom:0}
+  body.android-shell.desktop-shell .home-hero,body.mobile-optimized.desktop-shell .home-hero{grid-row:auto;min-height:0;width:100%;max-width:100%;padding:16px 18px;border-radius:20px}
+  body.android-shell.desktop-shell .home-hero::after,body.mobile-optimized.desktop-shell .home-hero::after{left:18px;right:18px;bottom:14px}
+  body.android-shell.desktop-shell .home-hero-inner,body.mobile-optimized.desktop-shell .home-hero-inner,body.android-shell.desktop-shell .home-hero-inner.home-construction-inner,body.mobile-optimized.desktop-shell .home-hero-inner.home-construction-inner{display:flex!important;flex-direction:column;justify-content:flex-start;align-items:flex-start;min-height:0;height:auto;width:100%;max-width:100%;padding:0}
+  body.android-shell.desktop-shell .home-kicker,body.mobile-optimized.desktop-shell .home-kicker{margin-bottom:8px;font-size:9.5px;max-width:100%}
+  body.android-shell.desktop-shell .home-title,body.mobile-optimized.desktop-shell .home-title,body.android-shell.desktop-shell .home-title.home-construction-title,body.mobile-optimized.desktop-shell .home-title.home-construction-title{font-size:clamp(25px,7.6vw,36px);line-height:1.08;max-width:100%;word-break:keep-all}
+  body.android-shell.desktop-shell .home-sub,body.mobile-optimized.desktop-shell .home-sub{margin-top:9px;font-size:12px;line-height:1.45;max-width:100%;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  body.android-shell.desktop-shell .home-weather-meta,body.mobile-optimized.desktop-shell .home-weather-meta{margin-top:10px;gap:6px}
+  body.android-shell.desktop-shell .home-weather-pill,body.mobile-optimized.desktop-shell .home-weather-pill{height:25px;padding:0 9px;font-size:10.5px}
+  body.android-shell.desktop-shell .home-quick-row,body.mobile-optimized.desktop-shell .home-quick-row{width:100%;max-width:100%;margin-top:12px;gap:7px}
+  body.android-shell.desktop-shell .home-chip,body.mobile-optimized.desktop-shell .home-chip{height:31px;min-width:0;padding:0 12px;font-size:11px;white-space:nowrap}
+  body.android-shell.desktop-shell .home-visual,body.mobile-optimized.desktop-shell .home-visual,body.android-shell.desktop-shell .home-mosaic,body.mobile-optimized.desktop-shell .home-mosaic{display:none!important}
+  body.android-shell.desktop-shell .home-grid,body.mobile-optimized.desktop-shell .home-grid{display:flex!important;flex-direction:column;grid-template-columns:none!important;gap:10px;width:100%;max-width:100%;overflow:visible}
+  body.android-shell.desktop-shell .home-card,body.mobile-optimized.desktop-shell .home-card{min-height:92px;padding:12px;border-radius:17px}
+  body.android-shell.desktop-shell .home-card-title,body.mobile-optimized.desktop-shell .home-card-title{font-size:14px;max-width:calc(100% - 72px);line-height:1.18}
+  body.android-shell.desktop-shell .home-card-sub,body.mobile-optimized.desktop-shell .home-card-sub{font-size:10.2px;line-height:1.25;max-width:calc(100% - 72px);-webkit-line-clamp:2}
+  body.android-shell.desktop-shell .home-card-art,body.mobile-optimized.desktop-shell .home-card-art{right:10px;bottom:10px;width:58px;height:58px;border-radius:14px}
+  body.android-shell.desktop-shell .home-title,body.mobile-optimized.desktop-shell .home-title,body.android-shell.desktop-shell .home-sub,body.mobile-optimized.desktop-shell .home-sub,body.android-shell.desktop-shell .home-section-head,body.mobile-optimized.desktop-shell .home-section-head,body.android-shell.desktop-shell .home-card-title,body.mobile-optimized.desktop-shell .home-card-title,body.android-shell.desktop-shell .home-card-sub,body.mobile-optimized.desktop-shell .home-card-sub,body.android-shell.desktop-shell .home-tile-title,body.mobile-optimized.desktop-shell .home-tile-title,body.android-shell.desktop-shell .home-tile-sub,body.mobile-optimized.desktop-shell .home-tile-sub{min-width:0;overflow:hidden;text-overflow:ellipsis}
+  body.android-shell.desktop-shell .home-rail,body.mobile-optimized.desktop-shell .home-rail{display:flex!important;flex-direction:column;width:100%;max-width:100%;min-height:0;overflow:visible}
+  body.android-shell.desktop-shell .home-tile-row,body.mobile-optimized.desktop-shell .home-tile-row{display:flex!important;flex-direction:column;grid-template-columns:none!important;gap:10px;width:100%;max-width:100%;height:auto;min-height:0;overflow:visible;padding-right:0;scroll-snap-type:y proximity}
+  body.android-shell.desktop-shell .home-tile,body.mobile-optimized.desktop-shell .home-tile{display:grid;grid-template-columns:84px minmax(0,1fr);grid-template-rows:auto auto;column-gap:12px;row-gap:4px;align-items:center;width:100%;max-width:100%;min-width:0;min-height:104px;padding:10px 12px;border-radius:18px;scroll-snap-align:start}
+  body.android-shell.desktop-shell .home-tile-cover,body.mobile-optimized.desktop-shell .home-tile-cover{grid-row:1 / span 2;width:84px;height:84px;aspect-ratio:auto;margin:0;border-radius:14px}
+  body.android-shell.desktop-shell .home-tile-title,body.mobile-optimized.desktop-shell .home-tile-title{align-self:end;font-size:13px;line-height:1.25;-webkit-line-clamp:1}
+  body.android-shell.desktop-shell .home-tile-sub,body.mobile-optimized.desktop-shell .home-tile-sub{display:block;align-self:start;margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+}
+@media (orientation:portrait) and (max-width:620px){
+  body.android-shell.desktop-shell #empty-home,body.mobile-optimized.desktop-shell #empty-home{left:11px;right:11px;top:118px;bottom:112px;width:auto}
+  body.android-shell.desktop-shell.controls-visible #empty-home,body.mobile-optimized.desktop-shell.controls-visible #empty-home{bottom:calc(env(safe-area-inset-bottom,0px) + clamp(220px,32vh,340px))}
+  body.android-shell.desktop-shell .home-grid,body.mobile-optimized.desktop-shell .home-grid{grid-template-columns:1fr}
+  body.android-shell.desktop-shell .home-tile,body.mobile-optimized.desktop-shell .home-tile{grid-template-columns:78px minmax(0,1fr);min-height:98px}
+  body.android-shell.desktop-shell .home-tile-cover,body.mobile-optimized.desktop-shell .home-tile-cover{width:78px;height:78px}
+}
 #user-btn.logged-out{justify-content:center;padding:0 17px;min-width:60px;color:rgba(255,255,255,.78);font-size:13px;font-weight:650;letter-spacing:.08em;border-color:rgba(244,210,138,.28);background:rgba(255,255,255,.045);box-shadow:0 12px 34px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.08)}
 #user-btn.logged-out:hover{color:#fff2bd;border-color:rgba(244,210,138,.56);background:rgba(244,210,138,.11);box-shadow:0 16px 42px rgba(244,210,138,.10),inset 0 1px 0 rgba(255,255,255,.10)}
 #user-btn .login-word{display:block;line-height:1;transform:translateY(.5px)}
@@ -1544,6 +1606,33 @@ html.control-glass-svg-ok #bottom-bar.visible{
 }
 #bottom-bar .control-cover{
   box-shadow:0 8px 20px rgba(0,0,0,.26),inset 0 0 0 1px rgba(255,255,255,.075)!important;
+}
+#bottom-bar .ctrl-btn:focus,#bottom-bar .ctrl-btn:focus-visible,#bottom-bar #play-btn:focus,#bottom-bar #play-btn:focus-visible,
+body.mobile-optimized button:focus,body.mobile-optimized button:focus-visible,body.android-shell button:focus,body.android-shell button:focus-visible{
+  outline:none!important;
+  -webkit-tap-highlight-color:transparent!important;
+}
+#bottom-bar .ctrl-btn:focus:not(:hover){background:transparent!important}
+#bottom-bar #play-btn:focus:not(:hover){background:rgba(255,255,255,.070)!important}
+@media (hover:none),(pointer:coarse){
+  body.mobile-optimized #bottom-bar .ctrl-btn:hover,body.android-shell #bottom-bar .ctrl-btn:hover,
+  body.mobile-optimized #bottom-bar .ctrl-btn:focus,body.android-shell #bottom-bar .ctrl-btn:focus,
+  body.mobile-optimized #bottom-bar .ctrl-btn:focus-visible,body.android-shell #bottom-bar .ctrl-btn:focus-visible{
+    background:transparent!important;
+    box-shadow:none!important;
+    text-shadow:none!important;
+    transform:none!important;
+  }
+  body.mobile-optimized #bottom-bar #play-btn:hover,body.android-shell #bottom-bar #play-btn:hover,
+  body.mobile-optimized #bottom-bar #play-btn:focus,body.android-shell #bottom-bar #play-btn:focus,
+  body.mobile-optimized #bottom-bar #play-btn:focus-visible,body.android-shell #bottom-bar #play-btn:focus-visible{
+    background:rgba(255,255,255,.070)!important;
+    box-shadow:0 10px 24px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.16)!important;
+    transform:none!important;
+  }
+  body.mobile-optimized #bottom-bar .ctrl-btn:active,body.android-shell #bottom-bar .ctrl-btn:active{background:rgba(255,255,255,.035)!important;transform:scale(.96)!important}
+  body.mobile-optimized #bottom-bar #play-btn:active,body.android-shell #bottom-bar #play-btn:active{background:rgba(255,255,255,.095)!important;transform:scale(.965)!important}
+  body.mobile-optimized button,body.android-shell button,body.mobile-optimized a,body.android-shell a{-webkit-user-select:none;user-select:none}
 }
 
 .home-card[data-home-tone],.home-tile[data-home-tone]{--tone-a:var(--home-accent);--tone-b:color-mix(in srgb,var(--home-accent) 58%,#2442ff);--tone-c:color-mix(in srgb,var(--home-accent) 42%,#f8f4ee)}
@@ -2855,7 +2944,7 @@ var beatOnsetFlag = false;        // beat 上升沿瞬时标志,每帧消费一�
 var lastStrongDrop = 0;           // 用于 burst 预设的强 drop 时刻
 
 var lyricsLines = [], lyricsVisible = false, lyricsHasNativeKaraoke = false, lyricsTimingSource = 'none';
-var playlist = [], playQueue = [], currentIdx = -1, playing = false, playToggleBusy = false;
+var playlist = [], playQueue = [], currentIdx = -1, playing = false, playToggleBusy = false, playTogglePending = false, playToggleLastStart = 0;
 var searchMode = 'song', podcastResults = [], podcastPrograms = [], podcastCurrentRadio = null;
 var loginStatus = { loggedIn: false, vipType: 0, vipLevel: 'none', isVip: false, isSvip: false, vipLabel: '无VIP' };
 var qqLoginStatus = { provider: 'qq', loggedIn: false, preview: false, nickname: 'QQ 音乐', userId: '', avatar: '', vipType: 0 };
@@ -5707,6 +5796,17 @@ function syncMobileInteractionClass() {
   document.body.classList.toggle('mobile-optimized', isMobileInteractionShell());
 }
 
+function clearMobileTapFocus(e) {
+  if (!e || (e.pointerType && e.pointerType === 'mouse')) return;
+  var selector = 'button,a,[role="button"],[tabindex],[onclick],input[type="button"],input[type="submit"],input[type="reset"]';
+  var active = document.activeElement;
+  var target = e.target && e.target.closest ? e.target.closest(selector) : null;
+  [active, target].forEach(function(el){
+    if (!el || el === document.body || el === document.documentElement) return;
+    if (el.matches && el.matches(selector)) setTimeout(function(){ try { el.blur(); } catch (err) {} }, 0);
+  });
+}
+
 function syncMobileGestureButton(loading) {
   var btn = document.getElementById('mobile-gesture-btn');
   if (!btn) return;
@@ -5750,6 +5850,9 @@ var mobileStagePointer = {
 function initMobileInteractionLogic() {
   syncMobileInteractionClass();
   window.addEventListener('resize', syncMobileInteractionClass, { passive:true });
+  window.addEventListener('pointerup', clearMobileTapFocus, { passive:true });
+  window.addEventListener('pointercancel', clearMobileTapFocus, { passive:true });
+  window.addEventListener('touchend', clearMobileTapFocus, { passive:true });
   if (window.matchMedia) {
     try {
       var coarseQuery = window.matchMedia('(pointer: coarse)');
@@ -8830,18 +8933,34 @@ function lyricThreeColor(css, fallback, minLum) {
 
 var STAGE_LYRIC_MAX_LINES = 1;
 
+function isPortraitStageLayout() {
+  var portrait = innerHeight > innerWidth * 1.08;
+  if (!portrait) return false;
+  if (document.documentElement && document.documentElement.classList.contains('android-shell-root')) return true;
+  if (document.body && (document.body.classList.contains('android-shell') || document.body.classList.contains('mobile-optimized'))) return true;
+  return typeof isMobileInteractionShell === 'function' ? isMobileInteractionShell() : innerWidth <= 720;
+}
+
+function stageLyricMaskProfile() {
+  if (!isPortraitStageLayout()) {
+    return { canvasW: 2048, canvasH: 384, maxWidthPad: 190, maxLines: STAGE_LYRIC_MAX_LINES, startFont: 128, minFont: 42, fitFloor: 0.68, worldW: 6.10 };
+  }
+  return { canvasW: 1536, canvasH: 512, maxWidthPad: 150, maxLines: 2, startFont: 108, minFont: 42, fitFloor: 0.82, worldW: 4.72 };
+}
+
 function makeLyricMask(text) {
   var canvas = document.createElement('canvas');
-  var W = 2048, H = 384;
+  var profile = stageLyricMaskProfile();
+  var W = profile.canvasW, H = profile.canvasH;
   canvas.width = W; canvas.height = H;
   var ctx = canvas.getContext('2d');
-  var maxWidth = W - 190;
-  var maxLines = STAGE_LYRIC_MAX_LINES;
-  var fontSize = 128;
+  var maxWidth = W - profile.maxWidthPad;
+  var maxLines = profile.maxLines;
+  var fontSize = profile.startFont;
   text = String(text || '').replace(/\s+/g, ' ').trim();
   var lines = [text];
   var widest = 1;
-  for (; fontSize >= 42; fontSize -= 4) {
+  for (; fontSize >= profile.minFont; fontSize -= 4) {
     ctx.font = lyricFontCss(fontSize);
     lines = maxLines > 1 && lyricMeasureText(ctx, text, fontSize) > maxWidth ? wrapLyricText(ctx, text, maxWidth, maxLines, fontSize) : [text];
     widest = 1;
@@ -8853,7 +8972,7 @@ function makeLyricMask(text) {
   widest = 1;
   for (var mi = 0; mi < lines.length; mi++) widest = Math.max(widest, lyricMeasureText(ctx, lines[mi], fontSize));
   var width = Math.min(maxWidth, widest);
-  var fitScaleX = maxLines <= 1 && widest > maxWidth ? Math.max(0.68, maxWidth / widest) : 1;
+  var fitScaleX = widest > maxWidth ? Math.max(profile.fitFloor, maxWidth / widest) : 1;
   if (fitScaleX < 1) width = Math.min(maxWidth, widest * fitScaleX);
   var lineHeight = fontSize * (lines.length > 1 ? 1.02 : 1.0) * lyricLineHeightFactor();
   var blockH = fontSize + (lines.length - 1) * lineHeight;
@@ -9174,7 +9293,7 @@ function buildLyricMesh(text) {
   text = String(text || '').replace(/\s+/g, ' ').trim();
   var mask = makeLyricMask(text);
   var pal = stageLyrics.palette;
-  var worldW = 6.10;
+  var worldW = stageLyricMaskProfile().worldW;
   var worldH = worldW * (mask.height / mask.width);
   var geo = new THREE.PlaneGeometry(worldW, worldH, 1, 1);
   var textWorldW = worldW * (mask.textWidth / mask.width);
@@ -9333,6 +9452,18 @@ function refreshCurrentLyricStyle() {
   if (stageLyrics.current && stageLyrics.current.userData) stageLyrics.current.userData.age = 0.48;
 }
 
+var lyricViewportRefreshTimer = null;
+function refreshStageLyricsForViewport() {
+  if (lyricViewportRefreshTimer) clearTimeout(lyricViewportRefreshTimer);
+  lyricViewportRefreshTimer = setTimeout(function(){
+    lyricViewportRefreshTimer = null;
+    refreshCurrentLyricStyle();
+    requestStageLyricCameraSnap(8);
+  }, 140);
+}
+window.addEventListener('resize', refreshStageLyricsForViewport, { passive:true });
+window.addEventListener('orientationchange', refreshStageLyricsForViewport, { passive:true });
+
 function clearStageLyrics() {
   disposeLyricMesh(stageLyrics.current);
   stageLyrics.current = null;
@@ -9384,6 +9515,15 @@ function updateStageLyrics3D(dt) {
   var layoutZ = clampRange(Number(fx.lyricOffsetZ) || 0, -1.6, 1.6);
   var layoutTiltX = clampRange(Number(fx.lyricTiltX) || 0, -42, 42);
   var layoutTiltY = clampRange(Number(fx.lyricTiltY) || 0, -42, 42);
+  var portraitLyrics = isPortraitStageLayout();
+  if (portraitLyrics) {
+    layoutScale *= 0.82;
+    layoutX = clampRange(layoutX * 0.62, -1.10, 1.10);
+    layoutY = clampRange(layoutY * 0.55 + 0.34, -0.42, 0.86);
+    layoutZ = clampRange(layoutZ + 0.34, -0.82, 1.35);
+    layoutTiltX *= 0.45;
+    layoutTiltY *= 0.45;
+  }
   var skullMouthLyrics = !!(camera && fx && fx.preset === SKULL_PRESET_INDEX && skullParticleGroup && skullParticleGroup.visible);
   var shelfDetailOpen = !!(shelfManager && shelfManager.hasOpenContent && shelfManager.hasOpenContent());
   var skullShelfDetailOpen = !!(fx && fx.preset === SKULL_PRESET_INDEX && shelfDetailOpen);
@@ -9431,7 +9571,7 @@ function updateStageLyrics3D(dt) {
       layoutZ = clampRange(layoutZ + 0.18, -1.6, 1.6);
     }
   }
-  var lockBaseDistance = wallpaperShelfLyrics ? 5.58 : 4.85;
+  var lockBaseDistance = wallpaperShelfLyrics ? 5.58 : (portraitLyrics ? 5.28 : 4.85);
   var lockDistance = lockBaseDistance + layoutZ;
   var cameraLockedLyrics = (fx.lyricCameraLock || wallpaperLyricLock) && camera;
   var skullLyricEdgeGuard = !!(fx && fx.preset === SKULL_PRESET_INDEX && (orbit.centerLocked || orbit.recentering));
@@ -18817,6 +18957,7 @@ function handlePlaybackUnavailable(song, data) {
 
 function pauseCurrentAudioForTrackSwitch() {
   playToggleBusy = false;
+  playTogglePending = false;
   if (!audio) return;
   try {
     audioFadeSerial++;
@@ -19186,9 +19327,14 @@ async function playAudio(opts) {
   opts = opts || {};
   return attemptAudioPlay({ manual: false, silent: !!opts.silent });
 }
-async function togglePlay() {
-  if (playToggleBusy) return;
+async function togglePlay(fromPending) {
+  var now = performance && performance.now ? performance.now() : Date.now();
+  if (playToggleBusy || (!fromPending && now - playToggleLastStart < 180)) {
+    playTogglePending = true;
+    return;
+  }
   playToggleBusy = true;
+  playToggleLastStart = now;
   try {
     forcePlaybackControlsInteractive();
     if ((!audio || !audio.src) && playQueue.length && currentIdx >= 0) {
@@ -19217,6 +19363,10 @@ async function togglePlay() {
     if (!audio || !audio.src) showToast('播放控制失败');
   } finally {
     playToggleBusy = false;
+    if (playTogglePending) {
+      playTogglePending = false;
+      setTimeout(function(){ togglePlay(true); }, 90);
+    }
   }
 }
 function setPlayIcon(p) {
@@ -19227,6 +19377,7 @@ function setPlayIcon(p) {
 function nextTrack() {
   if (!playQueue.length) return;
   playToggleBusy = false;
+  playTogglePending = false;
   forcePlaybackControlsInteractive();
   if (playMode === 'shuffle') currentIdx = Math.floor(Math.random() * playQueue.length);
   else currentIdx = (currentIdx + 1) % playQueue.length;
@@ -19235,6 +19386,7 @@ function nextTrack() {
 function prevTrack() {
   if (!playQueue.length) return;
   playToggleBusy = false;
+  playTogglePending = false;
   forcePlaybackControlsInteractive();
   currentIdx = (currentIdx - 1 + playQueue.length) % playQueue.length;
   Promise.resolve(playQueueAt(currentIdx)).finally(forcePlaybackControlsInteractive);
@@ -19485,6 +19637,7 @@ function bindPlayerControlAnimations() {
       var hovered = e && e.pointerType !== 'touch' && btn.matches(':hover');
       window.gsap.to(btn, { y: hovered ? -2 : 0, scale: hovered ? (isPlay ? 1.07 : 1.08) : 1, duration: 0.24, ease: 'back.out(1.9)', overwrite: 'auto' });
       if (iconTarget) window.gsap.to(iconTarget, { scale: hovered ? 1.06 : 1, duration: 0.22, ease: 'back.out(1.8)', overwrite: 'auto' });
+      if (e && (e.pointerType === 'touch' || e.pointerType === 'pen')) setTimeout(function(){ btn.blur(); }, 0);
     }
     function clickPulse() {
       if (!canAnimate() || btn.id === 'play-mode-btn') return;
@@ -25616,7 +25769,9 @@ function loadScriptOnce(src) {
 function startHeadTracking(){}     // stub: 兼容旧调用
 function stopHeadTracking(){}      // stub
 
-var gestureVideo = null, gestureCamera = null, gestureHands = null;
+var gestureVideo = null, gestureCamera = null, gestureHands = null, gestureStream = null;
+var gestureFrameLoopId = 0, gestureFrameBusy = false, gestureLastFrameAt = 0;
+var GESTURE_FRAME_MIN_MS = 1000 / 18;
 var gestureActive = false;
 // 21 个关键点的平滑缓存 (EMA): [{x,y}, ...]
 var handLmSmooth = null;
@@ -25685,32 +25840,147 @@ var handCanvas = null, handCanvasCtx = null;
 // 平滑系数 (越小越平滑, 但反应越慢)
 var HAND_SMOOTH_ALPHA = 0.35;
 
-function gestureCameraOptions(facingMode) {
-  var options = {
-    onFrame: async function(){
-      if (!gestureHands || !gestureVideo || gestureVideo.readyState < 2) return;
-      await gestureHands.send({ image: gestureVideo });
-    },
-    width: 640,
-    height: 480
+function stopGestureFrameLoop() {
+  if (gestureFrameLoopId) cancelAnimationFrame(gestureFrameLoopId);
+  gestureFrameLoopId = 0;
+  gestureFrameBusy = false;
+}
+
+function stopGestureStream() {
+  try { if (gestureCamera && gestureCamera.stop) gestureCamera.stop(); } catch(e){}
+  gestureCamera = null;
+  try {
+    if (gestureStream) gestureStream.getTracks().forEach(function(t){ t.stop(); });
+  } catch(e){}
+  try {
+    if (gestureVideo && gestureVideo.srcObject) gestureVideo.srcObject.getTracks().forEach(function(t){ t.stop(); });
+  } catch(e){}
+  if (gestureVideo) gestureVideo.srcObject = null;
+  gestureStream = null;
+}
+
+function gestureVideoConstraints(facingMode, exactFacing, width, height, frameRate, deviceId) {
+  var video = {
+    width: { ideal: width || 960 },
+    height: { ideal: height || 720 },
+    frameRate: { ideal: frameRate || 30, max: frameRate || 30 }
   };
-  if (facingMode) options.facingMode = facingMode;
-  return options;
+  if (deviceId) video.deviceId = { exact: deviceId };
+  if (facingMode) video.facingMode = exactFacing ? { exact: facingMode } : { ideal: facingMode };
+  return { audio: false, video: video };
+}
+
+function gestureCameraLabelScore(device) {
+  var label = String(device && device.label || '').toLowerCase();
+  var score = 0;
+  if (/front|user|face|selfie|internal|integrated|前|内|自拍/.test(label)) score += 12;
+  if (/back|rear|environment|world|后|外/.test(label)) score -= 8;
+  if (/wide|ultra|macro|tele/.test(label)) score -= 2;
+  return score;
+}
+
+async function gestureFrontCameraDeviceIds() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+  try {
+    var devices = await navigator.mediaDevices.enumerateDevices();
+    var cameras = devices
+      .filter(function(d){ return d && d.kind === 'videoinput' && d.deviceId; })
+      .map(function(d){ return { device: d, score: gestureCameraLabelScore(d) }; });
+    if (!cameras.some(function(item){ return item.score !== 0; })) return [];
+    return cameras
+      .sort(function(a, b){ return b.score - a.score; })
+      .filter(function(item){ return item.score >= 0; })
+      .map(function(item){ return item.device.deviceId; });
+  } catch (e) {
+    console.warn('Gesture camera enumerate failed:', e);
+    return [];
+  }
+}
+
+function waitForGestureVideoReady(video) {
+  return new Promise(function(resolve, reject){
+    var done = false;
+    var timer = setTimeout(function(){ finish(resolve); }, 7000);
+    function cleanup() {
+      clearTimeout(timer);
+      video.removeEventListener('loadedmetadata', ready);
+      video.removeEventListener('canplay', ready);
+      video.removeEventListener('error', fail);
+    }
+    function finish(fn, value) {
+      if (done) return;
+      done = true;
+      cleanup();
+      fn(value);
+    }
+    function ready() {
+      if (video.readyState >= 2 || video.videoWidth > 0) finish(resolve);
+    }
+    function fail(e) {
+      finish(reject, e || new Error('GESTURE_VIDEO_ERROR'));
+    }
+    video.addEventListener('loadedmetadata', ready);
+    video.addEventListener('canplay', ready);
+    video.addEventListener('error', fail);
+    ready();
+  });
+}
+
+async function attachGestureStreamToVideo(stream) {
+  gestureVideo.srcObject = stream;
+  await waitForGestureVideoReady(gestureVideo);
+  try { await gestureVideo.play(); } catch(playErr) { console.warn('Gesture video play deferred:', playErr); }
+}
+
+function startGestureFrameLoop() {
+  stopGestureFrameLoop();
+  gestureLastFrameAt = 0;
+  function tick(ts) {
+    if (!gestureActive || !gestureHands || !gestureVideo) {
+      gestureFrameLoopId = 0;
+      return;
+    }
+    if (gestureVideo.readyState >= 2 && !gestureFrameBusy && ts - gestureLastFrameAt >= GESTURE_FRAME_MIN_MS) {
+      gestureFrameBusy = true;
+      gestureLastFrameAt = ts;
+      Promise.resolve(gestureHands.send({ image: gestureVideo })).catch(function(err){
+        console.warn('Gesture frame failed:', err);
+      }).finally(function(){
+        gestureFrameBusy = false;
+      });
+    }
+    gestureFrameLoopId = requestAnimationFrame(tick);
+  }
+  gestureFrameLoopId = requestAnimationFrame(tick);
 }
 
 async function startGestureCameraStream() {
-  try {
-    gestureCamera = new Camera(gestureVideo, gestureCameraOptions('user'));
-    await gestureCamera.start();
-    return 'front';
-  } catch (frontErr) {
-    console.warn('Front camera failed, falling back to default camera:', frontErr);
-    try { if (gestureCamera && gestureCamera.stop) gestureCamera.stop(); } catch(e){}
-    gestureCamera = null;
-    gestureCamera = new Camera(gestureVideo, gestureCameraOptions());
-    await gestureCamera.start();
-    return 'default';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('CAMERA_UNAVAILABLE');
+  stopGestureStream();
+  var attempts = [];
+  var ids = await gestureFrontCameraDeviceIds();
+  ids.forEach(function(id){
+    attempts.push({ mode: 'front', constraints: gestureVideoConstraints(null, false, 640, 480, 24, id) });
+  });
+  attempts.push(
+    { mode: 'front', constraints: gestureVideoConstraints('user', true, 640, 480, 24) },
+    { mode: 'front', constraints: gestureVideoConstraints('user', false, 640, 480, 24) },
+    { mode: 'front', constraints: gestureVideoConstraints('user', false, 960, 720, 24) },
+    { mode: 'default', constraints: gestureVideoConstraints(null, false, 640, 480, 20) }
+  );
+  var lastErr = null;
+  for (var i = 0; i < attempts.length; i++) {
+    try {
+      gestureStream = await navigator.mediaDevices.getUserMedia(attempts[i].constraints);
+      await attachGestureStreamToVideo(gestureStream);
+      return attempts[i].mode;
+    } catch (err) {
+      lastErr = err;
+      stopGestureStream();
+      console.warn('Gesture camera attempt failed:', attempts[i].mode, err);
+    }
   }
+  throw lastErr || new Error('CAMERA_OPEN_FAILED');
 }
 
 async function startGestureControl() {
@@ -25721,16 +25991,25 @@ async function startGestureControl() {
   syncMobileGestureButton(true);
   showToast('正在加载手势识别…');
   try {
-    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
     await loadScriptOnce('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
     gestureVideo = document.createElement('video');
     gestureVideo.playsInline = true; gestureVideo.muted = true; gestureVideo.autoplay = true;
     gestureVideo.setAttribute('playsinline', '');
-    gestureVideo.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;';
+    gestureVideo.width = 640;
+    gestureVideo.height = 480;
+    gestureVideo.style.cssText = 'position:fixed;left:0;top:0;width:160px;height:120px;opacity:.001;pointer-events:none;z-index:-1;transform:scaleX(-1);';
     document.body.appendChild(gestureVideo);
     gestureHands = new Hands({ locateFile: function(f){ return 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/' + f; } });
     // modelComplexity:1 比 0 更稳定, 但仍流畅. 提高 confidence 减少误检
-    gestureHands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
+    var mobileHands = typeof isMobileInteractionShell === 'function' && isMobileInteractionShell();
+    // Mobile WebView and tablet cameras often need a lighter model to keep frames flowing.
+    gestureHands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: mobileHands ? 0 : 1,
+      minDetectionConfidence: mobileHands ? 0.50 : 0.62,
+      minTrackingConfidence: mobileHands ? 0.45 : 0.58,
+      selfieMode: true
+    });
     gestureHands.onResults(function(res){
       if (!gestureActive) return;
       var lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
@@ -25739,6 +26018,7 @@ async function startGestureControl() {
     });
     var cameraMode = await startGestureCameraStream();
     gestureActive = true;
+    startGestureFrameLoop();
     // 准备 hand canvas
     handCanvas = document.getElementById('hand-canvas');
     handCanvasCtx = handCanvas.getContext('2d');
@@ -25750,10 +26030,11 @@ async function startGestureControl() {
   } catch (e) {
     console.warn('Gesture failed:', e);
     showToast('手势启动失败 (需要摄像头权限)');
-    try { if (gestureCamera && gestureCamera.stop) gestureCamera.stop(); } catch(cleanErr){}
-    try { if (gestureVideo && gestureVideo.srcObject) gestureVideo.srcObject.getTracks().forEach(function(t){ t.stop(); }); } catch(cleanErr2){}
+    stopGestureFrameLoop();
+    stopGestureStream();
+    try { if (gestureHands && gestureHands.close) gestureHands.close(); } catch(cleanErr){}
     try { if (gestureVideo) gestureVideo.remove(); } catch(cleanErr3){}
-    gestureVideo = null; gestureHands = null; gestureCamera = null; gestureActive = false;
+    gestureVideo = null; gestureHands = null; gestureCamera = null; gestureStream = null; gestureActive = false;
     fx.cam = 'off';
     document.querySelectorAll('#cam-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.cam === 'off'); });
     syncMobileGestureButton(false);
@@ -25766,10 +26047,11 @@ function stopGestureControl() {
     syncMobileGestureButton(false);
     return;
   }
-  try { if (gestureCamera && gestureCamera.stop) gestureCamera.stop(); } catch(e){}
-  try { if (gestureVideo && gestureVideo.srcObject) gestureVideo.srcObject.getTracks().forEach(function(t){ t.stop(); }); } catch(e){}
+  stopGestureFrameLoop();
+  stopGestureStream();
+  try { if (gestureHands && gestureHands.close) gestureHands.close(); } catch(e){}
   try { if (gestureVideo) gestureVideo.remove(); } catch(e){}
-  gestureVideo = null; gestureHands = null; gestureCamera = null;
+  gestureVideo = null; gestureHands = null; gestureCamera = null; gestureStream = null;
   gestureActive = false;
   pinchState.active = false;
   handLmSmooth = null;
