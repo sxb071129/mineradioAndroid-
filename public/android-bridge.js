@@ -71,6 +71,7 @@
     clearKugouMusicLogin: function () { return promiseResult('clearLogin', { provider: 'kugou' }); },
     openUpdateInstaller: function (filePath) { return promiseResult('openUpdateInstaller', { filePath: filePath || '' }); },
     restartApp: function () { return promiseResult('restartApp'); },
+    setPlaybackActive: function (payload) { return promiseResult('setPlaybackActive', payload || {}); },
     configureGlobalHotkeys: function () { return Promise.resolve({ ok: true, results: [], androidNoop: true }); },
     exportJsonFile: function (payload) { return callNativeAsync('exportJsonFile', payload || {}, 60000); },
     importJsonFile: function () { return callNativeAsync('importJsonFile', {}, 300000); },

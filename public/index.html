@@ -3547,6 +3547,10 @@ function readSavedPlaybackVisualPreset() {
 var playbackVisualPreset = readSavedPlaybackVisualPreset();
 var startupVisualPreviewActive = false;
 var fx = Object.assign({}, fxDefaults, readSavedLyricLayout());
+if (window.desktopWindow && window.desktopWindow.isAndroid && fx.performanceBackground === 'auto') {
+  fx.performanceBackground = 'keep';
+  fx.liveBackgroundKeep = true;
+}
 normalizeDevelopmentLockedFxState();
 var presetTransition = { active:false, start:-10, duration:0.92, from:0, to:0 };
 var controlsAutoHide = readBooleanPreference(CONTROLS_AUTO_HIDE_STORE_KEY, false);
@@ -18825,8 +18829,31 @@ function pauseCurrentAudioForTrackSwitch() {
   syncPlaybackStateFromAudioEvent('track-switch');
 }
 
+var androidPlaybackBridgeActive = null;
+function shouldKeepAndroidPlaybackActive(isPlaying, reason) {
+  if (isPlaying) return true;
+  if (!(window.desktopWindow && window.desktopWindow.isAndroid)) return false;
+  if (reason === 'ended') return !!(playQueue && playQueue.length && currentIdx >= 0);
+  if (reason === 'track-switch') return !!(playQueue && playQueue.length && currentIdx >= 0);
+  return false;
+}
+function syncAndroidPlaybackActive(active, reason) {
+  var api = window.desktopWindow;
+  if (!api || !api.isAndroid || typeof api.setPlaybackActive !== 'function') return;
+  if (androidPlaybackBridgeActive === active) return;
+  androidPlaybackBridgeActive = active;
+  var song = playQueue && currentIdx >= 0 ? playQueue[currentIdx] : null;
+  api.setPlaybackActive({
+    active: !!active,
+    reason: reason || '',
+    title: song && song.name || '',
+    artist: song && song.artist || ''
+  }).catch(function(e){ console.warn('[AndroidPlaybackBridge]', e); });
+}
+
 function syncPlaybackStateFromAudioEvent(reason) {
   var isPlaying = !!(audio && audio.src && !audio.paused && !audio.ended);
+  syncAndroidPlaybackActive(shouldKeepAndroidPlaybackActive(isPlaying, reason), reason);
   playing = isPlaying;
   setPlayIcon(isPlaying);
   if (!isPlaying) hideLoading();
@@ -25658,6 +25685,34 @@ var handCanvas = null, handCanvasCtx = null;
 // 平滑系数 (越小越平滑, 但反应越慢)
 var HAND_SMOOTH_ALPHA = 0.35;
 
+function gestureCameraOptions(facingMode) {
+  var options = {
+    onFrame: async function(){
+      if (!gestureHands || !gestureVideo || gestureVideo.readyState < 2) return;
+      await gestureHands.send({ image: gestureVideo });
+    },
+    width: 640,
+    height: 480
+  };
+  if (facingMode) options.facingMode = facingMode;
+  return options;
+}
+
+async function startGestureCameraStream() {
+  try {
+    gestureCamera = new Camera(gestureVideo, gestureCameraOptions('user'));
+    await gestureCamera.start();
+    return 'front';
+  } catch (frontErr) {
+    console.warn('Front camera failed, falling back to default camera:', frontErr);
+    try { if (gestureCamera && gestureCamera.stop) gestureCamera.stop(); } catch(e){}
+    gestureCamera = null;
+    gestureCamera = new Camera(gestureVideo, gestureCameraOptions());
+    await gestureCamera.start();
+    return 'default';
+  }
+}
+
 async function startGestureControl() {
   if (gestureActive) {
     syncMobileGestureButton(false);
@@ -25669,8 +25724,9 @@ async function startGestureControl() {
     await loadScriptOnce('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
     await loadScriptOnce('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
     gestureVideo = document.createElement('video');
-    gestureVideo.playsInline = true; gestureVideo.muted = true;
-    gestureVideo.style.display = 'none';
+    gestureVideo.playsInline = true; gestureVideo.muted = true; gestureVideo.autoplay = true;
+    gestureVideo.setAttribute('playsinline', '');
+    gestureVideo.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;';
     document.body.appendChild(gestureVideo);
     gestureHands = new Hands({ locateFile: function(f){ return 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/' + f; } });
     // modelComplexity:1 比 0 更稳定, 但仍流畅. 提高 confidence 减少误检
@@ -25681,8 +25737,7 @@ async function startGestureControl() {
       if (!lm) { onHandLost(); return; }
       processHandFrame(lm);
     });
-    gestureCamera = new Camera(gestureVideo, { onFrame: async function(){ if (gestureHands) await gestureHands.send({ image: gestureVideo }); }, width: 480, height: 360 });
-    await gestureCamera.start();
+    var cameraMode = await startGestureCameraStream();
     gestureActive = true;
     // 准备 hand canvas
     handCanvas = document.getElementById('hand-canvas');
@@ -25690,7 +25745,7 @@ async function startGestureControl() {
     resizeHandCanvas();
     handCanvas.classList.add('show');
     syncMobileGestureButton(false);
-    showToast('手势已开启: 手掌推开 · 捏合旋转 · 握拳收束');
+    showToast((cameraMode === 'front' ? '前置摄像头手势已开启' : '前置不可用，已使用默认摄像头') + ': 手掌推开 · 捏合旋转 · 握拳收束');
     showGestureHUD('待命', 0, '把手放进视野');
   } catch (e) {
     console.warn('Gesture failed:', e);

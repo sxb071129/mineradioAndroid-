@@ -2,12 +2,17 @@ package com.mineradio.android;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.ViewGroup;
@@ -49,6 +54,7 @@ public class MainActivity extends Activity {
     private static final int REQUEST_LOGIN = 9101;
     private static final int REQUEST_IMPORT_JSON = 9102;
     private static final int REQUEST_CAMERA_PERMISSION = 9103;
+    private static final long PLAYBACK_WAKE_LOCK_TIMEOUT_MS = 12L * 60L * 60L * 1000L;
     private static boolean nodeStarted = false;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -58,12 +64,29 @@ public class MainActivity extends Activity {
     private String pendingLoginToken;
     private String pendingImportToken;
     private PermissionRequest pendingWebPermissionRequest;
+    private AudioManager audioManager;
+    private AudioFocusRequest audioFocusRequest;
+    private PowerManager.WakeLock playbackWakeLock;
+    private boolean playbackActive = false;
+    private final AudioManager.OnAudioFocusChangeListener audioFocusChangeListener = focusChange -> {
+        if (focusChange == AudioManager.AUDIOFOCUS_LOSS && webView != null) {
+            runOnUiThread(() -> webView.evaluateJavascript(
+                "window.__mineradioAndroidAudioFocusLost && window.__mineradioAndroidAudioFocusLost();",
+                null));
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (powerManager != null) {
+            playbackWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Mineradio:Playback");
+            playbackWakeLock.setReferenceCounted(false);
+        }
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
@@ -145,6 +168,45 @@ public class MainActivity extends Activity {
             if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource)) return true;
         }
         return false;
+    }
+
+    private void setPlaybackActive(boolean active) {
+        playbackActive = active;
+        if (active) {
+            requestPlaybackAudioFocus();
+            if (playbackWakeLock != null && !playbackWakeLock.isHeld()) {
+                playbackWakeLock.acquire(PLAYBACK_WAKE_LOCK_TIMEOUT_MS);
+            }
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            if (webView != null) webView.resumeTimers();
+        } else {
+            abandonPlaybackAudioFocus();
+            if (playbackWakeLock != null && playbackWakeLock.isHeld()) {
+                playbackWakeLock.release();
+            }
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+    }
+
+    private void requestPlaybackAudioFocus() {
+        if (audioManager == null) return;
+        if (audioFocusRequest == null) {
+            AudioAttributes attributes = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build();
+            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attributes)
+                .setAcceptsDelayedFocusGain(true)
+                .setOnAudioFocusChangeListener(audioFocusChangeListener)
+                .build();
+        }
+        audioManager.requestAudioFocus(audioFocusRequest);
+    }
+
+    private void abandonPlaybackAudioFocus() {
+        if (audioManager == null || audioFocusRequest == null) return;
+        audioManager.abandonAudioFocusRequest(audioFocusRequest);
     }
 
     private void startNodeAndLoad() {
@@ -413,7 +475,26 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        if (webView != null) webView.resumeTimers();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (playbackActive && webView != null) webView.resumeTimers();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (webView != null) webView.resumeTimers();
+    }
+
+    @Override
     protected void onDestroy() {
+        setPlaybackActive(false);
         if (webView != null) {
             webView.destroy();
             webView = null;
@@ -510,6 +591,18 @@ public class MainActivity extends Activity {
                 if (url == null || url.trim().isEmpty()) return error("MISSING_URL").toString();
                 Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                 startActivity(intent);
+                return ok().toString();
+            } catch (Exception e) {
+                return error(e.getMessage()).toString();
+            }
+        }
+
+        @JavascriptInterface
+        public String setPlaybackActive(String json) {
+            try {
+                JSONObject request = new JSONObject(json == null ? "{}" : json);
+                boolean active = request.optBoolean("active", false);
+                runOnUiThread(() -> MainActivity.this.setPlaybackActive(active));
                 return ok().toString();
             } catch (Exception e) {
                 return error(e.getMessage()).toString();
