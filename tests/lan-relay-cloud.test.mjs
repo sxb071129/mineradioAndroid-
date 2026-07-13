@@ -90,7 +90,7 @@ test("cloud proxy forwards Range and only accepts canonical song ids", async (t)
   assert.match(response.headers.get("access-control-allow-headers") || "", /range/i);
   assert.match(response.headers.get("access-control-expose-headers") || "", /content-range/i);
   assert.deepEqual(upstreamRequests, [{
-    url: "/api/stream?id=123456",
+    url: "/api/stream?provider=netease&id=123456&quality=standard",
     range: "bytes=4-7",
     cookie: undefined,
   }]);
@@ -150,6 +150,8 @@ test("room canonicalizes cloud tracks and ignores client transport fields", asyn
     type: "audio/mpeg",
     size: 0,
     path: "/api/cloud/123456",
+    provider: "netease",
+    quality: "standard",
   });
   assert.equal(stateMessage.state.position, 0);
   assert.equal(stateMessage.state.playing, false);
@@ -164,4 +166,72 @@ test("room canonicalizes cloud tracks and ignores client transport fields", asyn
   assert.equal(denied.code, "invalid_track");
   assert.equal(relay.rooms.get("ROOM42").state.revision, revision);
   assert.equal(relay.rooms.get("ROOM42").state.track.id, "cloud-123456");
+
+  leader.ws.send(JSON.stringify({ type: "command", action: "seek", position: 42 }));
+  await follower.next((message) => message.type === "state" && message.state?.position === 42);
+  leader.ws.send(JSON.stringify({ type: "command", action: "play" }));
+  await follower.next((message) => message.type === "state" && message.state?.playing === true);
+  leader.ws.send(JSON.stringify({ type: "command", action: "quality", quality: "lossless" }));
+  const qualityState = await follower.next(
+    (message) => message.type === "state" && message.state?.track?.quality === "lossless",
+  );
+  assert.equal(qualityState.state.track.id, "cloud-v2-netease-123456-lossless");
+  assert.equal(qualityState.state.track.path, "/api/cloud/v2/netease/123456/lossless");
+  assert.equal(qualityState.state.playing, true);
+  assert.ok(qualityState.state.position >= 42);
+
+  follower.ws.send(JSON.stringify({ type: "command", action: "quality", quality: "standard" }));
+  assert.equal((await follower.next((message) => message.type === "error" && message.code === "leader_only")).code, "leader_only");
+});
+
+test("v2 cloud proxy canonicalizes provider, play key, and quality", async (t) => {
+  const upstreamRequests = [];
+  const music = http.createServer((req, res) => {
+    upstreamRequests.push({ url: req.url, range: req.headers.range, cookie: req.headers.cookie });
+    const bytes = Buffer.from([9, 8]);
+    res.writeHead(206, {
+      "Content-Type": "audio/flac",
+      "Content-Length": bytes.length,
+      "Content-Range": "bytes 2-3/4",
+      "Accept-Ranges": "bytes",
+    });
+    res.end(bytes);
+  });
+  const musicPort = await listen(music);
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-v2-cloud-relay-"));
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+    musicApiHost: "127.0.0.1",
+    musicApiPort: musicPort,
+  });
+  t.after(async () => {
+    await relay.close();
+    await new Promise((resolve) => music.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  const playKey = "a".repeat(24);
+  const base = `http://127.0.0.1:${relay.port}`;
+  const response = await fetch(`${base}/api/cloud/v2/kugou/${playKey}/lossless`, {
+    headers: { range: "bytes=2-3", cookie: "CLIENT_SECRET=1" },
+  });
+  assert.equal(response.status, 206);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), new Uint8Array([9, 8]));
+  assert.deepEqual(upstreamRequests, [{
+    url: `/api/stream?provider=kugou&id=${playKey}&quality=lossless`,
+    range: "bytes=2-3",
+    cookie: undefined,
+  }]);
+
+  for (const pathname of [
+    `/api/cloud/v2/kugou/${playKey}/ultra`,
+    "/api/cloud/v2/kugou/not-a-key/hires",
+    "/api/cloud/v2/unknown/123/standard",
+    "/api/cloud/v2/netease/01/standard",
+  ]) {
+    assert.equal((await fetch(`${base}${pathname}`)).status, 404, pathname);
+  }
+  assert.equal(upstreamRequests.length, 1);
 });

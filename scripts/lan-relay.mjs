@@ -20,6 +20,8 @@ const MAX_WS_PAYLOAD = 64 * 1024;
 const ROOM_RE = /^[A-Z0-9]{4,8}$/;
 const TRACK_ID_RE = /^[a-f0-9]{24}$/;
 const CLOUD_TRACK_RE = /^cloud-([1-9]\d{0,19})$/;
+const QUALITY_VALUES = new Set(["jymaster", "hires", "lossless", "exhigh", "standard"]);
+const CLOUD_V2_RE = /^cloud-v2-(netease|kugou)-([A-Za-z0-9]+)-(jymaster|hires|lossless|exhigh|standard)$/;
 
 function corsHeaders(extra = {}) {
   return {
@@ -63,19 +65,39 @@ function normalizeRoom(value) {
   return ROOM_RE.test(room) ? room : "";
 }
 
+function parseCloudTrackId(value) {
+  const id = String(value || "");
+  const legacy = CLOUD_TRACK_RE.exec(id);
+  if (legacy) {
+    return { id, provider: "netease", sourceId: legacy[1], quality: "standard", legacy: true };
+  }
+  const match = CLOUD_V2_RE.exec(id);
+  if (!match) return null;
+  const [, provider, sourceId, quality] = match;
+  if (provider === "netease" && !/^[1-9]\d{0,19}$/.test(sourceId)) return null;
+  if (provider === "kugou" && !/^[a-f0-9]{24}$/.test(sourceId)) return null;
+  return { id, provider, sourceId, quality, legacy: false };
+}
+
+function cloudTrackDescriptor(value, cloud) {
+  return {
+    id: cloud.id,
+    name: cleanName(value.name),
+    type: "audio/mpeg",
+    size: 0,
+    path: cloud.legacy
+      ? `/api/cloud/${cloud.sourceId}`
+      : `/api/cloud/v2/${cloud.provider}/${cloud.sourceId}/${cloud.quality}`,
+    provider: cloud.provider,
+    quality: cloud.quality,
+  };
+}
+
 function normalizeTrack(value) {
   if (!value) return null;
   const id = String(value.id || "");
-  const cloudMatch = CLOUD_TRACK_RE.exec(id);
-  if (cloudMatch) {
-    return {
-      id,
-      name: cleanName(value.name),
-      type: "audio/mpeg",
-      size: 0,
-      path: `/api/cloud/${cloudMatch[1]}`,
-    };
-  }
+  const cloud = parseCloudTrackId(id);
+  if (cloud) return cloudTrackDescriptor(value, cloud);
   if (!TRACK_ID_RE.test(id)) return null;
   return {
     id,
@@ -249,13 +271,14 @@ async function uploadTrack(req, res, dataDir, url) {
   }
 }
 
-async function proxyCloudTrack(req, res, songId, musicApiHost, musicApiPort) {
+async function proxyCloudTrack(req, res, provider, sourceId, quality, musicApiHost, musicApiPort) {
   await new Promise((resolve) => {
+    const params = new URLSearchParams({ provider, id: sourceId, quality });
     const upstream = http.request(
       {
         hostname: musicApiHost,
         port: musicApiPort,
-        path: `/api/stream?id=${encodeURIComponent(songId)}`,
+        path: `/api/stream?${params.toString()}`,
         method: "GET",
         headers: req.headers.range ? { range: req.headers.range } : {},
       },
@@ -330,7 +353,20 @@ export async function createLanRelay({
     }
     const cloudMatch = /^\/api\/cloud\/([1-9]\d{0,19})$/.exec(url.pathname);
     if (req.method === "GET" && cloudMatch) {
-      await proxyCloudTrack(req, res, cloudMatch[1], musicApiHost, musicApiPort);
+      await proxyCloudTrack(req, res, "netease", cloudMatch[1], "standard", musicApiHost, musicApiPort);
+      return;
+    }
+    const cloudV2Match = /^\/api\/cloud\/v2\/(netease|kugou)\/([A-Za-z0-9]+)\/(jymaster|hires|lossless|exhigh|standard)$/.exec(url.pathname);
+    if (req.method === "GET" && cloudV2Match) {
+      const [, provider, sourceId, quality] = cloudV2Match;
+      const validSource = provider === "netease"
+        ? /^[1-9]\d{0,19}$/.test(sourceId)
+        : /^[a-f0-9]{24}$/.test(sourceId);
+      if (!validSource) {
+        json(res, 404, { error: "not_found" });
+        return;
+      }
+      await proxyCloudTrack(req, res, provider, sourceId, quality, musicApiHost, musicApiPort);
       return;
     }
     json(res, 404, { error: "not_found" });
@@ -450,6 +486,22 @@ export async function createLanRelay({
         state.position = Math.max(0, Math.min(Number(message.position) || 0, 86400));
       } else if (action === "volume") {
         state.volume = Math.max(0, Math.min(Number(message.volume) || 0, 1));
+      } else if (action === "quality") {
+        const quality = String(message.quality || "").toLowerCase();
+        const cloud = parseCloudTrackId(state.track?.id);
+        if (!cloud || !QUALITY_VALUES.has(quality)) {
+          send(ws, { type: "error", code: "quality_unavailable" });
+          return;
+        }
+        state.position = currentPosition(state, now);
+        const id = `cloud-v2-${cloud.provider}-${cloud.sourceId}-${quality}`;
+        state.track = cloudTrackDescriptor(state.track, {
+          id,
+          provider: cloud.provider,
+          sourceId: cloud.sourceId,
+          quality,
+          legacy: false,
+        });
       } else if (action === "track") {
         const track = normalizeTrack(message.track);
         if (!track || (isLocalTrack(track) && !(await readTrackMeta(dataDir, track.id)))) {

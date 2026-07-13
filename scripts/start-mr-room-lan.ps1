@@ -56,7 +56,7 @@ Write-Host "============================================================" -Foreg
 Write-Host ""
 Write-Host "Web port  : $WebPort" -ForegroundColor Cyan
 Write-Host "Sync port : $RelayPort" -ForegroundColor Cyan
-Write-Host "Music API : $MusicPort (NetEase adapter)" -ForegroundColor Cyan
+Write-Host "Music API : $MusicPort (NetEase + Kugou adapters)" -ForegroundColor Cyan
 Write-Host "This PC   : http://localhost:$WebPort" -ForegroundColor Green
 Write-Host ""
 

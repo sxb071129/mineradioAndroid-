@@ -1,24 +1,51 @@
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { isIP } from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createKugouProvider } from "./kugou-provider.mjs";
 
 const require = createRequire(import.meta.url);
 const netease = require("NeteaseCloudMusicApi");
 
 const DEFAULT_PORT = Number(process.env.MINERADIO_MUSIC_PORT || 8790);
 const DEFAULT_HOST = process.env.MINERADIO_MUSIC_HOST || "0.0.0.0";
-const DEFAULT_DATA_DIR = path.resolve(".mineradio-lan", "accounts");
 const WEB_PORT = String(process.env.MINERADIO_WEB_PORT || 3000);
 const SONG_ID_RE = /^[1-9]\d{0,19}$/;
+const PLAY_KEY_RE = /^[a-f0-9]{24}$/;
+const PLAYLIST_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const KUGOU_HASH_RE = /^[A-Fa-f0-9]{32}$/;
 const QR_TTL_MS = 10 * 60 * 1000;
 const STREAM_URL_TTL_MS = 5 * 60 * 1000;
+const KUGOU_TRACK_TTL_MS = 24 * 60 * 60 * 1000;
 const PROVIDER_TIMEOUT_MS = 12_000;
+const QUALITY_LEVELS = ["jymaster", "hires", "lossless", "exhigh", "standard"];
+const QUALITY_SET = new Set(QUALITY_LEVELS);
+const NETEASE_QUALITY_CANDIDATES = [
+  { level: "jymaster", br: 1_999_000 },
+  { level: "hires", br: 1_999_000 },
+  { level: "lossless", br: 1_411_000 },
+  { level: "exhigh", br: 999_000 },
+  { level: "standard", br: 128_000 },
+];
+
+function defaultDataDir() {
+  if (process.platform === "win32") {
+    return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Mineradio", "accounts");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Mineradio", "accounts");
+  }
+  return path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "mineradio", "accounts");
+}
+
+const DEFAULT_DATA_DIR = defaultDataDir();
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, Number(value) || 0));
@@ -225,7 +252,7 @@ function corsHeaders(origin, extra = {}) {
     ...(allowed ? { "Access-Control-Allow-Origin": allowed } : {}),
     "Access-Control-Allow-Methods": "GET,OPTIONS",
     "Access-Control-Allow-Headers": "range,content-type",
-    "Access-Control-Expose-Headers": "accept-ranges,content-length,content-range",
+    "Access-Control-Expose-Headers": "accept-ranges,content-length,content-range,x-mineradio-provider,x-mineradio-quality",
     "Cross-Origin-Resource-Policy": "cross-origin",
     Vary: "Origin",
     ...extra,
@@ -248,12 +275,90 @@ function sendJson(req, res, status, value) {
 function publicError(error, fallback) {
   const message = String(error?.message || "");
   if (/timeout|timed out|abort/i.test(message)) return "third_party_timeout";
+  if ([
+    "track_unavailable",
+    "track_trial_only",
+    "track_key_expired",
+    "kugou_login_required",
+  ].includes(message)) return message;
   return fallback;
 }
 
 function validSongId(value) {
   const id = String(value || "");
   return SONG_ID_RE.test(id) ? id : "";
+}
+
+function validQuality(value, fallback = "hires") {
+  const quality = String(value || fallback).trim().toLowerCase();
+  return QUALITY_SET.has(quality) ? quality : "";
+}
+
+function validPlayKey(value) {
+  const key = String(value || "").trim().toLowerCase();
+  return PLAY_KEY_RE.test(key) ? key : "";
+}
+
+function safeAccountInfo(value, provider) {
+  const info = value && typeof value === "object" ? value : {};
+  return {
+    provider,
+    loggedIn: Boolean(info.loggedIn),
+    userId: info.userId == null ? "" : String(info.userId).slice(0, 32),
+    nickname: String(info.nickname || (provider === "kugou" ? "酷狗音乐" : "网易云音乐")).slice(0, 80),
+    avatar: /^https:\/\//i.test(String(info.avatar || "")) ? String(info.avatar) : "",
+    vipType: Math.max(0, Number(info.vipType) || 0),
+    vipLevel: String(info.vipLevel || "none").slice(0, 16),
+    isVip: Boolean(info.isVip),
+    vipLabel: String(info.vipLabel || "").slice(0, 40),
+    playbackKeyReady: Boolean(info.playbackKeyReady),
+  };
+}
+
+function cleanKugouHash(value) {
+  const hash = String(value || "").trim().toUpperCase();
+  return KUGOU_HASH_RE.test(hash) ? hash : "";
+}
+
+function cleanProviderId(value) {
+  const id = String(value || "").trim();
+  return /^[A-Za-z0-9_-]{0,64}$/.test(id) ? id : "";
+}
+
+function normalizeKugouTrack(raw) {
+  const qualityHashes = {};
+  for (const quality of QUALITY_LEVELS) {
+    const hash = cleanKugouHash(raw?.qualityHashes?.[quality]);
+    if (hash) qualityHashes[quality] = hash;
+  }
+  const hash = cleanKugouHash(raw?.hash) || Object.values(qualityHashes)[0] || "";
+  if (!hash) return null;
+  const descriptor = {
+    hash,
+    qualityHashes,
+    albumAudioId: cleanProviderId(raw?.albumAudioId),
+    albumId: cleanProviderId(raw?.albumId),
+  };
+  const playKey = createHash("sha256")
+    .update(JSON.stringify(descriptor))
+    .digest("hex")
+    .slice(0, 24);
+  return {
+    descriptor,
+    publicTrack: {
+      provider: "kugou",
+      source: "kugou",
+      type: "song",
+      id: playKey,
+      playKey,
+      name: String(raw?.name || "未命名歌曲").slice(0, 160),
+      artist: String(raw?.artist || "").slice(0, 160),
+      album: String(raw?.album || "").slice(0, 160),
+      cover: /^https:\/\//i.test(String(raw?.cover || "")) ? String(raw.cover) : "",
+      duration: Math.max(0, Number(raw?.duration) || 0),
+      qualities: QUALITY_LEVELS.filter((quality) => Boolean(qualityHashes[quality])),
+    },
+  };
 }
 
 function pruneTimedMap(map, maxEntries) {
@@ -278,6 +383,7 @@ export async function createMusicApi({
   host = DEFAULT_HOST,
   dataDir = DEFAULT_DATA_DIR,
   provider = netease,
+  kugouProvider,
   fetchImpl = fetch,
   validateStreamUrl = assertSafeProviderUrl,
 } = {}) {
@@ -285,7 +391,12 @@ export async function createMusicApi({
   const cookieFile = path.join(dataDir, "netease.cookie");
   let userCookie = await readCookieFile(cookieFile);
   const qrKeys = new Map();
+  const kugouQrKeys = new Map();
   const streamUrls = new Map();
+  const kugouTracks = new Map();
+  const kugou = kugouProvider || await createKugouProvider({
+    authFile: path.join(dataDir, "kugou.auth.json"),
+  });
 
   const callProvider = (name, options) => {
     if (typeof provider[name] !== "function") {
@@ -322,30 +433,82 @@ export async function createMusicApi({
     }
   }
 
-  async function resolveStreamUrl(songId) {
-    const cached = streamUrls.get(songId);
-    if (cached && cached.expiresAt > Date.now()) return cached.url;
-
-    let value;
-    try {
-      value = await callProvider("song_url_v1", {
-        id: songId,
-        level: "standard",
-        cookie: userCookie || undefined,
+  function registerKugouTracks(rawTracks) {
+    const tracks = [];
+    for (const raw of Array.isArray(rawTracks) ? rawTracks : []) {
+      const normalized = normalizeKugouTrack(raw);
+      if (!normalized) continue;
+      pruneTimedMap(kugouTracks, 2048);
+      kugouTracks.set(normalized.publicTrack.playKey, {
+        ...normalized.descriptor,
+        expiresAt: Date.now() + KUGOU_TRACK_TTL_MS,
       });
-    } catch {
-      value = await callProvider("song_url", {
-        id: songId,
-        br: 320000,
-        cookie: userCookie || undefined,
-      });
+      tracks.push(normalized.publicTrack);
     }
-    const data = responseBody(value).data?.[0] || {};
-    if (!data.url) throw Object.assign(new Error("track_unavailable"), { statusCode: 403 });
-    const resolved = await validateStreamUrl(data.url);
-    pruneTimedMap(streamUrls, 256);
-    streamUrls.set(songId, { url: resolved.toString(), expiresAt: Date.now() + STREAM_URL_TTL_MS });
-    return resolved.toString();
+    return tracks;
+  }
+
+  async function resolveNeteaseStream(songId, quality) {
+    const candidates = NETEASE_QUALITY_CANDIDATES.slice(QUALITY_LEVELS.indexOf(quality));
+    let lastData = null;
+    for (const candidate of candidates) {
+      let value;
+      try {
+        value = await callProvider("song_url_v1", {
+          id: songId,
+          level: candidate.level,
+          cookie: userCookie || undefined,
+        });
+      } catch {
+        try {
+          value = await callProvider("song_url", {
+            id: songId,
+            br: candidate.br,
+            cookie: userCookie || undefined,
+          });
+        } catch {
+          continue;
+        }
+      }
+      const data = responseBody(value).data?.[0] || {};
+      lastData = data;
+      if (data.url) return { url: data.url, level: candidate.level };
+    }
+    const reason = lastData?.freeTrialInfo ? "track_trial_only" : "track_unavailable";
+    throw Object.assign(new Error(reason), { statusCode: 403 });
+  }
+
+  async function resolveKugouStream(playKey, quality) {
+    const track = kugouTracks.get(playKey);
+    if (!track || track.expiresAt <= Date.now()) {
+      kugouTracks.delete(playKey);
+      throw Object.assign(new Error("track_key_expired"), { statusCode: 404 });
+    }
+    track.expiresAt = Date.now() + KUGOU_TRACK_TTL_MS;
+    const value = await withTimeout(kugou.resolveStream(track, quality));
+    if (!value?.url) {
+      const reason = value?.reason === "login_required" ? "kugou_login_required" : "track_unavailable";
+      throw Object.assign(new Error(reason), { statusCode: 403 });
+    }
+    return { url: value.url, level: validQuality(value.level, quality) || quality };
+  }
+
+  async function resolveStream(providerName, sourceId, quality) {
+    const cacheKey = `${providerName}:${sourceId}:${quality}`;
+    const cached = streamUrls.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached;
+    const value = providerName === "kugou"
+      ? await resolveKugouStream(sourceId, quality)
+      : await resolveNeteaseStream(sourceId, quality);
+    const resolved = await validateStreamUrl(value.url);
+    pruneTimedMap(streamUrls, 512);
+    const entry = {
+      url: resolved.toString(),
+      level: value.level,
+      expiresAt: Date.now() + STREAM_URL_TTL_MS,
+    };
+    streamUrls.set(cacheKey, entry);
+    return entry;
   }
 
   const server = http.createServer(async (req, res) => {
@@ -367,7 +530,100 @@ export async function createMusicApi({
 
     try {
       if (requestUrl.pathname === "/health") {
-        sendJson(req, res, 200, { ok: true, provider: "netease", loggedIn: Boolean(userCookie) });
+        sendJson(req, res, 200, {
+          ok: true,
+          providers: ["netease", "kugou"],
+          neteaseLoggedIn: Boolean(userCookie),
+        });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/kugou/login/status") {
+        sendJson(req, res, 200, safeAccountInfo(await withTimeout(kugou.loginStatus()), "kugou"));
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/kugou/login/qr/key") {
+        const value = await withTimeout(kugou.loginQrKey());
+        const key = String(value?.key || "").trim();
+        const img = String(value?.img || "");
+        const loginUrl = String(value?.url || "");
+        const parsedLoginUrl = new URL(loginUrl);
+        if (!/^[A-Za-z0-9._~-]{8,256}$/.test(key) ||
+            !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(img) ||
+            parsedLoginUrl.protocol !== "https:" || parsedLoginUrl.hostname !== "h5.kugou.com") {
+          throw new Error("kugou_qr_invalid");
+        }
+        pruneTimedMap(kugouQrKeys, 32);
+        kugouQrKeys.set(key, Date.now() + QR_TTL_MS);
+        sendJson(req, res, 200, { provider: "kugou", key, img, url: parsedLoginUrl.toString() });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/kugou/login/qr/check") {
+        const key = String(requestUrl.searchParams.get("key") || "").trim();
+        if (!kugouQrKeys.has(key) || kugouQrKeys.get(key) < Date.now()) {
+          kugouQrKeys.delete(key);
+          sendJson(req, res, 400, { provider: "kugou", loggedIn: false, code: 800, error: "invalid_qr_key" });
+          return;
+        }
+        const value = await withTimeout(kugou.loginQrCheck(key));
+        const code = Number(value?.code) || 0;
+        if (code === 800 || code === 803) kugouQrKeys.delete(key);
+        sendJson(req, res, 200, {
+          ...safeAccountInfo(value, "kugou"),
+          code,
+          status: Number(value?.status) || 0,
+          message: String(value?.message || "").slice(0, 160),
+        });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/kugou/logout") {
+        await withTimeout(kugou.logout());
+        kugouTracks.clear();
+        for (const key of streamUrls.keys()) {
+          if (key.startsWith("kugou:")) streamUrls.delete(key);
+        }
+        sendJson(req, res, 200, { provider: "kugou", ok: true, loggedIn: false });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/kugou/user/playlists") {
+        const value = await withTimeout(kugou.userPlaylists());
+        const playlists = (Array.isArray(value?.playlists) ? value.playlists : [])
+          .map((item) => ({
+            provider: "kugou",
+            id: String(item?.id || "").slice(0, 64),
+            name: String(item?.name || "酷狗歌单").slice(0, 160),
+            cover: /^https:\/\//i.test(String(item?.cover || "")) ? String(item.cover) : "",
+            trackCount: Math.max(0, Number(item?.trackCount) || 0),
+          }))
+          .filter((item) => PLAYLIST_ID_RE.test(item.id));
+        sendJson(req, res, 200, {
+          ...safeAccountInfo(value, "kugou"),
+          playlists: playlists.slice(0, 100),
+        });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/kugou/playlist/tracks") {
+        const playlistId = String(requestUrl.searchParams.get("id") || "").trim();
+        if (!PLAYLIST_ID_RE.test(playlistId)) {
+          sendJson(req, res, 400, { error: "invalid_playlist_id", tracks: [] });
+          return;
+        }
+        const value = await withTimeout(kugou.playlistTracks(playlistId));
+        sendJson(req, res, 200, {
+          ...safeAccountInfo(value, "kugou"),
+          playlist: {
+            provider: "kugou",
+            id: playlistId,
+            name: String(value?.playlist?.name || "酷狗歌单").slice(0, 160),
+            trackCount: Math.max(0, Number(value?.playlist?.trackCount) || 0),
+          },
+          tracks: registerKugouTracks(value?.tracks).slice(0, 500),
+        });
         return;
       }
 
@@ -490,29 +746,41 @@ export async function createMusicApi({
       }
 
       if (requestUrl.pathname === "/api/stream") {
-        const songId = validSongId(requestUrl.searchParams.get("id"));
-        if (!songId) {
-          sendJson(req, res, 400, { error: "invalid_song_id" });
+        const providerName = String(requestUrl.searchParams.get("provider") || "netease").toLowerCase();
+        const quality = validQuality(requestUrl.searchParams.get("quality"), "hires");
+        const sourceId = providerName === "kugou"
+          ? validPlayKey(requestUrl.searchParams.get("id"))
+          : validSongId(requestUrl.searchParams.get("id"));
+        if (!quality) {
+          sendJson(req, res, 400, { error: "invalid_quality" });
           return;
         }
-        const streamUrl = await resolveStreamUrl(songId);
-        const upstream = await fetchProviderStream(fetchImpl, validateStreamUrl, streamUrl, {
+        if (!sourceId || !["netease", "kugou"].includes(providerName)) {
+          sendJson(req, res, 400, {
+            error: providerName === "kugou" ? "invalid_play_key" : "invalid_song_id",
+          });
+          return;
+        }
+        const stream = await resolveStream(providerName, sourceId, quality);
+        const upstream = await fetchProviderStream(fetchImpl, validateStreamUrl, stream.url, {
           headers: {
             Accept: "*/*",
-            Referer: "https://music.163.com/",
+            Referer: providerName === "kugou" ? "https://www.kugou.com/" : "https://music.163.com/",
             "User-Agent": "MR-ROOM/1.0",
             ...(req.headers.range ? { Range: req.headers.range } : {}),
           },
           signal: AbortSignal.timeout(15_000),
         });
         if (!upstream.ok || !upstream.body) {
-          streamUrls.delete(songId);
+          streamUrls.delete(`${providerName}:${sourceId}:${quality}`);
           sendJson(req, res, 502, { error: "provider_stream_failed" });
           return;
         }
         const headers = corsHeaders(origin, {
           "Content-Type": upstream.headers.get("content-type") || "audio/mpeg",
           "Accept-Ranges": upstream.headers.get("accept-ranges") || "bytes",
+          "X-Mineradio-Provider": providerName,
+          "X-Mineradio-Quality": stream.level,
           "Cache-Control": "private, max-age=300",
         });
         for (const name of ["content-length", "content-range"]) {
@@ -558,5 +826,5 @@ const isMain =
 if (isMain) {
   const musicApi = await createMusicApi();
   console.log(`Mineradio music API listening on http://localhost:${musicApi.port}`);
-  console.log("Provider: NetEase Cloud Music (restricted endpoint adapter)");
+  console.log("Providers: NetEase Cloud Music + Kugou Music (restricted local adapters)");
 }

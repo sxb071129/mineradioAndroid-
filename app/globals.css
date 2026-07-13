@@ -1025,6 +1025,35 @@ input:disabled {
   max-width: 60ch;
 }
 
+.provider-tabs {
+  display: grid;
+  width: min(100%, 430px);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 18px;
+  padding: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 15px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.provider-tabs button {
+  min-height: 40px;
+  border: 0;
+  border-radius: 11px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.provider-tabs button.is-active {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.09);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
 .legacy-state.is-loading svg {
   animation: cloud-spin 900ms linear infinite;
 }
@@ -1127,14 +1156,16 @@ input:disabled {
   font: 650 11px/1.4 var(--font-mono);
 }
 
-.cloud-song-list {
+.cloud-song-list,
+.cloud-playlist-list {
   display: grid;
   width: 100%;
   gap: 7px;
   margin-top: 10px;
 }
 
-.cloud-song-list > button {
+.cloud-song-list > button,
+.cloud-playlist-list > button {
   display: grid;
   min-height: 70px;
   grid-template-columns: 54px minmax(0, 1fr) auto 34px;
@@ -1149,19 +1180,22 @@ input:disabled {
   cursor: pointer;
 }
 
-.cloud-song-list > button:hover {
+.cloud-song-list > button:hover,
+.cloud-playlist-list > button:hover {
   border-color: rgba(0, 245, 212, 0.28);
   background: rgba(0, 245, 212, 0.055);
 }
 
-.cloud-song-list > button > img {
+.cloud-song-list > button > img,
+.cloud-playlist-list > button > img {
   width: 54px;
   height: 54px;
   border-radius: 13px;
   object-fit: cover;
 }
 
-.cloud-song-list > button > span {
+.cloud-song-list > button > span,
+.cloud-playlist-list > button > span {
   display: flex;
   min-width: 0;
   flex-direction: column;
@@ -1169,13 +1203,16 @@ input:disabled {
 }
 
 .cloud-song-list strong,
-.cloud-song-list small {
+.cloud-song-list small,
+.cloud-playlist-list strong,
+.cloud-playlist-list small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .cloud-song-list small,
+.cloud-playlist-list small,
 .cloud-song-list time {
   color: var(--dim);
   font-size: 11px;
@@ -1183,6 +1220,30 @@ input:disabled {
 
 .cloud-song-list time {
   font-family: var(--font-mono);
+}
+
+.cloud-playlist-list > button {
+  grid-template-columns: 54px minmax(0, 1fr) 34px;
+}
+
+.cloud-playlist-list .playlist-enter {
+  transform: rotate(180deg);
+}
+
+.cloud-list-back {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  margin-top: 10px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  cursor: pointer;
+  font-size: 11px;
 }
 
 .cloud-modal-footer {
@@ -1273,6 +1334,115 @@ input:disabled {
 .dock-cluster button.is-active {
   color: var(--gold);
 }
+
+.dock-setting {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+}
+
+.dock-cluster .quality-pill {
+  width: auto;
+  min-width: 43px;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.76);
+  background: rgba(255, 255, 255, 0.04);
+  font: 760 10px/1 var(--font-mono);
+}
+
+.dock-setting-popover {
+  position: absolute;
+  z-index: 8;
+  bottom: calc(100% + 18px);
+  display: grid;
+  width: 286px;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 19px;
+  opacity: 0;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(10, 11, 15, 0.96);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+  transform: translateY(8px) scale(0.98);
+  transform-origin: bottom;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+@supports (backdrop-filter: blur(18px)) {
+  .dock-setting-popover {
+    background: rgba(10, 11, 15, 0.78);
+    backdrop-filter: blur(20px) saturate(1.08);
+  }
+}
+
+.quality-setting .dock-setting-popover { left: 0; }
+.effect-setting .dock-setting-popover { right: 0; }
+
+.dock-setting.is-open .dock-setting-popover {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+}
+
+.dock-setting-popover > span {
+  padding: 2px 4px 5px;
+  color: var(--dim);
+  font: 700 10px/1.3 var(--font-mono);
+  letter-spacing: 0.04em;
+}
+
+.dock-cluster .dock-setting-popover > button {
+  display: grid;
+  width: 100%;
+  height: auto;
+  min-height: 48px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 12px;
+  color: rgba(255, 255, 255, 0.74);
+  background: rgba(255, 255, 255, 0.025);
+  text-align: left;
+}
+
+.dock-cluster .effect-popover > button {
+  grid-template-columns: 82px minmax(0, 1fr);
+}
+
+.dock-cluster .dock-setting-popover > button:hover:not(:disabled),
+.dock-cluster .dock-setting-popover > button.is-active {
+  border-color: rgba(0, 245, 212, 0.22);
+  color: #fff;
+  background: rgba(0, 245, 212, 0.055);
+  transform: none;
+}
+
+.dock-setting-popover strong,
+.dock-setting-popover small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dock-setting-popover strong { font-size: 12px; }
+.dock-setting-popover small { color: var(--dim); font-size: 9.5px; }
+
+.dock-setting-popover p {
+  margin: 4px 4px 1px;
+  color: var(--dim);
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.mobile-quality-setting { display: none; }
 
 .dock-track > img {
   width: 52px;
@@ -1593,13 +1763,27 @@ input:disabled {
     justify-content: center;
   }
 
+  .mobile-quality-setting { display: flex; }
+
   .dock-volume {
     min-width: 92px;
   }
 
-  .dock-modes > button:nth-of-type(3),
-  .dock-modes > button:nth-of-type(4) {
+  .dock-device-button,
+  .dock-immersive-button {
     display: none;
+  }
+
+  .dock-setting-popover,
+  .quality-setting .dock-setting-popover,
+  .effect-setting .dock-setting-popover {
+    position: fixed;
+    right: 10px;
+    bottom: max(118px, calc(env(safe-area-inset-bottom) + 108px));
+    left: 10px;
+    width: auto;
+    max-height: min(460px, calc(100dvh - 150px));
+    overflow-y: auto;
   }
 
   .room-drawer {
@@ -1632,7 +1816,9 @@ input:disabled {
 
   .cloud-modal > p { font-size: 12px; }
   .cloud-song-list > button { grid-template-columns: 48px minmax(0, 1fr) 30px; gap: 9px; }
-  .cloud-song-list > button > img { width: 48px; height: 48px; }
+  .cloud-playlist-list > button { grid-template-columns: 48px minmax(0, 1fr) 30px; gap: 9px; }
+  .cloud-song-list > button > img,
+  .cloud-playlist-list > button > img { width: 48px; height: 48px; }
   .cloud-song-list time { display: none; }
   .cloud-profile { grid-template-columns: auto minmax(0, 1fr); }
   .cloud-profile > button { grid-column: 1 / -1; }

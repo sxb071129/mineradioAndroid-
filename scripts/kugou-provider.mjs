@@ -1,0 +1,1305 @@
+import {
+  constants as cryptoConstants,
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  publicEncrypt,
+  randomInt,
+  randomUUID,
+} from "node:crypto";
+import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import path from "node:path";
+
+const require = createRequire(import.meta.url);
+
+const PROVIDER = "kugou";
+const APP_ID = "3116";
+const CLIENT_VERSION = "11440";
+const QR_APP_ID = "1001";
+const QR_SOURCE_APP_ID = "2919";
+const ANDROID_SIGNATURE_KEY = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
+const WEB_SIGNATURE_KEY = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
+const PLAY_KEY_SALT = "kgcloudv2";
+const ANDROID_USER_AGENT = "Android15-1070-11440-46-0-DiscoveryDRADProtocol-wifi";
+const BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+const GATEWAY_ORIGIN = "https://gateway.kugou.com";
+const LOGIN_ORIGIN = "https://login-user.kugou.com";
+const USER_SERVICE_ORIGIN = "https://userservice.kugou.com";
+const TRACKER_ORIGIN = "https://trackercdn.kugou.com";
+const FIXED_API_ORIGINS = new Set([
+  GATEWAY_ORIGIN,
+  LOGIN_ORIGIN,
+  USER_SERVICE_ORIGIN,
+  TRACKER_ORIGIN,
+]);
+const STREAM_HOST_SUFFIXES = ["kugou.com", "kgimg.com", "kugou.net"];
+
+const REQUEST_TIMEOUT_MS = 12_000;
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_AUTH_FILE_BYTES = 64 * 1024;
+const QR_TTL_MS = 10 * 60 * 1000;
+const MAX_QR_SESSIONS = 16;
+const MAX_PLAYLIST_PAGES = 10;
+const PLAYLIST_PAGE_SIZE = 200;
+
+const HASH_RE = /^[a-fA-F0-9]{32}$/;
+const IDENTIFIER_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const QR_KEY_RE = /^[A-Za-z0-9_-]{8,256}$/;
+const USER_ID_RE = /^\d{1,24}$/;
+const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DEVICE_TOKEN_RE = /^[A-Z0-9]{8,64}$/;
+const DFID_RE = /^[A-Za-z0-9_-]{0,128}$/;
+const QUALITY_LEVELS = Object.freeze([
+  "jymaster",
+  "hires",
+  "lossless",
+  "exhigh",
+  "standard",
+]);
+const QUALITY_SET = new Set(QUALITY_LEVELS);
+const QUALITY_FALLBACKS = Object.freeze({
+  jymaster: ["jymaster", "hires", "lossless", "exhigh", "standard"],
+  hires: ["hires", "lossless", "exhigh", "standard"],
+  lossless: ["lossless", "exhigh", "standard"],
+  exhigh: ["exhigh", "standard"],
+  standard: ["standard"],
+});
+
+const KUGOU_RSA_PUBLIC_KEY = [
+  "-----BEGIN PUBLIC KEY-----",
+  "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDECi0Np2UR87scwrvTr72L6oO01rBbbBPriSDFPxr3Z5syug0O24QyQO8bg27+0+4kBzTBTBOZ/WWU0WryL1JSXRTXLgFVxtzIY41Pe7lPOgsfTCn5kZcvKhYKJesKnnJDNr5/abvTGf+rHG3YRwsCHcQ08/q6ifSioBszvb3QiwIDAQAB",
+  "-----END PUBLIC KEY-----",
+].join("\n");
+
+function makeError(code, statusCode = 502) {
+  const error = new Error(code);
+  error.code = code;
+  error.statusCode = statusCode;
+  return error;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function firstNonEmpty(...values) {
+  return values.find((value) => value != null && String(value).trim() !== "") ?? "";
+}
+
+function md5(value) {
+  return createHash("md5").update(String(value ?? "")).digest("hex");
+}
+
+function randomUppercaseString(length) {
+  const alphabet = "1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let output = "";
+  for (let index = 0; index < length; index += 1) {
+    output += alphabet[randomInt(0, alphabet.length)];
+  }
+  return output;
+}
+
+function randomLowercaseString(length) {
+  return randomUppercaseString(length).toLowerCase();
+}
+
+function calculateMid(guid) {
+  return BigInt(`0x${md5(guid)}`).toString(10);
+}
+
+function cleanText(value, maxLength = 256) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function cleanTrackText(value) {
+  return cleanText(value, 300)
+    .replace(/\.(mp3|flac|m4a|aac|ogg|wav)$/i, "")
+    .trim();
+}
+
+function cleanIdentifier(value, label = "identifier") {
+  const normalized = String(value ?? "").trim();
+  if (!IDENTIFIER_RE.test(normalized)) throw makeError(`invalid_${label}`, 400);
+  return normalized;
+}
+
+function optionalNumericIdentifier(value, label) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) return "";
+  if (!/^\d{1,24}$/.test(normalized)) throw makeError(`invalid_${label}`, 400);
+  return normalized;
+}
+
+function normalizeHash(value, { optional = false, label = "hash" } = {}) {
+  const normalized = String(value ?? "").trim().toUpperCase();
+  if (!normalized && optional) return "";
+  if (!HASH_RE.test(normalized)) throw makeError(`invalid_${label}`, 400);
+  return normalized;
+}
+
+function normalizeQuality(value) {
+  if (value == null || value === "") return "hires";
+  const normalized = String(value).trim().toLowerCase();
+  if (!QUALITY_SET.has(normalized)) throw makeError("invalid_quality", 400);
+  return normalized;
+}
+
+function safePublicUrl(value, { allowHttp = true, providerOnly = false } = {}) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw.length > 2_048) return "";
+  let resolved;
+  try {
+    resolved = new URL(raw);
+  } catch {
+    return "";
+  }
+  if ((!allowHttp && resolved.protocol !== "https:") ||
+      (allowHttp && resolved.protocol !== "https:" && resolved.protocol !== "http:") ||
+      resolved.username || resolved.password || resolved.port) {
+    return "";
+  }
+  if (providerOnly) {
+    const hostname = resolved.hostname.toLowerCase().replace(/\.$/, "");
+    const allowed = STREAM_HOST_SUFFIXES.some(
+      (suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`),
+    );
+    if (!allowed) return "";
+  }
+  return resolved.toString();
+}
+
+function safeProviderMessage(value) {
+  return cleanText(value, 300)
+    .replace(/((?:token|cookie|kugoo)\s*[=:]\s*)[^\s,;]+/gi, "$1[redacted]");
+}
+
+function signValue(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
+function androidSignature(params, dataString = "") {
+  const body = Object.keys(params)
+    .sort()
+    .map((key) => `${key}=${signValue(params[key])}`)
+    .join("");
+  return md5(ANDROID_SIGNATURE_KEY + body + dataString + ANDROID_SIGNATURE_KEY);
+}
+
+function webSignature(params) {
+  const body = Object.keys(params)
+    .sort()
+    .map((key) => `${key}=${params[key] == null ? "" : params[key]}`)
+    .join("");
+  return md5(WEB_SIGNATURE_KEY + body + WEB_SIGNATURE_KEY);
+}
+
+function createDeviceIdentity(existing = {}) {
+  if (!isPlainObject(existing)) throw makeError("invalid_auth_device", 500);
+  const guid = existing.guid || randomUUID();
+  const mid = existing.mid || calculateMid(guid);
+  const mac = existing.mac || randomUppercaseString(12);
+  const dev = existing.dev || randomUppercaseString(16);
+  const dfid = existing.dfid || "-";
+  if (!GUID_RE.test(guid) || !/^\d{1,64}$/.test(String(mid)) ||
+      !DEVICE_TOKEN_RE.test(mac) || !DEVICE_TOKEN_RE.test(dev) ||
+      !(dfid === "-" || DFID_RE.test(dfid))) {
+    throw makeError("invalid_auth_device", 500);
+  }
+  return {
+    guid: String(guid),
+    mid: String(mid),
+    mac: String(mac),
+    dev: String(dev),
+    dfid: String(dfid),
+  };
+}
+
+function normalizeSession(existing) {
+  if (existing == null) return null;
+  if (!isPlainObject(existing)) throw makeError("invalid_auth_session", 500);
+  const userId = String(existing.userId ?? existing.userid ?? "").trim();
+  const token = String(existing.token ?? "").trim();
+  if (!userId && !token) return null;
+  if (!USER_ID_RE.test(userId) || !token || token.length > 2_048 ||
+      /[\u0000-\u001f\u007f]/.test(token)) {
+    throw makeError("invalid_auth_session", 500);
+  }
+  const vipType = Math.max(0, Math.min(1_000_000, Number(existing.vipType) || 0));
+  return {
+    userId,
+    token,
+    nickname: cleanText(existing.nickname, 128),
+    avatar: safePublicUrl(existing.avatar, { providerOnly: true }),
+    vipType,
+  };
+}
+
+function serializeState(state) {
+  return JSON.stringify(
+    {
+      version: 1,
+      device: state.device,
+      session: state.session,
+      updatedAt: new Date().toISOString(),
+    },
+    null,
+    2,
+  ) + "\n";
+}
+
+async function loadAuthState(authFile) {
+  try {
+    const details = await stat(authFile);
+    if (!details.isFile() || details.size > MAX_AUTH_FILE_BYTES) {
+      throw makeError("invalid_auth_file", 500);
+    }
+    const parsed = JSON.parse(await readFile(authFile, "utf8"));
+    if (!isPlainObject(parsed) || (parsed.version != null && parsed.version !== 1)) {
+      throw makeError("invalid_auth_file", 500);
+    }
+    return {
+      device: createDeviceIdentity(parsed.device),
+      session: normalizeSession(parsed.session),
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { device: createDeviceIdentity(), session: null };
+    }
+    if (error?.code && String(error.code).startsWith("invalid_")) throw error;
+    throw makeError("invalid_auth_file", 500);
+  }
+}
+
+function headerValue(response, name) {
+  return response?.headers?.get?.(name) || "";
+}
+
+async function responseText(response) {
+  const declaredLength = Number(headerValue(response, "content-length")) || 0;
+  if (declaredLength > MAX_RESPONSE_BYTES) throw makeError("provider_response_too_large");
+  const text = await response.text();
+  if (Buffer.byteLength(text) > MAX_RESPONSE_BYTES) throw makeError("provider_response_too_large");
+  return text;
+}
+
+async function responseBuffer(response) {
+  const declaredLength = Number(headerValue(response, "content-length")) || 0;
+  if (declaredLength > MAX_RESPONSE_BYTES) throw makeError("provider_response_too_large");
+  const value = Buffer.from(await response.arrayBuffer());
+  if (value.length > MAX_RESPONSE_BYTES) throw makeError("provider_response_too_large");
+  return value;
+}
+
+function parseJson(text) {
+  try {
+    const parsed = JSON.parse(String(text || "{}"));
+    if (!isPlainObject(parsed) && !Array.isArray(parsed)) throw new Error("invalid");
+    return parsed;
+  } catch {
+    throw makeError("invalid_provider_response");
+  }
+}
+
+function deepFind(value, names, depth = 0) {
+  if (depth > 8 || value == null || typeof value !== "object") return "";
+  for (const name of names) {
+    if (value[name] != null && String(value[name]) !== "") return value[name];
+  }
+  for (const child of Object.values(value)) {
+    const result = deepFind(child, names, depth + 1);
+    if (result != null && String(result) !== "") return result;
+  }
+  return "";
+}
+
+function safeGet(value, keys, fallback = "") {
+  let current = value;
+  for (const key of keys) {
+    if (!current || typeof current !== "object" || !(key in current)) return fallback;
+    current = current[key];
+  }
+  return current == null ? fallback : current;
+}
+
+function asArrayDeep(value, keys, depth = 0) {
+  if (Array.isArray(value)) return value;
+  if (depth > 8 || !value || typeof value !== "object") return [];
+  for (const key of keys) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+  for (const child of Object.values(value)) {
+    if (child && typeof child === "object") {
+      const result = asArrayDeep(child, keys, depth + 1);
+      if (result.length) return result;
+    }
+  }
+  return [];
+}
+
+function replaceCoverSize(value, size) {
+  const raw = String(value ?? "").replace(/\{size\}/g, String(size));
+  return safePublicUrl(raw);
+}
+
+function mapPlaylist(raw) {
+  if (!isPlainObject(raw)) return null;
+  const id = String(
+    firstNonEmpty(raw.listid, raw.list_id, raw.global_collection_id, raw.specialid, raw.id),
+  ).trim();
+  if (!IDENTIFIER_RE.test(id)) return null;
+  const name = cleanText(
+    firstNonEmpty(raw.name, raw.listname, raw.list_name, raw.specialname, raw.title, raw.collection_name),
+    200,
+  );
+  if (!name) return null;
+  return {
+    provider: PROVIDER,
+    source: PROVIDER,
+    type: PROVIDER,
+    id,
+    name,
+    cover: replaceCoverSize(
+      firstNonEmpty(raw.pic, raw.img, raw.cover, raw.sizable_cover, raw.list_pic, raw.avatar),
+      240,
+    ),
+    trackCount: Math.max(
+      0,
+      Math.min(
+        1_000_000,
+        Number(raw.count ?? raw.song_count ?? raw.total ?? raw.file_count ?? raw.songcount) || 0,
+      ),
+    ),
+    creator: cleanText(raw.username ?? raw.nickname ?? raw.user_name ?? "酷狗音乐", 128),
+  };
+}
+
+function extractQualityHashes(raw, trans) {
+  const candidates = {
+    standard: firstNonEmpty(raw["128hash"], raw.hash, raw.Hash, raw.file_hash, trans.ogg_128_hash),
+    exhigh: firstNonEmpty(raw["320hash"], raw.HQFileHash, trans.ogg_320_hash),
+    lossless: firstNonEmpty(raw.sqhash, raw.SQFileHash, raw.flac_hash),
+    hires: firstNonEmpty(raw.hrhash, raw.high_hash),
+    jymaster: firstNonEmpty(raw.masterhash, raw.jymaster_hash),
+  };
+  return Object.fromEntries(
+    QUALITY_LEVELS.map((level) => {
+      const candidate = String(candidates[level] ?? "").trim().toUpperCase();
+      return [level, HASH_RE.test(candidate) ? candidate : ""];
+    }),
+  );
+}
+
+function normalizeSimpleTitle(value) {
+  return cleanTrackText(value).toLowerCase().replace(/\s+/g, "");
+}
+
+function mapTrack(raw) {
+  if (!isPlainObject(raw)) return null;
+  const trans = isPlainObject(raw.trans_param)
+    ? raw.trans_param
+    : (isPlainObject(raw.transParam) ? raw.transParam : {});
+  const qualityHashes = extractQualityHashes(raw, trans);
+  const rawHash = firstNonEmpty(
+    raw.hash,
+    raw.Hash,
+    raw.file_hash,
+    raw.FileHash,
+    raw.audio_hash,
+    raw["320hash"],
+    raw["128hash"],
+    raw.sqhash,
+    raw.SQFileHash,
+    raw.HQFileHash,
+    trans.ogg_320_hash,
+    trans.ogg_128_hash,
+  );
+  const hash = String(rawHash).trim().toUpperCase();
+  const safeHash = HASH_RE.test(hash) ? hash : "";
+  const albumAudioId = String(
+    firstNonEmpty(
+      raw.album_audio_id,
+      raw.albumAudioId,
+      raw.audio_id,
+      raw.audioid,
+      raw.Audioid,
+      raw.mixsongid,
+      raw.songid,
+      raw.id,
+    ),
+  ).trim();
+  const safeAlbumAudioId = /^\d{1,24}$/.test(albumAudioId) ? albumAudioId : "";
+  const filename = cleanTrackText(firstNonEmpty(raw.filename, raw.FileName));
+  let name = cleanTrackText(firstNonEmpty(raw.songname, raw.song_name, raw.name, raw.title));
+  let artist = cleanTrackText(
+    firstNonEmpty(raw.singername, raw.singer_name, raw.author_name, raw.singer, raw.artist),
+  );
+  if (!artist && Array.isArray(raw.singerinfo)) {
+    artist = raw.singerinfo
+      .map((item) => cleanTrackText(item?.name))
+      .filter(Boolean)
+      .join(" / ");
+  }
+  if (filename) {
+    const parts = filename.split(" - ");
+    if (parts.length >= 2) {
+      const filenameArtist = cleanTrackText(parts.shift());
+      const filenameTitle = cleanTrackText(parts.join(" - "));
+      artist ||= filenameArtist;
+      if (!name || normalizeSimpleTitle(name) === normalizeSimpleTitle(filename)) name = filenameTitle;
+    } else {
+      name ||= filename;
+    }
+  }
+  if (name && artist && name.includes(" - ")) {
+    const parts = name.split(" - ");
+    const possibleArtist = cleanTrackText(parts.shift());
+    const possibleTitle = cleanTrackText(parts.join(" - "));
+    if (possibleTitle && normalizeSimpleTitle(possibleArtist) === normalizeSimpleTitle(artist)) {
+      name = possibleTitle;
+    }
+  }
+  name = cleanTrackText(name).replace(/\s*-\s*$/, "");
+  if (!name || (!safeHash && !safeAlbumAudioId)) return null;
+
+  const albumInfo = isPlainObject(raw.albuminfo)
+    ? raw.albuminfo
+    : (isPlainObject(raw.albumInfo) ? raw.albumInfo : {});
+  const albumId = String(firstNonEmpty(raw.album_id, raw.albumid, raw.AlbumID, raw.albumId)).trim();
+  const safeAlbumId = /^\d{1,24}$/.test(albumId) ? albumId : "";
+  const rawDuration = Math.max(
+    0,
+    Number(raw.timelength ?? raw.time_length ?? raw.timelen ?? raw.duration ?? raw.interval) || 0,
+  );
+  const duration = Math.min(24 * 60 * 60 * 1_000, rawDuration > 1_000 ? rawDuration : rawDuration * 1_000);
+  const position = Math.max(0, Number(raw.fsort ?? raw.sort ?? raw.position ?? raw.pos) || 0);
+  return {
+    provider: PROVIDER,
+    source: PROVIDER,
+    type: PROVIDER,
+    id: safeHash || safeAlbumAudioId,
+    hash: safeHash,
+    qualityHashes,
+    albumAudioId: safeAlbumAudioId,
+    albumId: safeAlbumId,
+    name,
+    artist,
+    artists: artist ? [{ name: artist }] : [],
+    album: cleanText(firstNonEmpty(raw.album_name, raw.albumname, raw.album, albumInfo.name), 200),
+    cover: replaceCoverSize(
+      firstNonEmpty(raw.pic, raw.img, raw.image, raw.cover, raw.sizable_cover, trans.union_cover),
+      300,
+    ),
+    duration,
+    fee: Math.max(
+      0,
+      Number(raw.privilege ?? raw.media_privilege ?? raw.media_pay_type ?? raw.pay_type) || 0,
+    ),
+    fsort: position,
+    position,
+    sort: position,
+    playable: Boolean(safeHash),
+  };
+}
+
+function sortCloudTracks(tracks) {
+  return tracks.slice().sort((left, right) => {
+    const leftPosition = Number(left?.fsort ?? left?.sort ?? left?.position ?? left?.pos) || 0;
+    const rightPosition = Number(right?.fsort ?? right?.sort ?? right?.position ?? right?.pos) || 0;
+    if (leftPosition || rightPosition) return leftPosition - rightPosition;
+    const leftCollected = Number(left?.collecttime ?? left?.collect_time) || 0;
+    const rightCollected = Number(right?.collecttime ?? right?.collect_time) || 0;
+    return leftCollected - rightCollected;
+  });
+}
+
+function normalizeQualityHashes(value) {
+  if (value == null) return {};
+  if (!isPlainObject(value)) throw makeError("invalid_quality_hashes", 400);
+  for (const key of Object.keys(value)) {
+    if (!QUALITY_SET.has(key)) throw makeError("invalid_quality_hashes", 400);
+  }
+  const result = {};
+  for (const level of QUALITY_LEVELS) {
+    const raw = String(value[level] ?? "").trim();
+    result[level] = raw ? normalizeHash(raw, { label: "quality_hash" }) : "";
+  }
+  return result;
+}
+
+function selectQualityHash(baseHash, quality, hashes) {
+  for (const level of QUALITY_FALLBACKS[quality]) {
+    if (hashes[level]) return { hash: hashes[level], level };
+  }
+  return { hash: baseHash, level: quality };
+}
+
+function pruneQrSessions(sessions) {
+  const now = Date.now();
+  for (const [key, value] of sessions) {
+    if (!value || value.expiresAt <= now) sessions.delete(key);
+  }
+  while (sessions.size >= MAX_QR_SESSIONS) sessions.delete(sessions.keys().next().value);
+}
+
+export async function createKugouProvider({
+  authFile,
+  fetchImpl = fetch,
+  qrCode,
+} = {}) {
+  if (typeof fetchImpl !== "function") throw makeError("invalid_fetch_implementation", 500);
+  if (typeof authFile !== "string" || !authFile.trim() || authFile.includes("\u0000")) {
+    throw makeError("auth_file_required", 500);
+  }
+  const resolvedAuthFile = path.resolve(authFile);
+  await mkdir(path.dirname(resolvedAuthFile), { recursive: true });
+
+  const qrLibrary = qrCode ?? require("qrcode");
+  const toDataUrl = typeof qrLibrary === "function"
+    ? qrLibrary
+    : qrLibrary?.toDataURL?.bind(qrLibrary);
+  if (typeof toDataUrl !== "function") throw makeError("invalid_qr_code_implementation", 500);
+
+  let state = await loadAuthState(resolvedAuthFile);
+  let saveTail = Promise.resolve();
+  const qrSessions = new Map();
+
+  function persistState() {
+    const snapshot = serializeState(state);
+    saveTail = saveTail.then(async () => {
+      await writeFile(resolvedAuthFile, snapshot, { encoding: "utf8", mode: 0o600 });
+      await chmod(resolvedAuthFile, 0o600);
+    });
+    return saveTail;
+  }
+
+  function publicProviderMessage(value) {
+    let message = safeProviderMessage(value);
+    const token = state.session?.token;
+    if (token) message = message.split(token).join("[redacted]");
+    return message;
+  }
+
+  await persistState();
+
+  function cookieHeader() {
+    const session = state.session;
+    const pairs = [
+      ["userid", session?.userId],
+      ["token", session?.token],
+      ["dfid", state.device.dfid],
+      ["KUGOU_API_MID", state.device.mid],
+      ["KUGOU_API_GUID", state.device.guid],
+      ["KUGOU_API_MAC", state.device.mac],
+      ["KUGOU_API_DEV", state.device.dev],
+    ];
+    return pairs
+      .filter(([, value]) => value != null && String(value) !== "")
+      .map(([key, value]) => `${key}=${encodeURIComponent(String(value))}`)
+      .join("; ");
+  }
+
+  function cloudlistCookieHeader() {
+    const pairs = [
+      ["userid", state.session?.userId],
+      ["token", state.session?.token],
+      ["KUGOU_API_MID", state.device.mid],
+    ];
+    return pairs
+      .filter(([, value]) => value != null && String(value) !== "")
+      .map(([key, value]) => `${key}=${encodeURIComponent(String(value))}`)
+      .join("; ");
+  }
+
+  async function fetchFixed(urlValue, init = {}, responseType = "json", redirectCount = 0) {
+    const target = new URL(urlValue);
+    if (!FIXED_API_ORIGINS.has(target.origin) || target.username || target.password || target.port) {
+      throw makeError("provider_origin_rejected");
+    }
+    const controller = new AbortController();
+    let timer;
+    try {
+      const request = Promise.resolve().then(() => fetchImpl(target, {
+        ...init,
+        redirect: "manual",
+        signal: controller.signal,
+      }));
+      const response = await Promise.race([
+        request,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(makeError("provider_timeout", 504));
+          }, REQUEST_TIMEOUT_MS);
+        }),
+      ]);
+      const statusCode = Number(response?.status) || 0;
+      if (statusCode >= 300 && statusCode < 400) {
+        const location = headerValue(response, "location");
+        if (!location || redirectCount >= 2) throw makeError("provider_redirect_rejected");
+        const next = new URL(location, target);
+        if (next.origin !== target.origin) throw makeError("provider_cross_origin_redirect_rejected");
+        return fetchFixed(next, init, responseType, redirectCount + 1);
+      }
+      if (!(response?.ok ?? (statusCode >= 200 && statusCode < 300))) {
+        throw makeError("provider_request_failed");
+      }
+      if (responseType === "buffer") return responseBuffer(response);
+      const text = await responseText(response);
+      if (responseType === "text") return text;
+      return parseJson(text);
+    } catch (error) {
+      if (error?.code && (String(error.code).startsWith("provider_") ||
+          String(error.code).startsWith("invalid_provider_"))) {
+        throw error;
+      }
+      if (error?.name === "AbortError") throw makeError("provider_timeout", 504);
+      throw makeError("provider_unavailable");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function gatewayRequest(pathname, options = {}) {
+    if (typeof pathname !== "string" || !pathname.startsWith("/") || pathname.includes("\\")) {
+      throw makeError("invalid_provider_path", 500);
+    }
+    const origin = options.origin || GATEWAY_ORIGIN;
+    if (!FIXED_API_ORIGINS.has(origin)) throw makeError("provider_origin_rejected");
+    const clientTime = String(Math.floor(Date.now() / 1_000));
+    const params = {
+      dfid: state.device.dfid,
+      mid: state.device.mid,
+      uuid: "-",
+      appid: APP_ID,
+      clientver: CLIENT_VERSION,
+      clienttime: clientTime,
+      ...(options.params || {}),
+    };
+    if (state.session?.token && !params.token) params.token = state.session.token;
+    if (state.session?.userId && !params.userid) params.userid = state.session.userId;
+
+    const hasBody = options.data != null;
+    const dataString = hasBody
+      ? (typeof options.data === "string" ? options.data : JSON.stringify(options.data))
+      : "";
+    if (!options.noSignature && !params.signature) {
+      params.signature = options.signatureType === "web"
+        ? webSignature(params)
+        : androidSignature(params, dataString);
+    }
+    const target = new URL(pathname, origin);
+    for (const [key, value] of Object.entries(params)) {
+      if (value != null) target.searchParams.set(key, String(value));
+    }
+    const headers = {
+      "User-Agent": ANDROID_USER_AGENT,
+      "kg-rc": "1",
+      "kg-thash": "5d816a0",
+      "kg-rec": "1",
+      "kg-rf": "B9EDA08A64250DEFFBCADDEE00F8F25F",
+      dfid: state.device.dfid,
+      mid: state.device.mid,
+      clienttime: clientTime,
+      ...(options.headers || {}),
+    };
+    const cookie = cookieHeader();
+    if (cookie) headers.Cookie = cookie;
+    if (hasBody && typeof options.data !== "string") headers["Content-Type"] = "application/json";
+    return fetchFixed(
+      target,
+      {
+        method: String(options.method || "GET").toUpperCase(),
+        headers,
+        ...(hasBody ? { body: dataString } : {}),
+      },
+      options.responseType || "json",
+    );
+  }
+
+  async function cloudlistRequest(pathname, params, data) {
+    const clientTime = String(Math.floor(Date.now() / 1_000));
+    const finalParams = {
+      dfid: state.device.dfid,
+      mid: state.device.mid,
+      uuid: "-",
+      appid: APP_ID,
+      clientver: CLIENT_VERSION,
+      clienttime: clientTime,
+      userid: state.session?.userId || "",
+      token: state.session?.token || "",
+      ...(params || {}),
+    };
+    const dataString = data == null ? "" : JSON.stringify(data);
+    finalParams.signature = androidSignature(finalParams, dataString);
+    const target = new URL(pathname, GATEWAY_ORIGIN);
+    for (const [key, value] of Object.entries(finalParams)) {
+      if (value != null) target.searchParams.set(key, String(value));
+    }
+    return fetchFixed(target, {
+      method: dataString ? "POST" : "GET",
+      headers: {
+        "User-Agent": ANDROID_USER_AGENT,
+        "x-router": "cloudlist.service.kugou.com",
+        "kg-rc": "1",
+        "kg-thash": "5d816a0",
+        "kg-rec": "1",
+        "kg-rf": "B9EDA08A64250DEFFBCADDEE00F8F25F",
+        dfid: state.device.dfid,
+        mid: state.device.mid,
+        clienttime: clientTime,
+        "Content-Type": "application/json",
+        Cookie: cloudlistCookieHeader(),
+      },
+      ...(dataString ? { body: dataString } : {}),
+    });
+  }
+
+  async function registerDevice() {
+    if (!state.session) return;
+    const dataMap = {
+      availableRamSize: 4_983_533_568,
+      availableRomSize: 48_114_719,
+      availableSDSize: 48_114_717,
+      basebandVer: "",
+      batteryLevel: 100,
+      batteryStatus: 3,
+      brand: "Redmi",
+      buildSerial: "unknown",
+      device: "marble",
+      imei: state.device.guid,
+      imsi: "",
+      manufacturer: "Xiaomi",
+      uuid: state.device.guid,
+      accelerometerValue: "",
+      gravity: false,
+      gravityValue: "",
+      gyroscope: false,
+      gyroscopeValue: "",
+      light: false,
+      lightValue: "",
+      magnetic: false,
+      magneticValue: "",
+      orientation: false,
+      orientationValue: "",
+      pressure: false,
+      pressureValue: "",
+      step_counter: false,
+      step_counterValue: "",
+      temperature: false,
+      temperatureValue: "",
+      accelerometer: false,
+    };
+    const aesKey = randomLowercaseString(6);
+    const digest = md5(aesKey);
+    const key = Buffer.from(digest.slice(0, 16), "utf8");
+    const iv = Buffer.from(digest.slice(16, 32), "utf8");
+    const cipher = createCipheriv("aes-128-cbc", key, iv);
+    const encrypted = Buffer.concat([
+      cipher.update(JSON.stringify(dataMap), "utf8"),
+      cipher.final(),
+    ]).toString("base64");
+    const rsaPayload = JSON.stringify({
+      aes: aesKey,
+      uid: state.session.userId,
+      token: state.session.token,
+    });
+    const encryptedParams = publicEncrypt(
+      { key: KUGOU_RSA_PUBLIC_KEY, padding: cryptoConstants.RSA_PKCS1_PADDING },
+      Buffer.from(rsaPayload),
+    ).toString("hex");
+    const response = await gatewayRequest("/risk/v2/r_register_dev", {
+      origin: USER_SERVICE_ORIGIN,
+      method: "POST",
+      responseType: "buffer",
+      params: { part: 1, platid: 1, p: encryptedParams },
+      data: encrypted,
+      headers: { "x-router": "userservice.kugou.com" },
+    });
+    let parsed;
+    const plain = response.toString("utf8").trim();
+    if (plain.startsWith("{")) {
+      parsed = parseJson(plain);
+    } else {
+      const decipher = createDecipheriv("aes-128-cbc", key, iv);
+      const decrypted = Buffer.concat([decipher.update(response), decipher.final()]).toString("utf8");
+      parsed = parseJson(decrypted);
+    }
+    const dfid = String(safeGet(parsed, ["data", "dfid"], "")).trim();
+    if (dfid && DFID_RE.test(dfid)) {
+      state = { ...state, device: { ...state.device, dfid } };
+      await persistState();
+    }
+  }
+
+  async function loginStatus() {
+    const session = state.session;
+    const loggedIn = Boolean(session?.userId && session?.token);
+    const vipType = loggedIn ? Math.max(0, Number(session.vipType) || 0) : 0;
+    const isVip = vipType > 0;
+    return {
+      provider: PROVIDER,
+      loggedIn,
+      hasCookie: loggedIn,
+      userId: loggedIn ? session.userId : "",
+      nickname: loggedIn ? (session.nickname || "酷狗音乐用户") : "酷狗音乐",
+      avatar: loggedIn ? session.avatar : "",
+      vipType,
+      vipLevel: isVip ? "vip" : "none",
+      isVip,
+      isSvip: false,
+      vipLabel: isVip ? "Kugou VIP" : "无 VIP",
+      playbackKeyReady: loggedIn,
+      preview: !loggedIn,
+      message: loggedIn ? "已保存酷狗网页登录会话" : "未登录酷狗音乐",
+    };
+  }
+
+  async function loginQrKey() {
+    pruneQrSessions(qrSessions);
+    const qrPrefix = `https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=${APP_ID}&`;
+    const data = await gatewayRequest("/v2/qrcode", {
+      origin: LOGIN_ORIGIN,
+      signatureType: "web",
+      params: {
+        appid: QR_APP_ID,
+        type: 1,
+        plat: 4,
+        qrcode_txt: qrPrefix,
+        srcappid: QR_SOURCE_APP_ID,
+      },
+      headers: {
+        "User-Agent": BROWSER_USER_AGENT,
+        "x-router": "login-user.kugou.com",
+      },
+    });
+    const rawKey = safeGet(data, ["data", "qrcode"], "") || data.qrcode || data.key || "";
+    const key = String(rawKey).trim();
+    if (!QR_KEY_RE.test(key)) throw makeError("kugou_qr_key_failed");
+    const url = `https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode=${encodeURIComponent(key)}`;
+    const img = await toDataUrl(url, {
+      margin: 1,
+      width: 220,
+      errorCorrectionLevel: "M",
+    });
+    if (typeof img !== "string" || !img.startsWith("data:image/") || img.length > 1_000_000) {
+      throw makeError("kugou_qr_image_failed");
+    }
+    qrSessions.set(key, {
+      expiresAt: Date.now() + QR_TTL_MS,
+      deviceGuid: state.device.guid,
+    });
+    return {
+      provider: PROVIDER,
+      key,
+      qrcode: key,
+      url,
+      img,
+      deviceId: state.device.guid,
+    };
+  }
+
+  async function loginQrCheck(keyValue) {
+    const key = String(keyValue ?? "").trim();
+    if (!QR_KEY_RE.test(key)) throw makeError("invalid_qr_key", 400);
+    pruneQrSessions(qrSessions);
+    const issued = qrSessions.get(key);
+    if (!issued || issued.expiresAt <= Date.now() || issued.deviceGuid !== state.device.guid) {
+      qrSessions.delete(key);
+      return {
+        provider: PROVIDER,
+        loggedIn: false,
+        code: 800,
+        status: 0,
+        rawStatus: 0,
+        message: "Kugou QR key expired",
+      };
+    }
+    const data = await gatewayRequest("/v2/get_userinfo_qrcode", {
+      origin: LOGIN_ORIGIN,
+      signatureType: "web",
+      params: {
+        plat: 4,
+        appid: APP_ID,
+        srcappid: QR_SOURCE_APP_ID,
+        qrcode: key,
+      },
+      headers: {
+        "User-Agent": BROWSER_USER_AGENT,
+        "x-router": "login-user.kugou.com",
+      },
+    });
+    const status = Math.max(
+      0,
+      Number(safeGet(data, ["data", "status"], data.status || deepFind(data, ["status"]))) || 0,
+    );
+    const token = String(
+      safeGet(data, ["data", "token"], "") ||
+      deepFind(data, ["token", "user_token", "access_token", "key"]) ||
+      data.token || "",
+    ).trim();
+    const userId = String(
+      safeGet(data, ["data", "userid"], "") ||
+      deepFind(data, ["userid", "user_id", "uid", "kugooid", "kugouid"]) ||
+      data.userid || "",
+    ).replace(/\D/g, "");
+    const message = publicProviderMessage(data.message || data.msg || data.error_msg);
+
+    if (!(token && userId)) {
+      if (status !== 4) {
+        const code = status === 2 ? 802 : (status === 3 ? 800 : 801);
+        if (code === 800) qrSessions.delete(key);
+        return {
+          provider: PROVIDER,
+          loggedIn: false,
+          code,
+          status,
+          rawStatus: status,
+          message,
+        };
+      }
+      qrSessions.delete(key);
+      return {
+        provider: PROVIDER,
+        loggedIn: false,
+        code: 803,
+        status,
+        rawStatus: status,
+        error: "KUGOU_TOKEN_MISSING",
+        message: "Kugou login confirmed but token was not returned",
+      };
+    }
+
+    if (!USER_ID_RE.test(userId) || token.length > 2_048 || /[\u0000-\u001f\u007f]/.test(token)) {
+      qrSessions.delete(key);
+      throw makeError("invalid_provider_credentials");
+    }
+    const nickname = cleanText(
+      safeGet(data, ["data", "nickname"], "") ||
+      safeGet(data, ["data", "username"], "") ||
+      deepFind(data, ["nickname", "nick", "username", "user_name", "uname"]),
+      128,
+    );
+    const avatar = safePublicUrl(
+      safeGet(data, ["data", "pic"], "") ||
+      safeGet(data, ["data", "avatar"], "") ||
+      safeGet(data, ["data", "img"], "") ||
+      safeGet(data, ["data", "user_pic"], "") ||
+      deepFind(data, ["avatar", "pic", "img", "icon", "headpic", "head_img", "headimg", "user_pic", "userpic"]),
+      { providerOnly: true },
+    );
+    const vipType = Math.max(
+      0,
+      Math.min(
+        1_000_000,
+        Number(
+          safeGet(data, ["data", "vip_type"], 0) ||
+          safeGet(data, ["data", "vipType"], 0) ||
+          safeGet(data, ["data", "viptype"], 0) ||
+          deepFind(data, ["vip_type", "vipType", "viptype", "isvip", "is_vip", "vip"]),
+        ) || 0,
+      ),
+    );
+    state = {
+      ...state,
+      session: { userId, token, nickname, avatar, vipType },
+    };
+    await persistState();
+    qrSessions.delete(key);
+    try {
+      await registerDevice();
+    } catch {
+      // The authenticated session is already safely persisted. Device registration is best effort.
+    }
+    return {
+      ...(await loginStatus()),
+      code: 803,
+      status,
+      rawStatus: status,
+      saved: true,
+    };
+  }
+
+  async function logout() {
+    state = { ...state, session: null };
+    qrSessions.clear();
+    await persistState();
+    return { provider: PROVIDER, ok: true, loggedIn: false };
+  }
+
+  async function userPlaylists() {
+    const info = await loginStatus();
+    if (!info.loggedIn) return { loggedIn: false, provider: PROVIDER, playlists: [] };
+    const data = await gatewayRequest("/v7/get_all_list", {
+      method: "POST",
+      params: {
+        total_ver: 979,
+        type: 2,
+        page: 1,
+        pagesize: 200,
+        userid: state.session.userId,
+        token: state.session.token,
+      },
+      data: {
+        total_ver: 979,
+        type: 2,
+        page: 1,
+        pagesize: 200,
+        userid: Number(state.session.userId) || state.session.userId,
+        token: state.session.token,
+      },
+      headers: { "x-router": "cloudlist.service.kugou.com" },
+    });
+    const rawPlaylists = asArrayDeep(
+      data,
+      ["lists", "list", "info", "data", "listinfo", "collection_list", "playlist"],
+    );
+    const seen = new Set();
+    const playlists = [];
+    for (const raw of rawPlaylists) {
+      const playlist = mapPlaylist(raw);
+      if (!playlist || seen.has(playlist.id)) continue;
+      seen.add(playlist.id);
+      playlists.push(playlist);
+    }
+    return {
+      ...info,
+      loggedIn: true,
+      provider: PROVIDER,
+      userId: info.userId,
+      playlists,
+      rawStatus: Number(data.status ?? data.errcode ?? data.error_code) || 0,
+    };
+  }
+
+  async function playlistTracks(idValue) {
+    const info = await loginStatus();
+    if (!info.loggedIn) return { loggedIn: false, provider: PROVIDER, tracks: [] };
+    const id = cleanIdentifier(idValue, "playlist_id");
+    let detail;
+    let rawTracks = [];
+    try {
+      let page = 1;
+      let total = 0;
+      do {
+        detail = await cloudlistRequest(
+          "/v4/get_list_all_file",
+          { listid: id, page, pagesize: PLAYLIST_PAGE_SIZE },
+          {
+            listid: id,
+            page,
+            pagesize: PLAYLIST_PAGE_SIZE,
+            area_code: 1,
+            show_relate_goods: 0,
+            allplatform: 1,
+            show_cover: 1,
+            type: 0,
+            userid: Number(state.session.userId) || state.session.userId,
+            token: state.session.token,
+          },
+        );
+        if (!detail || Number(detail.status) === 0 ||
+            Number(detail.error_code ?? detail.errcode) > 0) {
+          throw makeError("kugou_cloudlist_failed");
+        }
+        const pageTracks = asArrayDeep(
+          detail,
+          ["songs", "songlist", "list", "info", "files", "data"],
+        );
+        rawTracks.push(...pageTracks);
+        total = Math.max(
+          rawTracks.length,
+          Number(detail?.data?.count ?? detail?.data?.total) || rawTracks.length,
+        );
+        if (!pageTracks.length || rawTracks.length >= total) break;
+        page += 1;
+      } while (page <= MAX_PLAYLIST_PAGES);
+    } catch {
+      detail = await gatewayRequest("/pubsongs/v2/get_other_list_file_nofilt", {
+        params: {
+          id,
+          global_collection_id: id,
+          page: 1,
+          pagesize: 500,
+          area_code: 1,
+          plat: 1,
+          type: 1,
+          mode: 1,
+          personal_switch: 1,
+          extend_fields: "abtags,hot_cmt,popularization",
+        },
+        headers: { "x-router": "pubsongscdn.kugou.com" },
+      });
+      rawTracks = asArrayDeep(
+        detail,
+        ["songs", "songlist", "list", "info", "files", "data"],
+      );
+    }
+    const tracks = sortCloudTracks(rawTracks).map(mapTrack).filter(Boolean);
+    return {
+      loggedIn: true,
+      provider: PROVIDER,
+      playlist: { provider: PROVIDER, id, name: "", trackCount: tracks.length },
+      tracks,
+    };
+  }
+
+  async function trackerPlayUrl(hash, { albumAudioId, albumId } = {}) {
+    const session = state.session;
+    const params = {
+      cmd: "26",
+      hash,
+      behavior: "play",
+      appid: APP_ID,
+      pid: "2",
+      mid: state.device.mid,
+      userid: session?.userId || "0",
+      version: CLIENT_VERSION,
+      vipType: String(session?.vipType || 0),
+      token: session?.token || "0",
+      key: md5(hash + PLAY_KEY_SALT + APP_ID + state.device.mid + (session?.userId || "0")),
+    };
+    if (albumAudioId) params.album_audio_id = albumAudioId;
+    if (albumId) params.album_id = albumId;
+    const target = new URL("/i/v2/", TRACKER_ORIGIN);
+    for (const [key, value] of Object.entries(params)) target.searchParams.set(key, String(value));
+    const response = await fetchFixed(
+      target,
+      {
+        headers: {
+          "User-Agent": ANDROID_USER_AGENT,
+          Cookie: cloudlistCookieHeader(),
+        },
+      },
+      "text",
+    );
+    return parseJson(
+      response
+        .replace("<!--KG_TAG_RES_START-->", "")
+        .replace("<!--KG_TAG_RES_END-->", "")
+        .trim(),
+    );
+  }
+
+  async function resolveStream(trackValue, qualityValue) {
+    if (!isPlainObject(trackValue)) throw makeError("invalid_track", 400);
+    const quality = normalizeQuality(qualityValue);
+    const baseHash = normalizeHash(trackValue.hash ?? trackValue.id, { label: "track_hash" });
+    const hashes = normalizeQualityHashes(trackValue.qualityHashes);
+    const albumAudioId = optionalNumericIdentifier(
+      trackValue.albumAudioId ?? trackValue.album_audio_id,
+      "album_audio_id",
+    );
+    const albumId = optionalNumericIdentifier(trackValue.albumId ?? trackValue.album_id, "album_id");
+    const seenHashes = new Set();
+    const candidates = [];
+    for (const level of QUALITY_FALLBACKS[quality]) {
+      const hash = hashes[level] || (level === "standard" ? baseHash : "");
+      if (!hash || seenHashes.has(hash)) continue;
+      seenHashes.add(hash);
+      candidates.push({ hash, level });
+    }
+    if (!candidates.length) candidates.push(selectQualityHash(baseHash, quality, hashes));
+
+    let lastResponse = {};
+    let lastData = {};
+    let lastSelected = candidates.at(-1);
+    let lastError = null;
+    for (const selected of candidates) {
+      try {
+        const response = await trackerPlayUrl(selected.hash, { albumAudioId, albumId });
+        const data = isPlainObject(response.data) ? response.data : response;
+        const rawUrl = firstNonEmpty(
+          data.play_url,
+          data.play_backup_url,
+          data.url,
+          data.src,
+          data.backup_url,
+        );
+        const firstUrl = Array.isArray(rawUrl) ? rawUrl[0] : rawUrl;
+        const backupUrl = Array.isArray(data.backup_url) ? data.backup_url[0] : data.backup_url;
+        const candidateUrl = firstUrl || backupUrl || "";
+        const url = safePublicUrl(candidateUrl, { allowHttp: false, providerOnly: true });
+        if (candidateUrl && !url) throw makeError("unsafe_kugou_stream_url");
+        lastResponse = response;
+        lastData = data;
+        lastSelected = selected;
+        if (url) {
+          const info = await loginStatus();
+          return {
+            provider: PROVIDER,
+            url,
+            playable: true,
+            loggedIn: info.loggedIn,
+            vipType: info.vipType,
+            vipLevel: info.vipLevel,
+            level: selected.level,
+            quality: cleanText(data.fileName ?? data.songName ?? data.extName, 200),
+            requestedQuality: quality,
+            resolvedHash: selected.hash,
+            downgraded: selected.level !== quality,
+            trial: false,
+            message: "",
+            reason: "",
+            restriction: null,
+            kugouCode: Number(response.error_code ?? response.errcode ?? response.status) || 0,
+          };
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!Object.keys(lastResponse).length && lastError) throw lastError;
+    const statusCode = Number(lastResponse.error_code ?? lastResponse.errcode ?? lastResponse.status) || 0;
+    const info = await loginStatus();
+    const category = info.loggedIn ? "paid_required" : "login_required";
+    const url = "";
+    const restriction = {
+      provider: PROVIDER,
+      category,
+      action: info.loggedIn ? "upgrade" : "login",
+      message: info.loggedIn
+        ? "酷狗没有返回当前账号可播放地址，可能需要会员、购买或官方客户端权限"
+        : "酷狗歌曲需要登录后获取播放地址",
+      code: statusCode,
+      rawMessage: publicProviderMessage(lastResponse.error || lastResponse.errmsg || lastResponse.message),
+    };
+    return {
+      provider: PROVIDER,
+      url,
+      playable: false,
+      loggedIn: info.loggedIn,
+      vipType: info.vipType,
+      vipLevel: info.vipLevel,
+      level: lastSelected.level,
+      quality: cleanText(lastData.fileName ?? lastData.songName ?? lastData.extName, 200),
+      requestedQuality: quality,
+      resolvedHash: lastSelected.hash,
+      downgraded: lastSelected.level !== quality,
+      trial: false,
+      message: restriction?.message || "",
+      reason: restriction?.category || "",
+      restriction,
+      kugouCode: statusCode,
+    };
+  }
+
+  return Object.freeze({
+    loginStatus,
+    loginQrKey,
+    loginQrCheck,
+    logout,
+    userPlaylists,
+    playlistTracks,
+    resolveStream,
+  });
+}

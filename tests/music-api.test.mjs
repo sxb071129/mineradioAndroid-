@@ -22,6 +22,24 @@ function providerStub(overrides = {}) {
   };
 }
 
+function kugouProviderStub(overrides = {}) {
+  return {
+    loginStatus: async () => ({ provider: "kugou", loggedIn: false }),
+    loginQrKey: async () => ({
+      provider: "kugou",
+      key: "KUGOU_QR_TEST_KEY",
+      img: "data:image/png;base64,AA==",
+      url: "https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode=KUGOU_QR_TEST_KEY",
+    }),
+    loginQrCheck: async () => ({ provider: "kugou", loggedIn: false, code: 801, status: 1 }),
+    logout: async () => ({ provider: "kugou", ok: true, loggedIn: false }),
+    userPlaylists: async () => ({ provider: "kugou", loggedIn: false, playlists: [] }),
+    playlistTracks: async () => ({ provider: "kugou", loggedIn: false, tracks: [] }),
+    resolveStream: async () => ({ provider: "kugou", url: "", playable: false, reason: "login_required" }),
+    ...overrides,
+  };
+}
+
 async function fixture(t, options = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-music-api-"));
   if (options.cookie) {
@@ -33,6 +51,7 @@ async function fixture(t, options = {}) {
     host: "127.0.0.1",
     dataDir,
     provider: options.provider || providerStub(),
+    kugouProvider: options.kugouProvider || kugouProviderStub(),
     fetchImpl: options.fetchImpl,
     validateStreamUrl: options.validateStreamUrl,
   });
@@ -147,6 +166,39 @@ test("stream forwards Range without leaking browser or account cookies", async (
   assert.doesNotMatch(JSON.stringify(fetchCalls), /SERVER_SECRET|ATTACKER_COOKIE/);
 });
 
+test("failed upstream streams clear the provider-quality cache before retry", async (t) => {
+  let resolves = 0;
+  let fetches = 0;
+  const provider = providerStub({
+    song_url_v1: async () => {
+      resolves += 1;
+      return { body: { data: [{ url: `https://media.example.test/song-${resolves}.mp3` }] } };
+    },
+  });
+  const { base } = await fixture(t, {
+    provider,
+    validateStreamUrl: async (value) => new URL(value),
+    fetchImpl: async () => {
+      fetches += 1;
+      if (fetches === 1) return new Response("unavailable", { status: 503 });
+      return new Response(new Uint8Array([7]), {
+        status: 200,
+        headers: { "content-type": "audio/mpeg", "content-length": "1" },
+      });
+    },
+  });
+
+  const first = await fetch(`${base}/api/stream?provider=netease&id=123456&quality=lossless`);
+  assert.equal(first.status, 502);
+  assert.deepEqual(await first.json(), { error: "provider_stream_failed" });
+
+  const second = await fetch(`${base}/api/stream?provider=netease&id=123456&quality=lossless`);
+  assert.equal(second.status, 200);
+  assert.deepEqual(new Uint8Array(await second.arrayBuffer()), new Uint8Array([7]));
+  assert.equal(resolves, 2);
+  assert.equal(fetches, 2);
+});
+
 test("QR login stores its cookie only on the server", async (t) => {
   const loginStatusCalls = [];
   const provider = providerStub({
@@ -178,4 +230,110 @@ test("QR login stores its cookie only on the server", async (t) => {
   assert.match(await readFile(path.join(dataDir, "netease.cookie"), "utf8"), /MUSIC_U=QR_TOP_SECRET/);
   assert.match(loginStatusCalls.at(-1).cookie, /MUSIC_U=QR_TOP_SECRET/);
   assert.doesNotMatch(JSON.stringify(loginStatusCalls), /CLIENT_FORGED/);
+});
+
+test("Kugou QR, playlist tokens, qualities, and streams stay server constrained", async (t) => {
+  const hash = "A".repeat(32);
+  const losslessHash = "B".repeat(32);
+  const resolveCalls = [];
+  const streamFetches = [];
+  const kugouProvider = kugouProviderStub({
+    loginQrCheck: async () => ({
+      provider: "kugou",
+      loggedIn: true,
+      code: 803,
+      status: 4,
+      userId: "7",
+      nickname: "测试酷狗用户",
+      token: "KUGOU_TOP_SECRET",
+      cookie: "KUGOU_COOKIE_SECRET",
+    }),
+    userPlaylists: async () => ({
+      provider: "kugou",
+      loggedIn: true,
+      userId: "7",
+      nickname: "测试酷狗用户",
+      playlists: [{ id: "123", name: "我的酷狗歌单", cover: "https://imge.kugou.com/test.jpg", trackCount: 1 }],
+    }),
+    playlistTracks: async () => ({
+      provider: "kugou",
+      loggedIn: true,
+      playlist: { id: "123", name: "我的酷狗歌单", trackCount: 1 },
+      tracks: [{
+        hash,
+        qualityHashes: { standard: hash, lossless: losslessHash },
+        albumAudioId: "99",
+        albumId: "88",
+        name: "测试歌曲",
+        artist: "测试歌手",
+        album: "测试专辑",
+        cover: "https://imge.kugou.com/test.jpg",
+        duration: 180000,
+      }],
+    }),
+    resolveStream: async (track, quality) => {
+      resolveCalls.push({ track, quality });
+      return { url: `https://media.kugou.com/${quality}.mp3`, level: quality, playable: true };
+    },
+  });
+  const { base } = await fixture(t, {
+    kugouProvider,
+    validateStreamUrl: async (value) => new URL(value),
+    fetchImpl: async (url, init) => {
+      streamFetches.push({ url: String(url), init });
+      return new Response(new Uint8Array([1, 2, 3]), {
+        status: 206,
+        headers: {
+          "content-type": "audio/mpeg",
+          "content-length": "3",
+          "content-range": "bytes 0-2/3",
+          "accept-ranges": "bytes",
+        },
+      });
+    },
+  });
+
+  const qr = await fetch(`${base}/api/kugou/login/qr/key`).then((response) => response.json());
+  assert.equal(qr.key, "KUGOU_QR_TEST_KEY");
+  assert.match(qr.img, /^data:image\/png;base64,/);
+  const checkedResponse = await fetch(`${base}/api/kugou/login/qr/check?key=${encodeURIComponent(qr.key)}`);
+  const checkedText = await checkedResponse.text();
+  assert.equal(checkedResponse.status, 200);
+  assert.doesNotMatch(checkedText, /KUGOU_TOP_SECRET|KUGOU_COOKIE_SECRET/);
+  assert.equal(checkedResponse.headers.get("set-cookie"), null);
+
+  const playlists = await fetch(`${base}/api/kugou/user/playlists`).then((response) => response.json());
+  assert.deepEqual(playlists.playlists.map((playlist) => playlist.id), ["123"]);
+  const tracks = await fetch(`${base}/api/kugou/playlist/tracks?id=123`).then((response) => response.json());
+  assert.equal(tracks.tracks.length, 1);
+  const publicTrack = tracks.tracks[0];
+  assert.match(publicTrack.playKey, /^[a-f0-9]{24}$/);
+  assert.doesNotMatch(JSON.stringify(publicTrack), new RegExp(`${hash}|${losslessHash}`));
+
+  for (const quality of ["lossless", "standard"]) {
+    const response = await fetch(`${base}/api/stream?provider=kugou&id=${publicTrack.playKey}&quality=${quality}`, {
+      headers: { range: "bytes=0-2", cookie: "LAN_FORGED=1" },
+    });
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get("x-mineradio-provider"), "kugou");
+    assert.equal(response.headers.get("x-mineradio-quality"), quality);
+    await response.arrayBuffer();
+  }
+  assert.deepEqual(resolveCalls.map((call) => call.quality), ["lossless", "standard"]);
+  assert.equal(resolveCalls[0].track.hash, hash);
+  assert.equal(resolveCalls[0].track.qualityHashes.lossless, losslessHash);
+  assert.equal(streamFetches[0].init.headers.Range, "bytes=0-2");
+  assert.equal(streamFetches[0].init.headers.Cookie, undefined);
+  assert.doesNotMatch(JSON.stringify(streamFetches), /LAN_FORGED|KUGOU_TOP_SECRET/);
+
+  const callsBeforeInvalid = resolveCalls.length;
+  for (const path of [
+    `/api/stream?provider=kugou&id=${publicTrack.playKey}&quality=ultra`,
+    "/api/stream?provider=kugou&id=not-a-play-key&quality=hires",
+    `/api/stream?provider=unknown&id=${publicTrack.playKey}&quality=hires`,
+  ]) {
+    const response = await fetch(`${base}${path}`);
+    assert.equal(response.status, 400, path);
+  }
+  assert.equal(resolveCalls.length, callsBeforeInvalid);
 });

@@ -25,6 +25,9 @@ test("server-renders the finished player", async () => {
   assert.match(html, /aria-label="播放进度"/);
   assert.match(html, /MINERADIO · YOUR LIBRARY/);
   assert.match(html, /每日推荐/);
+  assert.match(html, /同步酷狗账号内的云歌单/);
+  assert.match(html, /超清母带/);
+  assert.match(html, /本机音色/);
   assert.match(html, />登录</);
   assert.match(html, /调用第三方音乐接口搜索/);
   assert.match(html, /mineradio-starfield\.png|class="starfield"/);

@@ -20,6 +20,7 @@ import {
   SkipBack,
   SkipForward,
   SpeakerHigh,
+  SlidersHorizontal,
   UploadSimple,
   UsersThree,
   Waveform,
@@ -37,33 +38,92 @@ import {
   useState,
 } from "react";
 import { useRoomSync } from "../hooks/use-room-sync";
-import type { TrackDescriptor } from "../lib/sync-types";
+import {
+  AUDIO_EFFECTS,
+  applyAudioEffect,
+  getAudioEffect,
+  type AudioEffectNodes,
+  type AudioEffectPreset,
+} from "../lib/audio-effects";
+import type { PlaybackQuality, TrackDescriptor } from "../lib/sync-types";
 
 type LocalTrack = TrackDescriptor & { url: string };
 type AudioWindow = Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext };
-type CloudPanel = "login" | "daily" | "recommend" | "search";
+type CloudPanel = "login" | "library" | "daily" | "recommend" | "search";
+type MusicProvider = "netease" | "kugou";
 type CloudSong = {
   id: string;
+  provider?: MusicProvider;
+  playKey?: string;
   name: string;
   artist: string;
   album: string;
   cover: string;
   duration: number;
+  qualities?: PlaybackQuality[];
 };
 type CloudUser = {
   loggedIn: boolean;
+  provider?: MusicProvider;
   userId?: string;
   nickname?: string;
   avatar?: string;
+  vipLabel?: string;
 };
 type CloudHome = {
   loggedIn: boolean;
   user: CloudUser | null;
   dailySongs: CloudSong[];
 };
+type CloudPlaylist = {
+  id: string;
+  name: string;
+  cover: string;
+  trackCount: number;
+};
 
 const DEFAULT_VOLUME = 0.72;
 const MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
+const QUALITY_OPTIONS: readonly { id: PlaybackQuality; label: string; shortLabel: string; detail: string }[] = [
+  { id: "jymaster", label: "超清母带", shortLabel: "母带", detail: "最高规格 · 有则优先" },
+  { id: "hires", label: "高清臻音", shortLabel: "臻音", detail: "默认 · 高解析优先" },
+  { id: "lossless", label: "无损 SQ", shortLabel: "SQ", detail: "FLAC 优先" },
+  { id: "exhigh", label: "极高 HQ", shortLabel: "HQ", detail: "320 kbps 优先" },
+  { id: "standard", label: "标准", shortLabel: "STD", detail: "128 kbps" },
+];
+
+function readPlaybackQuality(): PlaybackQuality {
+  if (typeof window === "undefined") return "hires";
+  const value = window.localStorage.getItem("mineradio-playback-quality-v1");
+  return QUALITY_OPTIONS.some((option) => option.id === value) ? value as PlaybackQuality : "hires";
+}
+
+function readAudioEffect(): AudioEffectPreset {
+  if (typeof window === "undefined") return "original";
+  return getAudioEffect(window.localStorage.getItem("mineradio-audio-effect-v1")).id;
+}
+
+function parseCloudTrackId(value: string | undefined) {
+  const legacy = /^cloud-([1-9]\d{0,19})$/.exec(value || "");
+  if (legacy) return { provider: "netease" as const, sourceId: legacy[1], quality: "standard" as PlaybackQuality };
+  const match = /^cloud-v2-(netease|kugou)-([A-Za-z0-9]+)-(jymaster|hires|lossless|exhigh|standard)$/.exec(value || "");
+  if (!match) return null;
+  return { provider: match[1] as MusicProvider, sourceId: match[2], quality: match[3] as PlaybackQuality };
+}
+
+function cloudTrackPath(provider: MusicProvider, sourceId: string, quality: PlaybackQuality) {
+  return `/api/cloud/v2/${provider}/${sourceId}/${quality}`;
+}
+
+function cloudStreamPath(provider: MusicProvider, sourceId: string, quality: PlaybackQuality) {
+  const params = new URLSearchParams({ provider, id: sourceId, quality });
+  return `/api/stream?${params.toString()}`;
+}
+
+function qualityShortLabel(quality: PlaybackQuality, provider?: MusicProvider) {
+  if (provider === "kugou" && quality === "hires") return "HiRes";
+  return QUALITY_OPTIONS.find((option) => option.id === quality)?.shortLabel || "臻音";
+}
 
 function defaultRelayUrl() {
   if (typeof window === "undefined") return "ws://localhost:8787/ws";
@@ -109,6 +169,8 @@ function cloudErrorMessage(error: unknown) {
   if (code === "third_party_timeout" || code === "provider_timeout") return "第三方音乐服务响应超时，请稍后重试。";
   if (code === "origin_not_allowed") return "音乐接口拒绝了当前网页地址，请从启动窗口显示的局域网网址打开。";
   if (code === "track_unavailable") return "该歌曲暂时没有可用音源，可能受版权或会员限制。";
+  if (code === "kugou_login_required") return "请先登录酷狗音乐，再尝试播放这首歌曲。";
+  if (code === "track_key_expired") return "该酷狗播放标识已过期，请重新打开歌单选择歌曲。";
   return "无法连接第三方音乐接口。请确认桌面启动窗口中的 Music API 已在 8790 端口运行。";
 }
 
@@ -148,13 +210,12 @@ function updateRoomInUrl(room: string) {
 }
 
 export function MineradioPlayer() {
-  const initialRoom = useMemo(() => roomFromUrl(), []);
-  const [mode, setMode] = useState<"solo" | "room">(initialRoom ? "room" : "solo");
-  const [roomCode, setRoomCode] = useState(initialRoom);
-  const [roomInput, setRoomInput] = useState(initialRoom);
-  const [relayUrl, setRelayUrl] = useState(defaultRelayUrl);
-  const [musicApiUrl] = useState(defaultMusicApiUrl);
-  const [deviceName, setDeviceName] = useState(defaultDeviceName);
+  const [mode, setMode] = useState<"solo" | "room">("solo");
+  const [roomCode, setRoomCode] = useState("");
+  const [roomInput, setRoomInput] = useState("");
+  const [relayUrl, setRelayUrl] = useState("ws://localhost:8787/ws");
+  const [musicApiUrl, setMusicApiUrl] = useState("http://localhost:8790");
+  const [deviceName, setDeviceName] = useState("网页设备");
   const [localTrack, setLocalTrack] = useState<LocalTrack | null>(null);
   const [soloPlaying, setSoloPlaying] = useState(false);
   const [soloVolume, setSoloVolume] = useState(DEFAULT_VOLUME);
@@ -164,12 +225,15 @@ export function MineradioPlayer() {
   const [notice, setNotice] = useState("");
   const [needsUnlock, setNeedsUnlock] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [roomPanelOpen, setRoomPanelOpen] = useState(Boolean(initialRoom));
+  const [roomPanelOpen, setRoomPanelOpen] = useState(false);
   const [lyricsOpen, setLyricsOpen] = useState(false);
   const [liked, setLiked] = useState(false);
   const [searchText, setSearchText] = useState("");
   const [legacyPanel, setLegacyPanel] = useState<CloudPanel | null>(null);
+  const [loginProvider, setLoginProvider] = useState<MusicProvider>("netease");
   const [cloudSongs, setCloudSongs] = useState<CloudSong[]>([]);
+  const [cloudPlaylists, setCloudPlaylists] = useState<CloudPlaylist[]>([]);
+  const [cloudPlaylistName, setCloudPlaylistName] = useState("");
   const [cloudUser, setCloudUser] = useState<CloudUser | null>(null);
   const [cloudLoading, setCloudLoading] = useState(false);
   const [cloudError, setCloudError] = useState("");
@@ -177,11 +241,21 @@ export function MineradioPlayer() {
   const [cloudQrImage, setCloudQrImage] = useState("");
   const [cloudQrKey, setCloudQrKey] = useState("");
   const [cloudRefresh, setCloudRefresh] = useState(0);
+  const [playbackQuality, setPlaybackQualityState] = useState<PlaybackQuality>("hires");
+  const [audioEffect, setAudioEffect] = useState<AudioEffectPreset>("original");
+  const [qualityOpen, setQualityOpen] = useState(false);
+  const [audioEffectOpen, setAudioEffectOpen] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const stageRef = useRef<HTMLElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const effectNodesRef = useRef<AudioEffectNodes | null>(null);
+  const volumeGainRef = useRef<GainNode | null>(null);
+  const playbackVolumeRef = useRef(DEFAULT_VOLUME);
+  const audioEffectRef = useRef<AudioEffectPreset>(audioEffect);
+  const resumeAfterSourceChangeRef = useRef<{ position: number; playing: boolean; source: string } | null>(null);
+  const settingsHydratedRef = useRef(false);
   const sourceCreatedRef = useRef(false);
   const objectUrlRef = useRef("");
 
@@ -200,6 +274,7 @@ export function MineradioPlayer() {
   const effectiveTrack = mode === "room" ? roomTrack : localTrack;
   const effectivePlaying = mode === "room" ? Boolean(roomState?.playing) : soloPlaying;
   const effectiveVolume = mode === "room" ? roomState?.volume ?? DEFAULT_VOLUME : soloVolume;
+  const effectiveQuality = effectiveTrack?.quality || playbackQuality;
   const canControl = mode === "solo" || roomIsLeader;
   const roomConnected = room.status === "connected";
   const audioSource = useMemo(() => {
@@ -210,6 +285,24 @@ export function MineradioPlayer() {
   }, [effectiveTrack, localTrack?.url, mode, room.httpBase]);
 
   useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      const initialRoom = roomFromUrl();
+      setMode(initialRoom ? "room" : "solo");
+      setRoomCode(initialRoom);
+      setRoomInput(initialRoom);
+      setRoomPanelOpen(Boolean(initialRoom));
+      setRelayUrl(defaultRelayUrl());
+      setMusicApiUrl(defaultMusicApiUrl());
+      setDeviceName(defaultDeviceName());
+      setPlaybackQualityState(readPlaybackQuality());
+      setAudioEffect(readAudioEffect());
+      settingsHydratedRef.current = true;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  useEffect(() => {
+    if (!settingsHydratedRef.current) return;
     window.localStorage.setItem(
       "mineradio-lan-settings-v1",
       JSON.stringify({ relayUrl, musicApiUrl, version: 2 }),
@@ -225,6 +318,8 @@ export function MineradioPlayer() {
       setCloudError("");
       setCloudStatus("");
       setCloudSongs([]);
+      setCloudPlaylists([]);
+      setCloudPlaylistName("");
       setCloudQrImage("");
       setCloudQrKey("");
       try {
@@ -241,6 +336,24 @@ export function MineradioPlayer() {
           return;
         }
 
+        if (legacyPanel === "library") {
+          const status = await requestCloud<CloudUser>(musicApiUrl, "/api/kugou/login/status", controller.signal);
+          setCloudUser(status);
+          if (!status.loggedIn) {
+            setCloudStatus("登录酷狗音乐后可同步你的云端歌单");
+            return;
+          }
+          const result = await requestCloud<CloudUser & { playlists: CloudPlaylist[] }>(
+            musicApiUrl,
+            "/api/kugou/user/playlists",
+            controller.signal,
+          );
+          setCloudUser(result);
+          setCloudPlaylists(result.playlists || []);
+          setCloudStatus(result.playlists?.length ? `已同步 ${result.playlists.length} 个酷狗歌单` : "账号内暂时没有可用歌单");
+          return;
+        }
+
         if (legacyPanel === "daily" || legacyPanel === "recommend") {
           const result = await requestCloud<CloudHome>(musicApiUrl, "/api/discover/home", controller.signal);
           setCloudUser(result.user);
@@ -249,21 +362,32 @@ export function MineradioPlayer() {
           return;
         }
 
-        const status = await requestCloud<CloudUser>(musicApiUrl, "/api/login/status", controller.signal);
+        const isKugou = loginProvider === "kugou";
+        const status = await requestCloud<CloudUser>(
+          musicApiUrl,
+          isKugou ? "/api/kugou/login/status" : "/api/login/status",
+          controller.signal,
+        );
         setCloudUser(status);
         if (status.loggedIn) {
           setCloudStatus(`已登录${status.nickname ? ` · ${status.nickname}` : ""}`);
           return;
         }
-        const keyResult = await requestCloud<{ key: string }>(musicApiUrl, "/api/login/qr/key", controller.signal);
-        const qrResult = await requestCloud<{ img: string }>(
+        const keyResult = await requestCloud<{ key: string; img?: string }>(
           musicApiUrl,
-          `/api/login/qr/create?key=${encodeURIComponent(keyResult.key)}`,
+          isKugou ? "/api/kugou/login/qr/key" : "/api/login/qr/key",
           controller.signal,
         );
+        const qrResult = isKugou
+          ? keyResult
+          : await requestCloud<{ img: string }>(
+              musicApiUrl,
+              `/api/login/qr/create?key=${encodeURIComponent(keyResult.key)}`,
+              controller.signal,
+            );
         setCloudQrKey(keyResult.key);
-        setCloudQrImage(qrResult.img);
-        setCloudStatus("请使用网易云音乐 App 扫码，并在手机上确认登录");
+        setCloudQrImage(qrResult.img || "");
+        setCloudStatus(`请使用${isKugou ? "酷狗音乐" : "网易云音乐"} App 扫码，并在手机上确认登录`);
       } catch (error) {
         if (!controller.signal.aborted) setCloudError(cloudErrorMessage(error));
       } finally {
@@ -273,7 +397,7 @@ export function MineradioPlayer() {
 
     void load();
     return () => controller.abort();
-  }, [cloudRefresh, legacyPanel, musicApiUrl, searchText]);
+  }, [cloudRefresh, legacyPanel, loginProvider, musicApiUrl, searchText]);
 
   useEffect(() => {
     if (legacyPanel !== "login" || !cloudQrKey || cloudUser?.loggedIn) return;
@@ -282,16 +406,24 @@ export function MineradioPlayer() {
 
     const poll = async () => {
       try {
+        const isKugou = loginProvider === "kugou";
         const result = await requestCloud<CloudUser & { code: number; message?: string }>(
           musicApiUrl,
-          `/api/login/qr/check?key=${encodeURIComponent(cloudQrKey)}`,
+          `${isKugou ? "/api/kugou/login/qr/check" : "/api/login/qr/check"}?key=${encodeURIComponent(cloudQrKey)}`,
         );
         if (stopped) return;
         if (result.code === 803) {
-          setCloudUser(result.loggedIn ? result : { loggedIn: true, nickname: result.nickname });
           setCloudQrImage("");
           setCloudQrKey("");
-          setCloudStatus("登录成功，云端推荐现在可以使用。");
+          if (result.loggedIn) {
+            setCloudUser(result);
+            setCloudStatus(isKugou ? "酷狗登录成功，云歌单现在可以使用。" : "登录成功，云端推荐现在可以使用。");
+          } else {
+            setCloudUser({ loggedIn: false });
+            setCloudError(isKugou
+              ? "手机已确认扫码，但酷狗没有返回可用登录凭证。请刷新二维码后重试。"
+              : "手机已确认扫码，但暂时无法读取账号状态。请刷新二维码后重试。");
+          }
           return;
         }
         if (result.code === 802) setCloudStatus("二维码已扫描，请在手机上确认登录");
@@ -313,7 +445,7 @@ export function MineradioPlayer() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [cloudQrKey, cloudUser?.loggedIn, legacyPanel, musicApiUrl]);
+  }, [cloudQrKey, cloudUser?.loggedIn, legacyPanel, loginProvider, musicApiUrl]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -322,29 +454,79 @@ export function MineradioPlayer() {
     audio.removeAttribute("src");
     if (audioSource) audio.src = audioSource;
     audio.load();
-    setProgress(0);
+    setProgress(resumeAfterSourceChangeRef.current?.position || 0);
     setDuration(0);
   }, [audioSource]);
 
   const ensureAudioGraph = useCallback(async () => {
     const audio = audioRef.current;
-    if (!audio) return;
+    if (!audio) return false;
     const Context = window.AudioContext || (window as AudioWindow).webkitAudioContext;
-    if (!Context) return;
+    if (!Context) return false;
     if (!audioContextRef.current) audioContextRef.current = new Context();
     const context = audioContextRef.current;
     if (!sourceCreatedRef.current) {
       const source = context.createMediaElementSource(audio);
+      const low = context.createBiquadFilter();
+      low.type = "lowshelf";
+      low.frequency.value = 120;
+      const presence = context.createBiquadFilter();
+      presence.type = "peaking";
+      presence.frequency.value = 1_800;
+      presence.Q.value = 0.8;
+      const high = context.createBiquadFilter();
+      high.type = "highshelf";
+      high.frequency.value = 7_000;
+      const compressor = context.createDynamicsCompressor();
+      compressor.attack.value = 0.012;
+      compressor.release.value = 0.24;
+      const output = context.createGain();
+      const volume = context.createGain();
       const analyser = context.createAnalyser();
       analyser.fftSize = 256;
       analyser.smoothingTimeConstant = 0.78;
-      source.connect(analyser);
+      source.connect(low);
+      low.connect(presence);
+      presence.connect(high);
+      high.connect(compressor);
+      compressor.connect(output);
+      output.connect(volume);
+      volume.connect(analyser);
       analyser.connect(context.destination);
+      const nodes = { low, presence, high, compressor, output };
+      applyAudioEffect(nodes, audioEffectRef.current, context.currentTime);
+      volume.gain.value = playbackVolumeRef.current;
+      audio.volume = 1;
+      effectNodesRef.current = nodes;
+      volumeGainRef.current = volume;
       analyserRef.current = analyser;
       sourceCreatedRef.current = true;
     }
     if (context.state === "suspended") await context.resume();
+    return true;
   }, []);
+
+  useEffect(() => {
+    audioEffectRef.current = audioEffect;
+    const context = audioContextRef.current;
+    const nodes = effectNodesRef.current;
+    if (context && nodes) applyAudioEffect(nodes, audioEffect, context.currentTime);
+  }, [audioEffect]);
+
+  useEffect(() => {
+    const value = Math.max(0, Math.min(effectiveVolume, 1));
+    playbackVolumeRef.current = value;
+    const audio = audioRef.current;
+    const context = audioContextRef.current;
+    const volume = volumeGainRef.current;
+    if (context && volume) {
+      if (audio) audio.volume = 1;
+      volume.gain.cancelScheduledValues(context.currentTime);
+      volume.gain.setTargetAtTime(value, context.currentTime, 0.025);
+    } else if (audio) {
+      audio.volume = value;
+    }
+  }, [effectiveVolume]);
 
   useEffect(() => {
     let frame = 0;
@@ -383,7 +565,6 @@ export function MineradioPlayer() {
     const audio = audioRef.current;
     const state = roomState;
     if (!audio || mode !== "room" || !state || !audioSource) return;
-    audio.volume = state.volume;
     const target = Math.min(getRoomTargetPosition(state), audio.duration || Infinity);
     const drift = target - (audio.currentTime || 0);
     if (Math.abs(drift) > 0.28 && Number.isFinite(target)) {
@@ -407,12 +588,6 @@ export function MineradioPlayer() {
 
   useEffect(() => {
     const audio = audioRef.current;
-    if (!audio || mode !== "solo") return;
-    audio.volume = soloVolume;
-  }, [mode, soloVolume]);
-
-  useEffect(() => {
-    const audio = audioRef.current;
     if (!audio) return;
     let lastPaint = 0;
     let frame = 0;
@@ -424,19 +599,36 @@ export function MineradioPlayer() {
       }
       frame = requestAnimationFrame(update);
     };
-    const onDuration = () => setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+    const updateDuration = () => {
+      setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+    };
+    const onLoadedMetadata = () => {
+      updateDuration();
+      const resume = resumeAfterSourceChangeRef.current;
+      if (!resume || !Number.isFinite(audio.duration)) return;
+      resumeAfterSourceChangeRef.current = null;
+      if (audio.currentSrc !== resume.source) return;
+      audio.currentTime = Math.min(resume.position, Math.max(0, audio.duration - 0.05));
+      setProgress(audio.currentTime);
+      if (resume.playing) {
+        void audio.play().then(() => setSoloPlaying(true)).catch(() => {
+          setSoloPlaying(false);
+          setNotice("音质已切换；请点击播放继续。");
+        });
+      }
+    };
     const onEnded = () => {
       if (mode === "solo") setSoloPlaying(false);
       else if (roomIsLeader) sendRoomCommand({ action: "pause" });
     };
-    audio.addEventListener("loadedmetadata", onDuration);
-    audio.addEventListener("durationchange", onDuration);
+    audio.addEventListener("loadedmetadata", onLoadedMetadata);
+    audio.addEventListener("durationchange", updateDuration);
     audio.addEventListener("ended", onEnded);
     frame = requestAnimationFrame(update);
     return () => {
       cancelAnimationFrame(frame);
-      audio.removeEventListener("loadedmetadata", onDuration);
-      audio.removeEventListener("durationchange", onDuration);
+      audio.removeEventListener("loadedmetadata", onLoadedMetadata);
+      audio.removeEventListener("durationchange", updateDuration);
       audio.removeEventListener("ended", onEnded);
     };
   }, [mode, roomIsLeader, sendRoomCommand]);
@@ -446,6 +638,9 @@ export function MineradioPlayer() {
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
       const context = audioContextRef.current;
       audioContextRef.current = null;
+      analyserRef.current = null;
+      effectNodesRef.current = null;
+      volumeGainRef.current = null;
       if (context && context.state !== "closed") void context.close().catch(() => {});
     },
     [],
@@ -505,6 +700,7 @@ export function MineradioPlayer() {
         setNotice("文件超过 512 MB，请选择更小的音频。");
         return;
       }
+      resumeAfterSourceChangeRef.current = null;
       await ensureAudioGraph();
       if (mode === "solo") {
         if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
@@ -618,13 +814,37 @@ export function MineradioPlayer() {
     window.setTimeout(() => setCopied(false), 1600);
   }, [shareUrl]);
 
+  const loadKugouPlaylist = useCallback(async (playlist: CloudPlaylist) => {
+    setCloudLoading(true);
+    setCloudError("");
+    try {
+      const result = await requestCloud<{ tracks: CloudSong[] }>(
+        musicApiUrl,
+        `/api/kugou/playlist/tracks?id=${encodeURIComponent(playlist.id)}`,
+      );
+      setCloudSongs(result.tracks || []);
+      setCloudPlaylistName(playlist.name);
+      setCloudStatus(result.tracks?.length ? `${playlist.name} · ${result.tracks.length} 首` : `${playlist.name} 暂无可播放歌曲`);
+    } catch (error) {
+      setCloudError(cloudErrorMessage(error));
+    } finally {
+      setCloudLoading(false);
+    }
+  }, [musicApiUrl]);
+
   const selectCloudSong = useCallback((song: CloudSong) => {
+    resumeAfterSourceChangeRef.current = null;
+    const provider = song.provider === "kugou" ? "kugou" : "netease";
+    const sourceId = provider === "kugou" ? String(song.playKey || song.id) : String(song.id);
+    const quality = playbackQuality;
     const track: TrackDescriptor = {
-      id: `cloud-${song.id}`,
+      id: `cloud-v2-${provider}-${sourceId}-${quality}`,
       name: song.artist ? `${song.name} · ${song.artist}` : song.name,
       type: "audio/mpeg",
       size: 0,
-      path: `/api/cloud/${song.id}`,
+      path: cloudTrackPath(provider, sourceId, quality),
+      provider,
+      quality,
     };
     if (mode === "room") {
       if (!roomConnected || !roomIsLeader) {
@@ -638,19 +858,56 @@ export function MineradioPlayer() {
       objectUrlRef.current = "";
       setLocalTrack({
         ...track,
-        url: `${musicApiUrl.replace(/\/+$/, "")}/api/stream?id=${encodeURIComponent(song.id)}`,
+        url: `${musicApiUrl.replace(/\/+$/, "")}${cloudStreamPath(provider, sourceId, quality)}`,
       });
       setSoloPlaying(false);
       setNotice("已从第三方音乐接口加载歌曲，点击播放即可开始。");
     }
     setLegacyPanel(null);
-  }, [mode, musicApiUrl, roomConnected, roomIsLeader, sendRoomCommand]);
+  }, [mode, musicApiUrl, playbackQuality, roomConnected, roomIsLeader, sendRoomCommand]);
+
+  const changePlaybackQuality = useCallback((quality: PlaybackQuality) => {
+    setPlaybackQualityState(quality);
+    window.localStorage.setItem("mineradio-playback-quality-v1", quality);
+    setQualityOpen(false);
+    const cloud = parseCloudTrackId(effectiveTrack?.id);
+    const label = QUALITY_OPTIONS.find((option) => option.id === quality)?.label || quality;
+    if (!cloud) {
+      setNotice(`音质偏好已设为 ${label}，下次播放在线歌曲时生效。`);
+      return;
+    }
+    if (mode === "room") {
+      if (!roomIsLeader) {
+        setNotice("音质由房间主控设备统一切换。");
+        return;
+      }
+      sendRoomCommand({ action: "quality", quality });
+      setNotice(`正在为房间切换到 ${label}，所有设备会从当前进度续播。`);
+      return;
+    }
+    const audio = audioRef.current;
+    const source = `${musicApiUrl.replace(/\/+$/, "")}${cloudStreamPath(cloud.provider, cloud.sourceId, quality)}`;
+    resumeAfterSourceChangeRef.current = {
+      position: audio?.currentTime || 0,
+      playing: Boolean(audio && !audio.paused),
+      source,
+    };
+    setLocalTrack((current) => current ? {
+      ...current,
+      id: `cloud-v2-${cloud.provider}-${cloud.sourceId}-${quality}`,
+      path: cloudTrackPath(cloud.provider, cloud.sourceId, quality),
+      provider: cloud.provider,
+      quality,
+      url: source,
+    } : current);
+    setNotice(`正在切换到 ${label}，可用档位由账号与版权权限决定。`);
+  }, [effectiveTrack?.id, mode, musicApiUrl, roomIsLeader, sendRoomCommand]);
 
   const logoutCloud = useCallback(async () => {
     setCloudLoading(true);
     setCloudError("");
     try {
-      await requestCloud<{ ok: boolean }>(musicApiUrl, "/api/logout");
+      await requestCloud<{ ok: boolean }>(musicApiUrl, loginProvider === "kugou" ? "/api/kugou/logout" : "/api/logout");
       setCloudUser({ loggedIn: false });
       setCloudStatus("已退出登录，账号凭证已从本机清除。");
       setCloudRefresh((value) => value + 1);
@@ -659,7 +916,7 @@ export function MineradioPlayer() {
     } finally {
       setCloudLoading(false);
     }
-  }, [musicApiUrl]);
+  }, [loginProvider, musicApiUrl]);
 
   const onSearchSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -684,8 +941,18 @@ export function MineradioPlayer() {
           : "等待中继";
   const overlayOpen = roomPanelOpen || Boolean(legacyPanel) || lyricsOpen;
 
-  const handleHomeCardAction = useCallback((action: "file" | "daily" | "recommend" | "play" | "profile") => {
+  useEffect(() => {
+    if (!overlayOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      setQualityOpen(false);
+      setAudioEffectOpen(false);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [overlayOpen]);
+
+  const handleHomeCardAction = useCallback((action: "library" | "file" | "daily" | "recommend" | "play" | "profile") => {
     if (action === "file") fileInputRef.current?.click();
+    else if (action === "library") setLegacyPanel("library");
     else if (action === "daily") setLegacyPanel("daily");
     else if (action === "recommend") setLegacyPanel("recommend");
     else if (action === "play") void togglePlayback();
@@ -696,9 +963,9 @@ export function MineradioPlayer() {
     {
       label: "LIBRARY",
       title: "我的歌单",
-      sub: effectiveTrack ? `正在听：${effectiveTrack.name}` : "从本地音乐开始",
+      sub: "同步酷狗账号内的云歌单",
       tone: "mint",
-      action: "file" as const,
+      action: "library" as const,
     },
     {
       label: "DAILY",
@@ -744,6 +1011,8 @@ export function MineradioPlayer() {
         crossOrigin="anonymous"
         preload="metadata"
         onError={() => {
+          resumeAfterSourceChangeRef.current = null;
+          if (mode === "solo") setSoloPlaying(false);
           if (audioSource) setNotice("音源加载失败，歌曲可能受版权、会员或网络限制。请尝试另一首。");
         }}
       />
@@ -884,10 +1153,12 @@ export function MineradioPlayer() {
           <button className="legacy-scrim" type="button" onClick={() => setLegacyPanel(null)} aria-label="关闭云端音乐面板" />
           <section className="legacy-modal cloud-modal" role="dialog" aria-modal="true" aria-labelledby="legacy-title">
             <button type="button" onClick={() => setLegacyPanel(null)} aria-label="关闭云端音乐面板"><X size={20} aria-hidden="true" /></button>
-            <span>MINERADIO CLOUD · NETEASE ADAPTER</span>
+            <span>MINERADIO CLOUD · LOCAL RESTRICTED ADAPTER</span>
             <h2 id="legacy-title">
               {legacyPanel === "login"
                 ? "登录"
+                : legacyPanel === "library"
+                  ? cloudPlaylistName || "我的酷狗歌单"
                 : legacyPanel === "daily"
                   ? "每日推荐"
                   : legacyPanel === "recommend"
@@ -897,10 +1168,31 @@ export function MineradioPlayer() {
             <p>
               {legacyPanel === "login"
                 ? "扫码登录由本机第三方适配服务完成；账号 Cookie 只保存在这台电脑，不会发送到浏览器或同步房间。"
+                : legacyPanel === "library"
+                  ? "酷狗账号和高音质权限沿用原平台规则；浏览器只接收歌单资料与受限播放标识，不接收账号 token 或真实音源地址。"
                 : legacyPanel === "search"
                   ? "搜索结果来自第三方网易云兼容接口；可直接加载到本机或当前局域网同步房间。"
                   : "云端推荐从第三方音乐服务读取；在线音源仍会经过受限代理，真实地址不会进入房间状态。"}
             </p>
+
+            {legacyPanel === "login" ? (
+              <div className="provider-tabs" role="tablist" aria-label="选择音乐平台">
+                <button
+                  className={loginProvider === "netease" ? "is-active" : ""}
+                  type="button"
+                  role="tab"
+                  aria-selected={loginProvider === "netease"}
+                  onClick={() => setLoginProvider("netease")}
+                >网易云音乐</button>
+                <button
+                  className={loginProvider === "kugou" ? "is-active" : ""}
+                  type="button"
+                  role="tab"
+                  aria-selected={loginProvider === "kugou"}
+                  onClick={() => setLoginProvider("kugou")}
+                >酷狗音乐</button>
+              </div>
+            ) : null}
 
             {cloudLoading ? (
               <div className="legacy-state is-loading" role="status">
@@ -920,12 +1212,15 @@ export function MineradioPlayer() {
               cloudUser?.loggedIn ? (
                 <div className="cloud-profile">
                   <img src={cloudUser.avatar || "/mineradio-card-art.png"} width="72" height="72" alt="" />
-                  <div><small>网易云账号</small><strong>{cloudUser.nickname || "已登录用户"}</strong></div>
+                  <div>
+                    <small>{loginProvider === "kugou" ? "酷狗音乐账号" : "网易云账号"}{cloudUser.vipLabel ? ` · ${cloudUser.vipLabel}` : ""}</small>
+                    <strong>{cloudUser.nickname || "已登录用户"}</strong>
+                  </div>
                   <button type="button" onClick={() => void logoutCloud()}>退出登录</button>
                 </div>
               ) : (
                 <div className="cloud-login">
-                  {cloudQrImage ? <img className="cloud-qr" src={cloudQrImage} width="190" height="190" alt="网易云音乐扫码登录二维码" /> : null}
+                  {cloudQrImage ? <img className="cloud-qr" src={cloudQrImage} width="190" height="190" alt={`${loginProvider === "kugou" ? "酷狗音乐" : "网易云音乐"}扫码登录二维码`} /> : null}
                   <span>{cloudStatus || "正在生成登录二维码…"}</span>
                 </div>
               )
@@ -935,22 +1230,46 @@ export function MineradioPlayer() {
               legacyPanel !== "search" && !cloudUser?.loggedIn ? (
                 <div className="cloud-empty">
                   <strong>需要先登录</strong>
-                  <span>{cloudStatus || "每日推荐与账号偏好相关。"}</span>
-                  <button type="button" onClick={() => setLegacyPanel("login")}>扫码登录</button>
+                  <span>{cloudStatus || (legacyPanel === "library" ? "酷狗云歌单与账号关联。" : "每日推荐与账号偏好相关。")}</span>
+                  <button type="button" onClick={() => {
+                    if (legacyPanel === "library") setLoginProvider("kugou");
+                    setLegacyPanel("login");
+                  }}>扫码登录</button>
                 </div>
               ) : (
                 <>
                   {cloudStatus ? <div className="cloud-result-status">{cloudStatus}</div> : null}
-                  <div className="cloud-song-list" role="list">
-                    {cloudSongs.map((song) => (
-                      <button type="button" onClick={() => selectCloudSong(song)} key={song.id}>
-                        <img src={song.cover || "/mineradio-card-art.png"} width="54" height="54" alt="" />
-                        <span><strong>{song.name}</strong><small>{[song.artist, song.album].filter(Boolean).join(" · ") || "网易云音乐"}</small></span>
-                        <time>{formatTime(song.duration / 1000)}</time>
-                        <Play size={17} weight="fill" aria-hidden="true" />
-                      </button>
-                    ))}
-                  </div>
+                  {legacyPanel === "library" && !cloudPlaylistName ? (
+                    <div className="cloud-playlist-list" role="list">
+                      {cloudPlaylists.map((playlist) => (
+                        <button type="button" onClick={() => void loadKugouPlaylist(playlist)} key={playlist.id}>
+                          <img src={playlist.cover || "/mineradio-card-art.png"} width="54" height="54" alt="" />
+                          <span><strong>{playlist.name}</strong><small>{playlist.trackCount} 首 · 酷狗音乐</small></span>
+                          <CaretLeft className="playlist-enter" size={17} aria-hidden="true" />
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <>
+                      {legacyPanel === "library" && cloudPlaylistName ? (
+                        <button className="cloud-list-back" type="button" onClick={() => {
+                          setCloudSongs([]);
+                          setCloudPlaylistName("");
+                          setCloudStatus(`已同步 ${cloudPlaylists.length} 个酷狗歌单`);
+                        }}><CaretLeft size={16} aria-hidden="true" />返回歌单</button>
+                      ) : null}
+                      <div className="cloud-song-list" role="list">
+                        {cloudSongs.map((song) => (
+                          <button type="button" onClick={() => selectCloudSong(song)} key={`${song.provider || "netease"}:${song.id}`}>
+                            <img src={song.cover || "/mineradio-card-art.png"} width="54" height="54" alt="" />
+                            <span><strong>{song.name}</strong><small>{[song.artist, song.album].filter(Boolean).join(" · ") || (song.provider === "kugou" ? "酷狗音乐" : "网易云音乐")}</small></span>
+                            <time>{formatTime(song.duration / 1000)}</time>
+                            <Play size={17} weight="fill" aria-hidden="true" />
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
                 </>
               )
             ) : null}
@@ -977,7 +1296,7 @@ export function MineradioPlayer() {
 
         {mode === "solo" ? (
           <div className="room-lobby">
-            <p>房间内会自动同步歌曲、播放状态、进度与应用内音量。</p>
+            <p>房间内会自动同步歌曲、音质、播放状态、进度与应用内音量；本机音色按设备单独保留。</p>
             <button className="drawer-primary" type="button" onClick={createRoom}>
               <UsersThree size={19} aria-hidden="true" />
               创建同步房间
@@ -1010,7 +1329,7 @@ export function MineradioPlayer() {
               <div><dt>延迟</dt><dd>{roomConnected ? `${room.latency} ms` : "—"}</dd></div>
               <div><dt>状态</dt><dd>{roomConnected ? "已同步" : "等待连接"}</dd></div>
             </dl>
-            {!room.isLeader ? <p className="follower-note">进度和应用内音量由主控自动同步；系统音量仍由本机按键控制。</p> : null}
+            {!room.isLeader ? <p className="follower-note">音质、进度和应用内音量由主控自动同步；本机音色与系统音量仍由当前设备控制。</p> : null}
           </div>
         )}
 
@@ -1042,6 +1361,33 @@ export function MineradioPlayer() {
               <strong>{effectiveTrack?.name || "还没有播放歌曲"}</strong>
               <span>{mode === "room" ? `同步房间 ${roomCode}` : "Mineradio · 本地音乐"}</span>
             </div>
+            <div className={`dock-setting quality-setting ${qualityOpen ? "is-open" : ""}`}>
+              <button
+                className="quality-pill"
+                type="button"
+                aria-label={`音质：${qualityShortLabel(effectiveQuality, effectiveTrack?.provider)}`}
+                aria-expanded={qualityOpen}
+                onClick={() => {
+                  setQualityOpen((value) => !value);
+                  setAudioEffectOpen(false);
+                }}
+              >{qualityShortLabel(effectiveQuality, effectiveTrack?.provider)}</button>
+              <div className="dock-setting-popover quality-popover" role="menu" aria-label="播放音质">
+                <span>播放音质</span>
+                {QUALITY_OPTIONS.map((option) => (
+                  <button
+                    className={effectiveQuality === option.id ? "is-active" : ""}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={effectiveQuality === option.id}
+                    disabled={mode === "room" && !canControl}
+                    onClick={() => changePlaybackQuality(option.id)}
+                    key={option.id}
+                  ><strong>{effectiveTrack?.provider === "kugou" && option.id === "hires" ? "Hi-Res" : option.label}</strong><small>{option.detail}</small></button>
+                ))}
+                <p>实际档位由平台、账号与版权权限决定。</p>
+              </div>
+            </div>
             <button className={liked ? "is-active" : ""} type="button" onClick={() => setLiked((value) => !value)} aria-label={liked ? "取消喜欢" : "喜欢"}>
               <Heart size={21} weight={liked ? "fill" : "regular"} aria-hidden="true" />
             </button>
@@ -1069,6 +1415,71 @@ export function MineradioPlayer() {
           </div>
 
           <div className="dock-cluster dock-modes">
+            <div className={`dock-setting quality-setting mobile-quality-setting ${qualityOpen ? "is-open" : ""}`}>
+              <button
+                className="quality-pill"
+                type="button"
+                aria-label={`音质：${qualityShortLabel(effectiveQuality, effectiveTrack?.provider)}`}
+                aria-expanded={qualityOpen}
+                onClick={() => {
+                  setQualityOpen((value) => !value);
+                  setAudioEffectOpen(false);
+                }}
+              >{qualityShortLabel(effectiveQuality, effectiveTrack?.provider)}</button>
+              <div className="dock-setting-popover quality-popover" role="menu" aria-label="播放音质">
+                <span>播放音质</span>
+                {QUALITY_OPTIONS.map((option) => (
+                  <button
+                    className={effectiveQuality === option.id ? "is-active" : ""}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={effectiveQuality === option.id}
+                    disabled={mode === "room" && !canControl}
+                    onClick={() => changePlaybackQuality(option.id)}
+                    key={option.id}
+                  ><strong>{option.label}</strong><small>{option.detail}</small></button>
+                ))}
+                <p>实际档位由平台、账号与版权权限决定。</p>
+              </div>
+            </div>
+            <div className={`dock-setting effect-setting ${audioEffectOpen ? "is-open" : ""}`}>
+              <button
+                className={audioEffect !== "original" ? "is-active" : ""}
+                type="button"
+                onClick={() => {
+                  setAudioEffectOpen((value) => !value);
+                  setQualityOpen(false);
+                }}
+                aria-label={`本机音色：${getAudioEffect(audioEffect).label}`}
+                aria-expanded={audioEffectOpen}
+              ><SlidersHorizontal size={20} aria-hidden="true" /></button>
+              <div className="dock-setting-popover effect-popover" role="menu" aria-label="本机音色预设">
+                <span>本机音色 · 不随房间同步</span>
+                {AUDIO_EFFECTS.map((effect) => (
+                  <button
+                    className={audioEffect === effect.id ? "is-active" : ""}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={audioEffect === effect.id}
+                    onClick={() => {
+                      audioEffectRef.current = effect.id;
+                      setAudioEffect(effect.id);
+                      window.localStorage.setItem("mineradio-audio-effect-v1", effect.id);
+                      setAudioEffectOpen(false);
+                      void ensureAudioGraph().then((enabled) => {
+                        setNotice(enabled
+                          ? `本机音色已切换为 ${effect.label}。`
+                          : `已保存 ${effect.label}；当前浏览器不支持 Web Audio 音色处理。`);
+                      }).catch(() => {
+                        setNotice(`已保存 ${effect.label}；请先允许浏览器播放声音后再启用音色。`);
+                      });
+                    }}
+                    key={effect.id}
+                  ><strong>{effect.label}</strong><small>{effect.description}</small></button>
+                ))}
+                <p>这是本机 Web Audio 处理，不是平台官方音效。</p>
+              </div>
+            </div>
             <button className={lyricsOpen ? "is-active" : ""} type="button" onClick={() => setLyricsOpen((value) => !value)} aria-label="歌词舞台">
               <span className="lyrics-glyph">词</span>
             </button>
@@ -1085,10 +1496,10 @@ export function MineradioPlayer() {
                 onChange={(event) => setVolume(Number(event.target.value))}
               />
             </label>
-            <button type="button" onClick={() => setRoomPanelOpen(true)} aria-label="同步设备">
+            <button className="dock-device-button" type="button" onClick={() => setRoomPanelOpen(true)} aria-label="同步设备">
               <UsersThree size={20} aria-hidden="true" />
             </button>
-            <button type="button" onClick={() => setLyricsOpen(true)} aria-label="沉浸模式">
+            <button className="dock-immersive-button" type="button" onClick={() => setLyricsOpen(true)} aria-label="沉浸模式">
               <CornersOut size={20} aria-hidden="true" />
             </button>
             <time>{formatTime(progress)} / {formatTime(duration)}</time>

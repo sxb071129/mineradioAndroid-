@@ -4,7 +4,11 @@ export type TrackDescriptor = {
   type: string;
   size: number;
   path: string;
+  provider?: "netease" | "kugou";
+  quality?: PlaybackQuality;
 };
+
+export type PlaybackQuality = "jymaster" | "hires" | "lossless" | "exhigh" | "standard";
 
 export type RoomState = {
   revision: number;
@@ -25,5 +29,5 @@ export type RoomCommand =
   | { action: "pause" }
   | { action: "seek"; position: number }
   | { action: "volume"; volume: number }
+  | { action: "quality"; quality: PlaybackQuality }
   | { action: "track"; track: TrackDescriptor };
-
