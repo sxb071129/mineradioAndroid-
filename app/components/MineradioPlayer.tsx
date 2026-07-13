@@ -1,8 +1,35 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element -- vinext does not provide a working image optimizer route. */
+
+import {
+  ArrowsClockwise,
+  CaretLeft,
+  Check,
+  Copy,
+  CornersOut,
+  GearSix,
+  Heart,
+  House,
+  List,
+  MagnifyingGlass,
+  MusicNotes,
+  Pause,
+  Play,
+  Plus,
+  SkipBack,
+  SkipForward,
+  SpeakerHigh,
+  UploadSimple,
+  UsersThree,
+  Waveform,
+  WifiHigh,
+  X,
+} from "@phosphor-icons/react";
 import {
   type CSSProperties,
   type ChangeEvent,
+  type FormEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -85,8 +112,13 @@ export function MineradioPlayer() {
   const [notice, setNotice] = useState("");
   const [needsUnlock, setNeedsUnlock] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [roomPanelOpen, setRoomPanelOpen] = useState(Boolean(initialRoom));
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const [liked, setLiked] = useState(false);
+  const [searchText, setSearchText] = useState("");
+  const [legacyPanel, setLegacyPanel] = useState<"login" | "daily" | "recommend" | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
-  const stageRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -104,7 +136,6 @@ export function MineradioPlayer() {
   const roomIsLeader = room.isLeader;
   const sendRoomCommand = room.sendCommand;
   const getRoomTargetPosition = room.targetPosition;
-
   const roomTrack = roomState?.track || null;
   const effectiveTrack = mode === "room" ? roomTrack : localTrack;
   const effectivePlaying = mode === "room" ? Boolean(roomState?.playing) : soloPlaying;
@@ -289,9 +320,9 @@ export function MineradioPlayer() {
         audio.pause();
       }
       setNeedsUnlock(false);
-      setNotice("声音已启用，设备会自动追赶房间进度");
+      setNotice("声音已启用，这台设备会自动追赶房间进度。");
     } catch {
-      setNotice("浏览器仍阻止播放，请检查静音开关或媒体权限");
+      setNotice("浏览器仍阻止播放，请检查静音开关或媒体权限。");
     }
   }, [audioSource, ensureAudioGraph, mode, room]);
 
@@ -301,11 +332,11 @@ export function MineradioPlayer() {
       event.target.value = "";
       if (!file) return;
       if (!file.type.startsWith("audio/")) {
-        setNotice("请选择浏览器支持的音频文件");
+        setNotice("请选择浏览器支持的音频文件。");
         return;
       }
       if (file.size > MAX_UPLOAD_BYTES) {
-        setNotice("文件超过 512 MB，请选择更小的音频");
+        setNotice("文件超过 512 MB，请选择更小的音频。");
         return;
       }
       await ensureAudioGraph();
@@ -322,15 +353,15 @@ export function MineradioPlayer() {
           url,
         });
         setSoloPlaying(false);
-        setNotice("文件只保留在此设备；创建房间后才会分享给局域网设备");
+        setNotice("歌曲只保留在当前设备；创建房间后可分享给局域网设备。");
         return;
       }
       if (!room.isLeader || !roomConnected || !room.httpBase) {
-        setNotice("请等待房间连接，且只有主控可以更换歌曲");
+        setNotice("请等待房间连接；只有主控设备可以更换歌曲。");
         return;
       }
       setUploading(true);
-      setNotice("正在把歌曲安全地送到局域网中继…");
+      setNotice("正在把歌曲发送到局域网中继…");
       try {
         const endpoint = new URL("/api/tracks", room.httpBase);
         endpoint.searchParams.set("name", file.name.replace(/\.[^.]+$/, ""));
@@ -339,7 +370,7 @@ export function MineradioPlayer() {
         const result = (await response.json()) as TrackDescriptor & { error?: string };
         if (!response.ok) throw new Error(result.error || "upload_failed");
         room.sendCommand({ action: "track", track: result });
-        setNotice("歌曲已送达房间，所有设备将加载同一份音频");
+        setNotice("歌曲已送达房间，所有设备会加载同一份音频。");
       } catch (error) {
         setNotice(`上传失败：${error instanceof Error ? error.message : "未知错误"}`);
       } finally {
@@ -376,19 +407,21 @@ export function MineradioPlayer() {
     setMode("room");
     setRoomCode(code);
     setRoomInput(code);
+    setRoomPanelOpen(true);
     updateRoomInUrl(code);
-    setNotice("房间已创建；连接后你将成为主控");
+    setNotice("房间已创建；连接后你将成为主控设备。");
   }, []);
 
   const joinRoom = useCallback(() => {
     const code = roomInput.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
     if (code.length < 4) {
-      setNotice("请输入 4–8 位房间码");
+      setNotice("请输入 4–8 位房间码。");
       return;
     }
     setMode("room");
     setRoomCode(code);
     setRoomInput(code);
+    setRoomPanelOpen(true);
     updateRoomInUrl(code);
   }, [roomInput]);
 
@@ -397,7 +430,7 @@ export function MineradioPlayer() {
     setRoomCode("");
     updateRoomInUrl("");
     setNeedsUnlock(false);
-    setNotice("已回到单机模式");
+    setNotice("已回到单机模式。");
   }, []);
 
   const shareUrl = useMemo(() => {
@@ -419,6 +452,14 @@ export function MineradioPlayer() {
     window.setTimeout(() => setCopied(false), 1600);
   }, [shareUrl]);
 
+  const onSearchSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (searchText.trim()) {
+      setNotice(`网页改编版不调用第三方搜索接口；请从本机导入“${searchText.trim()}”。`);
+    }
+    fileInputRef.current?.click();
+  }, [searchText]);
+
   const stageStyle = {
     "--progress": `${duration ? Math.min(1, progress / duration) : 0}`,
   } as CSSProperties;
@@ -431,9 +472,63 @@ export function MineradioPlayer() {
         : room.status === "reconnecting"
           ? "正在重连"
           : "等待中继";
+  const overlayOpen = roomPanelOpen || Boolean(legacyPanel) || lyricsOpen;
+
+  const handleHomeCardAction = useCallback((action: "file" | "daily" | "recommend" | "play" | "profile") => {
+    if (action === "file") fileInputRef.current?.click();
+    else if (action === "daily") setLegacyPanel("daily");
+    else if (action === "recommend") setLegacyPanel("recommend");
+    else if (action === "play") void togglePlayback();
+    else setNotice("听歌画像将在积累更多本地播放记录后生成。");
+  }, [togglePlayback]);
+
+  const homeCards = [
+    {
+      label: "LIBRARY",
+      title: "我的歌单",
+      sub: effectiveTrack ? `正在听：${effectiveTrack.name}` : "从本地音乐开始",
+      tone: "mint",
+      action: "file" as const,
+    },
+    {
+      label: "DAILY",
+      title: "每日推荐",
+      sub: "登录后同步你的今日歌曲",
+      tone: "blue",
+      action: "daily" as const,
+    },
+    {
+      label: "SONG",
+      title: "推荐歌曲",
+      sub: "登录后同步更多歌曲",
+      tone: "ice",
+      action: "recommend" as const,
+    },
+    {
+      label: "CONTINUE",
+      title: "继续听",
+      sub: duration ? `${formatTime(progress)} / ${formatTime(duration)}` : "最近播放会出现在这里",
+      tone: "silver",
+      action: effectiveTrack ? "play" as const : "file" as const,
+    },
+    {
+      label: "PROFILE",
+      title: "听歌画像",
+      sub: "播放几首后生成偏好",
+      tone: "cyan",
+      action: "profile" as const,
+    },
+    {
+      label: "VISUAL",
+      title: "更多歌曲",
+      sub: "播放后会继续补全推荐",
+      tone: "gold",
+      action: "recommend" as const,
+    },
+  ];
 
   return (
-    <main className="app-shell">
+    <main ref={stageRef} className="mineradio-shell" style={stageStyle}>
       <audio ref={audioRef} crossOrigin="anonymous" preload="metadata" />
       <input
         ref={fileInputRef}
@@ -443,78 +538,260 @@ export function MineradioPlayer() {
         onChange={onFile}
       />
 
-      <header className="topbar">
-        <a className="brand" href="#player" aria-label="回到播放器">
-          <span className="brand-mark" aria-hidden="true">MR</span>
-          <span><strong>ROOM RADIO</strong><small>based on Mineradio</small></span>
-        </a>
-        <div className="status-cluster" aria-live="polite">
-          <span className={`status-dot ${roomConnected ? "is-online" : ""}`} />
-          <span>{syncLabel}</span>
-          {mode === "room" && roomConnected ? <span className="latency">{room.latency} ms</span> : null}
-        </div>
+      <div className="starfield" aria-hidden="true" />
+
+      <header className="mineradio-topbar" inert={overlayOpen}>
+        <form className="search-glass" role="search" onSubmit={onSearchSubmit}>
+          <MagnifyingGlass size={18} weight="regular" aria-hidden="true" />
+          <input
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            placeholder="搜索歌曲、歌手…"
+            aria-label="搜索歌曲或歌手"
+          />
+          <button type="submit" aria-label="从本机导入音乐">
+            <UploadSimple size={18} aria-hidden="true" />
+          </button>
+        </form>
+
+        <nav className="top-actions" aria-label="播放器导航">
+          <button className="round-glass" type="button" aria-label="回到音乐库">
+            <House size={19} weight="fill" aria-hidden="true" />
+          </button>
+          <button
+            className={`room-capsule ${roomConnected ? "is-connected" : ""}`}
+            type="button"
+            onClick={() => setRoomPanelOpen(true)}
+            aria-label="打开同步房间"
+          >
+            <WifiHigh size={17} aria-hidden="true" />
+            <span>{syncLabel}</span>
+            {mode === "room" && roomConnected ? <small>{room.latency} ms</small> : null}
+          </button>
+          <button className="login-capsule" type="button" onClick={() => setLegacyPanel("login")}>登录</button>
+        </nav>
       </header>
 
-      <section id="player" ref={stageRef} className="player-grid" style={stageStyle}>
-        <div className="sound-stage">
-          <div className="ambient ambient-one" aria-hidden="true" />
-          <div className="ambient ambient-two" aria-hidden="true" />
-          <div className="stage-copy">
-            <span className="eyebrow">{mode === "room" ? `SYNC ROOM / ${roomCode || "—"}` : "PRIVATE LISTENING"}</span>
-            <h1>{effectiveTrack?.name || "把一首歌放进房间"}</h1>
+      <section className="home-workspace" aria-label="Mineradio 音乐库" inert={overlayOpen}>
+        <article className="home-hero-card">
+          <div className="hero-copy">
+            <span className="micro-label">MINERADIO · YOUR LIBRARY</span>
+            <h1>{effectiveTrack ? effectiveTrack.name : "我的音乐库"}</h1>
             <p>
               {effectiveTrack
                 ? mode === "room"
-                  ? "同一音源、同一时间线、同一房间音量。"
-                  : "本地播放不会上传；随时可以创建局域网房间。"
-                : "选择本地音频，或创建房间后分享给同一 Wi‑Fi 下的设备。"}
+                  ? "同一音源、同一时间线和同一应用内音量，所有设备保持同步。"
+                  : "歌曲只在这台设备播放；随时可以创建局域网房间。"
+                : "从本地音乐或同步房间开始，歌曲、进度和音量会在你的设备之间保持一致。"}
             </p>
-          </div>
-
-          <div className={`record-orbit ${effectivePlaying ? "is-playing" : ""}`} aria-hidden="true">
-            <div className="record-disc">
-              <div className="record-label">
-                <span>ROOM</span><strong>{effectiveTrack ? "LIVE" : "IDLE"}</strong><small>{mode === "room" ? roomCode || "SYNC" : "SOLO"}</small>
-              </div>
+            <div className="hero-meta">
+              <span>{mode === "room" ? `房间 ${roomCode}` : "本机播放"}</span>
+              <span>{effectivePlaying ? "正在播放" : "等待播放"}</span>
             </div>
           </div>
 
-          <div className="transport" aria-label="播放控制">
-            <button
-              className="track-button"
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploading || (mode === "room" && !room.isLeader)}
-            >
-              {uploading ? "正在上传…" : effectiveTrack ? "更换歌曲" : "选择歌曲"}
+          <div className={`hero-disc-stack ${effectivePlaying ? "is-playing" : ""}`} aria-hidden="true">
+            <img className="disc-card disc-card-one" src="/mineradio-card-art.png" width="115" height="115" alt="" />
+            <img className="disc-card disc-card-two" src="/mineradio-card-art.png" width="115" height="115" alt="" />
+            <img className="disc-card disc-card-three" src="/mineradio-card-art.png" width="115" height="115" alt="" />
+          </div>
+
+          <div className="wave-panel" aria-hidden="true">
+            <img src="/mineradio-wave.png" width="516" height="105" alt="" />
+          </div>
+
+          <div className="hero-actions">
+            <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading || (mode === "room" && !room.isLeader)}>
+              <UploadSimple size={15} aria-hidden="true" />
+              {uploading ? "正在上传…" : effectiveTrack ? "更换歌曲" : "导入本地音乐"}
             </button>
-            <button
-              className="play-button"
-              type="button"
-              onClick={togglePlayback}
-              disabled={!effectiveTrack || !canControl}
-              aria-label={effectivePlaying ? "暂停" : "播放"}
-            >
-              <span aria-hidden="true">{effectivePlaying ? "Ⅱ" : "▶"}</span>
+            <button type="button" onClick={() => setRoomPanelOpen(true)}>
+              <UsersThree size={15} aria-hidden="true" />
+              同步房间
             </button>
-            <div className="time-block">
-              <div className="time-row"><span>{formatTime(progress)}</span><span>{formatTime(duration)}</span></div>
+          </div>
+        </article>
+
+        <div className="home-side">
+          <div className="home-card-grid">
+            {homeCards.map((card) => (
+              <button className={`home-card tone-${card.tone}`} type="button" onClick={() => handleHomeCardAction(card.action)} key={card.label}>
+                <span className="home-card-label">{card.label}</span>
+                <strong>{card.title}</strong>
+                <small>{card.sub}</small>
+                <img className="home-card-art" src="/mineradio-card-art.png" width="115" height="115" alt="" />
+              </button>
+            ))}
+          </div>
+
+          <section className="start-rail" aria-labelledby="start-title">
+            <div className="start-heading">
+              <h2 id="start-title">先从这里开始</h2>
+              <span>局域网模式无需账号</span>
+            </div>
+            <div className="start-tile-row">
+              <button type="button" onClick={() => fileInputRef.current?.click()}>
+                <span className="tile-art"><img src="/mineradio-tile-art.png" width="102" height="93" alt="" /></span>
+                <strong>导入本地音乐</strong>
+              </button>
+              <button type="button" onClick={createRoom}>
+                <span className="tile-icon"><Plus size={28} aria-hidden="true" /></span>
+                <strong>创建同步房间</strong>
+              </button>
+              <button type="button" onClick={() => setRoomPanelOpen(true)}>
+                <span className="tile-icon"><UsersThree size={28} aria-hidden="true" /></span>
+                <strong>加入局域网房间</strong>
+              </button>
+              <button type="button" onClick={() => setLyricsOpen((value) => !value)}>
+                <span className="tile-icon"><Waveform size={28} aria-hidden="true" /></span>
+                <strong>打开歌词舞台</strong>
+              </button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      {lyricsOpen ? (
+        <section className="lyrics-stage" aria-label="歌词舞台">
+          <button type="button" onClick={() => setLyricsOpen(false)} aria-label="关闭歌词舞台">
+            <X size={20} aria-hidden="true" />
+          </button>
+          <span>{effectiveTrack ? "NOW PLAYING" : "MINERADIO"}</span>
+          <h2>{effectiveTrack?.name || "导入一首歌，让视觉舞台醒来"}</h2>
+          <p>{mode === "room" ? "歌词视觉与房间时间线保持同一拍" : "本地播放 · 私人视觉电台"}</p>
+        </section>
+      ) : null}
+
+      {legacyPanel ? (
+        <>
+        <button className="legacy-scrim" type="button" onClick={() => setLegacyPanel(null)} aria-label="关闭原版云端面板" />
+        <section className="legacy-modal" role="dialog" aria-modal="true" aria-labelledby="legacy-title">
+          <button type="button" onClick={() => setLegacyPanel(null)} aria-label="关闭原版云端面板"><X size={20} aria-hidden="true" /></button>
+          <span>MINERADIO CLOUD</span>
+          <h2 id="legacy-title">{legacyPanel === "login" ? "登录" : legacyPanel === "daily" ? "每日推荐" : "推荐歌曲"}</h2>
+          <p>该入口保留原版云端服务边界，不经过局域网同步中继。登录状态和推荐数据仍由原版接口提供。</p>
+          <div className="legacy-state">
+            <ArrowsClockwise size={20} aria-hidden="true" />
+            <span>{legacyPanel === "login" ? "等待原版登录服务" : "登录后同步云端内容"}</span>
+          </div>
+          <button className="legacy-close" type="button" onClick={() => setLegacyPanel(null)}>返回音乐库</button>
+        </section>
+        </>
+      ) : null}
+
+      <aside className={`room-drawer ${roomPanelOpen ? "is-open" : ""}`} aria-labelledby="room-title" aria-hidden={!roomPanelOpen} inert={!roomPanelOpen}>
+        <div className="drawer-heading">
+          <button className="drawer-back" type="button" onClick={() => setRoomPanelOpen(false)} aria-label="关闭同步房间">
+            <CaretLeft size={20} aria-hidden="true" />
+          </button>
+          <div>
+            <span>LISTEN TOGETHER</span>
+            <h2 id="room-title">局域网同步房间</h2>
+          </div>
+          {mode === "room" ? <button className="drawer-leave" type="button" onClick={leaveRoom}>退出</button> : null}
+        </div>
+
+        {mode === "solo" ? (
+          <div className="room-lobby">
+            <p>房间内会自动同步歌曲、播放状态、进度与应用内音量。</p>
+            <button className="drawer-primary" type="button" onClick={createRoom}>
+              <UsersThree size={19} aria-hidden="true" />
+              创建同步房间
+            </button>
+            <label className="field-label" htmlFor="room-code-input">房间码</label>
+            <div className="join-room-row">
               <input
-                aria-label="播放进度"
-                className="progress-slider"
-                type="range"
-                min="0"
-                max={duration || 1}
-                step="0.05"
-                value={Math.min(progress, duration || 1)}
-                disabled={!effectiveTrack || !canControl}
-                onChange={(event) => seek(Number(event.target.value))}
+                id="room-code-input"
+                value={roomInput}
+                onChange={(event) => setRoomInput(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8))}
+                placeholder="例如 A7K9Q2"
+                autoCapitalize="characters"
               />
+              <button type="button" onClick={joinRoom}>加入</button>
             </div>
-            <label className="volume-block">
-              <span>ROOM VOL</span>
+          </div>
+        ) : (
+          <div className="room-live">
+            <div className="room-code-card">
+              <span>ROOM CODE</span>
+              <strong>{roomCode}</strong>
+              <button type="button" onClick={copyShareLink} disabled={!shareUrl}>
+                {copied ? <Check size={17} aria-hidden="true" /> : <Copy size={17} aria-hidden="true" />}
+                {copied ? "已复制" : "复制局域网链接"}
+              </button>
+            </div>
+            <dl className="room-stats">
+              <div><dt>角色</dt><dd>{room.isLeader ? "主控设备" : "同步跟随"}</dd></div>
+              <div><dt>设备</dt><dd>{room.state?.deviceCount || 1} 台</dd></div>
+              <div><dt>延迟</dt><dd>{roomConnected ? `${room.latency} ms` : "—"}</dd></div>
+              <div><dt>状态</dt><dd>{roomConnected ? "已同步" : "等待连接"}</dd></div>
+            </dl>
+            {!room.isLeader ? <p className="follower-note">进度和应用内音量由主控自动同步；系统音量仍由本机按键控制。</p> : null}
+          </div>
+        )}
+
+        <details className="relay-settings">
+          <summary><GearSix size={17} aria-hidden="true" />局域网中继设置</summary>
+          <label><span>中继地址</span><input value={relayUrl} onChange={(event) => setRelayUrl(event.target.value)} spellCheck="false" /></label>
+          <label><span>设备名称</span><input value={deviceName} onChange={(event) => setDeviceName(event.target.value.slice(0, 32))} /></label>
+          <p>主机运行桌面启动脚本后，同一 Wi‑Fi 的设备使用主机 IP 即可加入。</p>
+        </details>
+      </aside>
+      {roomPanelOpen ? <button className="drawer-scrim" type="button" onClick={() => setRoomPanelOpen(false)} aria-label="关闭同步房间" /> : null}
+
+      <section className="player-dock" aria-label="播放控制台" inert={overlayOpen}>
+        <input
+          aria-label="播放进度"
+          className="dock-progress"
+          type="range"
+          min="0"
+          max={duration || 1}
+          step="0.05"
+          value={Math.min(progress, duration || 1)}
+          disabled={!effectiveTrack || !canControl}
+          onChange={(event) => seek(Number(event.target.value))}
+        />
+        <div className="dock-controls">
+          <div className="dock-cluster dock-track">
+            <img src="/mineradio-card-art.png" width="52" height="52" alt="" />
+            <div className="dock-meta">
+              <strong>{effectiveTrack?.name || "还没有播放歌曲"}</strong>
+              <span>{mode === "room" ? `同步房间 ${roomCode}` : "Mineradio · 本地音乐"}</span>
+            </div>
+            <button className={liked ? "is-active" : ""} type="button" onClick={() => setLiked((value) => !value)} aria-label={liked ? "取消喜欢" : "喜欢"}>
+              <Heart size={21} weight={liked ? "fill" : "regular"} aria-hidden="true" />
+            </button>
+            <button type="button" onClick={() => fileInputRef.current?.click()} aria-label="添加歌曲">
+              <Plus size={20} aria-hidden="true" />
+            </button>
+          </div>
+
+          <div className="dock-cluster dock-transport">
+            <button type="button" disabled aria-label="循环播放">
+              <ArrowsClockwise size={20} aria-hidden="true" />
+            </button>
+            <button type="button" disabled aria-label="上一首">
+              <SkipBack size={21} weight="fill" aria-hidden="true" />
+            </button>
+            <button className="dock-play" type="button" onClick={togglePlayback} disabled={!effectiveTrack || !canControl} aria-label={effectivePlaying ? "暂停" : "播放"}>
+              {effectivePlaying ? <Pause size={24} weight="fill" aria-hidden="true" /> : <Play size={24} weight="fill" aria-hidden="true" />}
+            </button>
+            <button type="button" disabled aria-label="下一首">
+              <SkipForward size={21} weight="fill" aria-hidden="true" />
+            </button>
+            <button type="button" onClick={() => setRoomPanelOpen(true)} aria-label="当前房间">
+              <List size={21} aria-hidden="true" />
+            </button>
+          </div>
+
+          <div className="dock-cluster dock-modes">
+            <button className={lyricsOpen ? "is-active" : ""} type="button" onClick={() => setLyricsOpen((value) => !value)} aria-label="歌词舞台">
+              <span className="lyrics-glyph">词</span>
+            </button>
+            <label className="dock-volume">
+              <SpeakerHigh size={20} aria-hidden="true" />
               <input
-                aria-label="房间音量"
+                aria-label="应用内音量"
                 type="range"
                 min="0"
                 max="1"
@@ -523,77 +800,32 @@ export function MineradioPlayer() {
                 disabled={!canControl}
                 onChange={(event) => setVolume(Number(event.target.value))}
               />
-              <output>{Math.round(effectiveVolume * 100)}%</output>
             </label>
+            <button type="button" onClick={() => setRoomPanelOpen(true)} aria-label="同步设备">
+              <UsersThree size={20} aria-hidden="true" />
+            </button>
+            <button type="button" onClick={() => setLyricsOpen(true)} aria-label="沉浸模式">
+              <CornersOut size={20} aria-hidden="true" />
+            </button>
+            <time>{formatTime(progress)} / {formatTime(duration)}</time>
           </div>
         </div>
-
-        <aside className="room-panel" aria-labelledby="room-title">
-          <div className="panel-heading">
-            <div><span className="eyebrow">LISTEN TOGETHER</span><h2 id="room-title">局域网同步房间</h2></div>
-            {mode === "room" ? <button className="text-button" type="button" onClick={leaveRoom}>退出</button> : null}
-          </div>
-
-          {mode === "solo" ? (
-            <div className="lobby-stack">
-              <div className="solo-note"><span className="note-index">01</span><p>单机模式下，音频只在当前浏览器内播放，不会上传。</p></div>
-              <button className="primary-action" type="button" onClick={createRoom}>创建同步房间<span aria-hidden="true">↗</span></button>
-              <div className="join-row">
-                <label>
-                  <span>房间码</span>
-                  <input
-                    value={roomInput}
-                    onChange={(event) => setRoomInput(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8))}
-                    placeholder="例如 A7K9Q2"
-                    autoCapitalize="characters"
-                    inputMode="text"
-                  />
-                </label>
-                <button type="button" onClick={joinRoom}>加入</button>
-              </div>
-            </div>
-          ) : (
-            <div className="room-stack">
-              <div className="room-code-card">
-                <span>ROOM CODE</span><strong>{roomCode}</strong>
-                <button type="button" onClick={copyShareLink} disabled={!shareUrl}>{copied ? "已复制" : "复制局域网链接"}</button>
-              </div>
-              <dl className="room-stats">
-                <div><dt>角色</dt><dd>{room.isLeader ? "主控设备" : "同步跟随"}</dd></div>
-                <div><dt>设备</dt><dd>{room.state?.deviceCount || 1} 台</dd></div>
-                <div><dt>延迟</dt><dd>{roomConnected ? `${room.latency} ms` : "—"}</dd></div>
-                <div><dt>状态</dt><dd>{roomConnected ? "已同步" : "等待连接"}</dd></div>
-              </dl>
-              {!room.isLeader ? <div className="follower-note">进度与应用内音量由主控自动同步；系统音量仍由本机按键控制。</div> : null}
-            </div>
-          )}
-
-          <details className="relay-settings">
-            <summary>局域网中继设置</summary>
-            <label><span>中继地址</span><input value={relayUrl} onChange={(event) => setRelayUrl(event.target.value)} spellCheck="false" /></label>
-            <label><span>设备名称</span><input value={deviceName} onChange={(event) => setDeviceName(event.target.value.slice(0, 32))} /></label>
-            <p>在主机运行 LAN 模式后，同一 Wi‑Fi 的设备使用主机 IP 即可加入。</p>
-          </details>
-
-          <div className="capability-list" aria-label="同步能力">
-            <span>同曲目</span><span>进度校准</span><span>房间音量</span><span>自动重连</span>
-          </div>
-        </aside>
       </section>
 
       {needsUnlock ? (
-        <div className="unlock-banner" role="alert"><span>浏览器需要你点按一次，才能响应房间播放。</span><button type="button" onClick={unlockAudio}>启用声音并追赶</button></div>
+        <div className="unlock-banner" role="alert">
+          <span>浏览器需要你点按一次，才能响应房间播放。</span>
+          <button type="button" onClick={unlockAudio}>启用声音并追赶</button>
+        </div>
       ) : null}
 
       {(notice || room.error) ? (
-        <div className="toast" role="status">{room.error || notice}<button type="button" aria-label="关闭提示" onClick={() => setNotice("")}>×</button></div>
+        <div className="toast" role="status">
+          <MusicNotes size={18} aria-hidden="true" />
+          <span>{room.error || notice}</span>
+          <button type="button" aria-label="关闭提示" onClick={() => setNotice("")}><X size={17} aria-hidden="true" /></button>
+        </div>
       ) : null}
-
-      <footer className="site-footer">
-        <span>MR//ROOM 01</span>
-        <p>受 Mineradio 启发的 GPL-3.0 网页改编 · 音频只在你选择的设备和局域网中继间流动</p>
-        <a href="https://github.com/zws84952324-create/Mineradio-Kugou-Modified" target="_blank" rel="noreferrer">上游项目 ↗</a>
-      </footer>
     </main>
   );
 }

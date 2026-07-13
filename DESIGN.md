@@ -1,34 +1,51 @@
-# MR//ROOM Visual Identity
+# Mineradio Original Interface Adaptation
 
-## Style Prompt
+## Visual target
 
-MR//ROOM translates Mineradio's immersive dark stage into a restrained, cross-platform listening room: one warm-black canvas, a tactile vinyl object, champagne typography, sea-glass sync accents, and glass panels that still read clearly without blur. Music changes the warmth, depth, and edge contrast of the stage rather than drawing a generic equalizer.
+The web player follows the repository's original 1440 × 900 home/player state: a black particle starfield, centered 620 px search glass, top-right Home/Login controls, a two-column library workspace, six glass recommendation cards, and a 1120 px floating playback dock.
 
-## Colors
+The source truth is `design-reference-original-controls.png`. The implementation preserves the original proportions and material while adapting overflow, touch targets, safe areas, and room controls for browsers and phones.
 
-- Canvas: `#0B0F0E`
-- Elevated ink: `#141A18`
-- Primary text: `#F3F0E8`
-- Muted text: `#A7B0AA`
-- Sync accent: `#5EE6C1`
-- Warm accent: `#F0C77A`
+## Original tokens
+
+- Canvas: `#000000`
+- Panel ink: `#08090B` / `#0E1014`
+- Primary text: `#F7F8FA`
+- Muted text: white at 34–62%
+- Sync accent: `#00F5D4`
+- Deep blue: `#2442FF`
+- Champagne accent: `#F4D28A`
+- Frosted lyric accent: `#D6F8FF`
 
 ## Typography
 
-- Display/body: local platform UI stack (`Segoe UI Variable`, `PingFang SC`, `Microsoft YaHei`)
-- Data/register voice: local monospace stack (`Cascadia Code`, `SFMono-Regular`, `Consolas`)
+- Display/body: `Noto Sans SC`, `PingFang SC`, `HarmonyOS Sans SC`, `Microsoft YaHei`, system UI.
+- Data and micro-labels: `JetBrains Mono`, `SFMono-Regular`, `Consolas`.
+- Large Chinese headings use an 840–900 optical weight and compact line height.
 
-## Motion
+## Material and layout
 
-- Bass gently swells the vinyl stage by no more than 6%.
-- Mid frequencies expand localized warmth; treble sharpens edge glow.
-- Controls use 160–260 ms transitions. Ambient motion stops under reduced-motion.
+- Search: 58 px high, 22 px radius, low-black glass, subtle inner white highlights.
+- Home hero: 28 px radius, dense black glass, 28 px padding, large Chinese display title.
+- Recommendation cards: two columns, 22 px radius, 108 px source-derived disc art.
+- Player dock: fixed 16 px from the bottom, 1120 px maximum width, 50 px radius, three balanced control clusters.
+- LAN room: a new drawer using the same black-glass material. It does not replace Login, Daily, or Song recommendation entries.
 
-## What NOT to Do
+## Responsive rules
 
-- No rainbow spectrum bars, musical-note clip art, or strobing beat flashes.
-- No cyan-purple full-screen gradient.
-- No hover-only controls or sub-12px essential text.
-- No borrowed MR logo, skull asset, platform artwork, or third-party album cover.
-- No blur-dependent contrast; glass must have an opaque fallback.
+- Desktop stays within one viewport and intentionally lets the floating dock cover the lower edge, matching the original composition.
+- Tablet preserves two columns until 760 px where the workspace becomes a single vertical stream.
+- Phone uses a two-row dock, a full-width bottom room sheet, safe-area padding, and no horizontal overflow.
+- Reduced-motion disables ambient drift; forced-colors replaces glass with system canvas surfaces.
 
+## Assets
+
+- `public/mineradio-starfield.png` is captured from the original rendered particle stage.
+- Disc, wave, and tile assets are source captures from the original interface rather than CSS-drawn substitutes.
+- Icons use Phosphor Icons for a consistent real icon family.
+
+## Intentional deviations
+
+- The new LAN room capsule sits between Home and Login.
+- The quick-start rail includes LAN room actions while the original Login, Daily, and Song recommendation entries remain visible and separate.
+- The mobile layout uses a compact two-row dock instead of the original three-row narrow-screen control stack.

@@ -23,7 +23,10 @@ test("server-renders the finished player", async () => {
   assert.match(html, /局域网同步房间/);
   assert.match(html, /创建同步房间/);
   assert.match(html, /aria-label="播放进度"/);
-  assert.match(html, /based on Mineradio/);
+  assert.match(html, /MINERADIO · YOUR LIBRARY/);
+  assert.match(html, /每日推荐/);
+  assert.match(html, />登录</);
+  assert.match(html, /mineradio-starfield\.png|class="starfield"/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/);
 });
 
@@ -36,4 +39,3 @@ test("responsive and accessible fallbacks are present", async () => {
   assert.match(css, /focus-visible/);
   assert.match(css, /@supports \(backdrop-filter/);
 });
-
