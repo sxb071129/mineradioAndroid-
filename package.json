@@ -11,7 +11,7 @@
     "relay": "node scripts/lan-relay.mjs",
     "build": "node scripts/run-vinext.mjs build",
     "start": "node scripts/run-vinext.mjs start",
-    "start:lan": "node scripts/dev-lan.mjs start",
+    "start:lan": "node scripts/dev-lan.mjs dev",
     "test": "npm run build && node --test tests/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .upstream-review"
   },

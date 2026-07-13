@@ -10,7 +10,6 @@ $RelayPort = if ($env:MINERADIO_SYNC_PORT -match '^\d+$') {
   8787
 }
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$DistEntry = Join-Path $ProjectRoot "dist\server\index.js"
 
 function Get-LanIPv4Addresses {
   $addresses = @(
@@ -84,17 +83,9 @@ if (-not $Node -or -not $Npm) {
 
 Push-Location $ProjectRoot
 try {
-  if (-not (Test-Path -LiteralPath $DistEntry)) {
-    Write-Host ""
-    Write-Host "First launch: creating the production build..." -ForegroundColor Yellow
-    & $Npm.Source run build
-    if ($LASTEXITCODE -ne 0) {
-      throw "Production build failed with exit code $LASTEXITCODE"
-    }
-  }
-
   Write-Host ""
-  Write-Host "Starting services. Close this window or press Ctrl+C to stop." -ForegroundColor Green
+  Write-Host "Starting the Windows-compatible live server and sync relay." -ForegroundColor Green
+  Write-Host "Close this window or press Ctrl+C to stop." -ForegroundColor Green
   Write-Host ""
   & $Npm.Source run start:lan
   exit $LASTEXITCODE
@@ -105,4 +96,3 @@ try {
 } finally {
   Pop-Location
 }
-
