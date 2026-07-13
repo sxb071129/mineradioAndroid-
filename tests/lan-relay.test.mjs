@@ -99,6 +99,18 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
   );
   assert.equal(volumeState.state.deviceCount, 2);
 
+  leader.ws.send(JSON.stringify({ type: "command", action: "seek", position: 12.5 }));
+  const seekState = await follower.next(
+    (message) => message.type === "state" && message.state?.position === 12.5,
+  );
+  assert.equal(seekState.state.position, 12.5);
+
+  leader.ws.send(JSON.stringify({ type: "command", action: "play" }));
+  const playState = await follower.next(
+    (message) => message.type === "state" && message.state?.playing === true,
+  );
+  assert.equal(playState.state.playing, true);
+
   follower.ws.send(JSON.stringify({ type: "command", action: "pause" }));
   const denied = await follower.next(
     (message) => message.type === "error" && message.code === "leader_only",
@@ -108,4 +120,3 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
   leader.ws.close();
   follower.ws.close();
 });
-

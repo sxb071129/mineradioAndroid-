@@ -78,13 +78,12 @@ input:disabled {
   --mid: 0;
   --treble: 0;
   position: relative;
-  height: 100vh;
-  height: 100dvh;
+  height: auto;
   min-height: 100vh;
   min-height: 100dvh;
   padding: max(158px, calc(env(safe-area-inset-top) + 120px)) 36px max(142px, calc(env(safe-area-inset-bottom) + 124px));
   isolation: isolate;
-  overflow: hidden;
+  overflow: visible;
   background: #000;
 }
 
@@ -255,11 +254,11 @@ input:disabled {
   display: grid;
   grid-template-columns: minmax(370px, 0.94fr) minmax(520px, 1.06fr);
   width: min(1240px, 100%);
-  height: min(610px, calc(100dvh - 300px));
-  min-height: 0;
+  height: auto;
+  min-height: 610px;
   margin: 0 auto;
   gap: 14px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .home-hero-card,
@@ -1000,6 +999,210 @@ input:disabled {
   cursor: pointer;
 }
 
+.cloud-modal {
+  width: min(720px, calc(100vw - 32px));
+  max-height: min(780px, calc(100dvh - 48px));
+  min-height: 420px;
+  justify-content: flex-start;
+  overflow-y: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.cloud-modal > * {
+  flex-shrink: 0;
+}
+
+.cloud-modal h2 {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-modal > p {
+  max-width: 60ch;
+}
+
+.legacy-state.is-loading svg {
+  animation: cloud-spin 900ms linear infinite;
+}
+
+.cloud-error,
+.cloud-empty,
+.cloud-login {
+  display: flex;
+  width: min(100%, 520px);
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 13px;
+  margin-top: 24px;
+  padding: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.cloud-error {
+  border-color: rgba(255, 126, 133, 0.22);
+  color: #ffd6d9;
+  background: rgba(255, 84, 98, 0.06);
+}
+
+.cloud-error button,
+.cloud-empty button,
+.cloud-profile button {
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.cloud-login {
+  padding: 18px;
+}
+
+.cloud-qr {
+  width: 190px;
+  height: 190px;
+  padding: 8px;
+  border-radius: 16px;
+  background: #fff;
+  object-fit: contain;
+}
+
+.cloud-profile {
+  display: grid;
+  width: min(100%, 520px);
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  margin-top: 24px;
+  padding: 17px;
+  border: 1px solid rgba(0, 245, 212, 0.18);
+  border-radius: 20px;
+  background: rgba(0, 245, 212, 0.045);
+  text-align: left;
+}
+
+.cloud-profile img {
+  width: 58px;
+  height: 58px;
+  border-radius: 17px;
+  object-fit: cover;
+}
+
+.cloud-profile div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.cloud-profile small,
+.cloud-modal-footer small {
+  color: var(--dim);
+  font: 600 10px/1.4 var(--font-mono);
+}
+
+.cloud-profile strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-result-status {
+  width: 100%;
+  margin-top: 22px;
+  color: var(--mint);
+  text-align: left;
+  font: 650 11px/1.4 var(--font-mono);
+}
+
+.cloud-song-list {
+  display: grid;
+  width: 100%;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.cloud-song-list > button {
+  display: grid;
+  min-height: 70px;
+  grid-template-columns: 54px minmax(0, 1fr) auto 34px;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px 8px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  border-radius: 17px;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.025);
+  text-align: left;
+  cursor: pointer;
+}
+
+.cloud-song-list > button:hover {
+  border-color: rgba(0, 245, 212, 0.28);
+  background: rgba(0, 245, 212, 0.055);
+}
+
+.cloud-song-list > button > img {
+  width: 54px;
+  height: 54px;
+  border-radius: 13px;
+  object-fit: cover;
+}
+
+.cloud-song-list > button > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cloud-song-list strong,
+.cloud-song-list small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-song-list small,
+.cloud-song-list time {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.cloud-song-list time {
+  font-family: var(--font-mono);
+}
+
+.cloud-modal-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: auto;
+  padding-top: 20px;
+}
+
+.cloud-modal-footer .legacy-close {
+  margin-top: 0;
+}
+
+@keyframes cloud-spin {
+  to { transform: rotate(360deg); }
+}
+
 .player-dock {
   position: fixed;
   z-index: 30;
@@ -1420,6 +1623,21 @@ input:disabled {
   }
 
   .legacy-modal h2 { font-size: 36px; }
+
+  .cloud-modal {
+    max-height: calc(100dvh - 20px);
+    min-height: 390px;
+    padding: 28px 14px 18px;
+  }
+
+  .cloud-modal > p { font-size: 12px; }
+  .cloud-song-list > button { grid-template-columns: 48px minmax(0, 1fr) 30px; gap: 9px; }
+  .cloud-song-list > button > img { width: 48px; height: 48px; }
+  .cloud-song-list time { display: none; }
+  .cloud-profile { grid-template-columns: auto minmax(0, 1fr); }
+  .cloud-profile > button { grid-column: 1 / -1; }
+  .cloud-modal-footer { align-items: stretch; flex-direction: column; }
+  .cloud-modal-footer .legacy-close { width: 100%; }
 
   .lyrics-stage { padding: 22px; }
   .lyrics-stage h2 { font-size: clamp(38px, 12vw, 58px); }

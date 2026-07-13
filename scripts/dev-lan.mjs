@@ -26,6 +26,10 @@ const children = [
     stdio: "inherit",
     env: process.env,
   }),
+  spawn(process.execPath, ["scripts/music-api.mjs"], {
+    stdio: "inherit",
+    env: process.env,
+  }),
 ];
 
 let closing = false;

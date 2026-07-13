@@ -26,6 +26,7 @@ test("server-renders the finished player", async () => {
   assert.match(html, /MINERADIO · YOUR LIBRARY/);
   assert.match(html, /每日推荐/);
   assert.match(html, />登录</);
+  assert.match(html, /调用第三方音乐接口搜索/);
   assert.match(html, /mineradio-starfield\.png|class="starfield"/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/);
 });
@@ -38,4 +39,6 @@ test("responsive and accessible fallbacks are present", async () => {
   assert.match(css, /forced-colors:\s*active/);
   assert.match(css, /focus-visible/);
   assert.match(css, /@supports \(backdrop-filter/);
+  assert.match(css, /\.mineradio-shell\s*\{[\s\S]*?height:\s*auto;[\s\S]*?overflow:\s*visible;/);
+  assert.match(css, /\.home-workspace\s*\{[\s\S]*?height:\s*auto;[\s\S]*?min-height:\s*610px;[\s\S]*?overflow:\s*visible;/);
 });

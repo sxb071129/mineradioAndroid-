@@ -41,6 +41,26 @@ import type { TrackDescriptor } from "../lib/sync-types";
 
 type LocalTrack = TrackDescriptor & { url: string };
 type AudioWindow = Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+type CloudPanel = "login" | "daily" | "recommend" | "search";
+type CloudSong = {
+  id: string;
+  name: string;
+  artist: string;
+  album: string;
+  cover: string;
+  duration: number;
+};
+type CloudUser = {
+  loggedIn: boolean;
+  userId?: string;
+  nickname?: string;
+  avatar?: string;
+};
+type CloudHome = {
+  loggedIn: boolean;
+  user: CloudUser | null;
+  dailySongs: CloudSong[];
+};
 
 const DEFAULT_VOLUME = 0.72;
 const MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
@@ -59,6 +79,37 @@ function defaultRelayUrl() {
   const secure = window.location.protocol === "https:";
   const port = secure ? window.location.port || "443" : "8787";
   return `${secure ? "wss" : "ws"}://${window.location.hostname}:${port}/${secure ? "sync" : "ws"}`;
+}
+
+function defaultMusicApiUrl() {
+  if (typeof window === "undefined") return "http://localhost:8790";
+  const saved = window.localStorage.getItem("mineradio-lan-settings-v1");
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved) as { musicApiUrl?: string };
+      if (parsed.musicApiUrl) return parsed.musicApiUrl;
+    } catch {
+      // Ignore stale settings and fall back to the current host.
+    }
+  }
+  if (window.location.protocol === "https:") return window.location.origin;
+  return `http://${window.location.hostname}:8790`;
+}
+
+async function requestCloud<T>(baseUrl: string, pathname: string, signal?: AbortSignal) {
+  const endpoint = new URL(pathname, `${baseUrl.replace(/\/+$/, "")}/`);
+  const response = await fetch(endpoint, { signal });
+  const value = (await response.json().catch(() => ({}))) as T & { error?: string };
+  if (!response.ok) throw new Error(value.error || `HTTP_${response.status}`);
+  return value;
+}
+
+function cloudErrorMessage(error: unknown) {
+  const code = error instanceof Error ? error.message : "third_party_unavailable";
+  if (code === "third_party_timeout" || code === "provider_timeout") return "第三方音乐服务响应超时，请稍后重试。";
+  if (code === "origin_not_allowed") return "音乐接口拒绝了当前网页地址，请从启动窗口显示的局域网网址打开。";
+  if (code === "track_unavailable") return "该歌曲暂时没有可用音源，可能受版权或会员限制。";
+  return "无法连接第三方音乐接口。请确认桌面启动窗口中的 Music API 已在 8790 端口运行。";
 }
 
 function defaultDeviceName() {
@@ -102,6 +153,7 @@ export function MineradioPlayer() {
   const [roomCode, setRoomCode] = useState(initialRoom);
   const [roomInput, setRoomInput] = useState(initialRoom);
   const [relayUrl, setRelayUrl] = useState(defaultRelayUrl);
+  const [musicApiUrl] = useState(defaultMusicApiUrl);
   const [deviceName, setDeviceName] = useState(defaultDeviceName);
   const [localTrack, setLocalTrack] = useState<LocalTrack | null>(null);
   const [soloPlaying, setSoloPlaying] = useState(false);
@@ -116,7 +168,15 @@ export function MineradioPlayer() {
   const [lyricsOpen, setLyricsOpen] = useState(false);
   const [liked, setLiked] = useState(false);
   const [searchText, setSearchText] = useState("");
-  const [legacyPanel, setLegacyPanel] = useState<"login" | "daily" | "recommend" | null>(null);
+  const [legacyPanel, setLegacyPanel] = useState<CloudPanel | null>(null);
+  const [cloudSongs, setCloudSongs] = useState<CloudSong[]>([]);
+  const [cloudUser, setCloudUser] = useState<CloudUser | null>(null);
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [cloudError, setCloudError] = useState("");
+  const [cloudStatus, setCloudStatus] = useState("");
+  const [cloudQrImage, setCloudQrImage] = useState("");
+  const [cloudQrKey, setCloudQrKey] = useState("");
+  const [cloudRefresh, setCloudRefresh] = useState(0);
   const audioRef = useRef<HTMLAudioElement>(null);
   const stageRef = useRef<HTMLElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -152,9 +212,108 @@ export function MineradioPlayer() {
   useEffect(() => {
     window.localStorage.setItem(
       "mineradio-lan-settings-v1",
-      JSON.stringify({ relayUrl, version: 1 }),
+      JSON.stringify({ relayUrl, musicApiUrl, version: 2 }),
     );
-  }, [relayUrl]);
+  }, [musicApiUrl, relayUrl]);
+
+  useEffect(() => {
+    if (!legacyPanel) return;
+    const controller = new AbortController();
+
+    const load = async () => {
+      setCloudLoading(true);
+      setCloudError("");
+      setCloudStatus("");
+      setCloudSongs([]);
+      setCloudQrImage("");
+      setCloudQrKey("");
+      try {
+        if (legacyPanel === "search") {
+          const query = searchText.trim();
+          if (!query) throw new Error("keywords_required");
+          const result = await requestCloud<{ songs: CloudSong[] }>(
+            musicApiUrl,
+            `/api/search?keywords=${encodeURIComponent(query)}&limit=18`,
+            controller.signal,
+          );
+          setCloudSongs(result.songs || []);
+          setCloudStatus(result.songs?.length ? `找到 ${result.songs.length} 首歌曲` : "没有找到匹配的歌曲");
+          return;
+        }
+
+        if (legacyPanel === "daily" || legacyPanel === "recommend") {
+          const result = await requestCloud<CloudHome>(musicApiUrl, "/api/discover/home", controller.signal);
+          setCloudUser(result.user);
+          setCloudSongs(result.dailySongs || []);
+          setCloudStatus(result.loggedIn ? "推荐已从第三方音乐服务同步" : "登录后可读取你的每日推荐");
+          return;
+        }
+
+        const status = await requestCloud<CloudUser>(musicApiUrl, "/api/login/status", controller.signal);
+        setCloudUser(status);
+        if (status.loggedIn) {
+          setCloudStatus(`已登录${status.nickname ? ` · ${status.nickname}` : ""}`);
+          return;
+        }
+        const keyResult = await requestCloud<{ key: string }>(musicApiUrl, "/api/login/qr/key", controller.signal);
+        const qrResult = await requestCloud<{ img: string }>(
+          musicApiUrl,
+          `/api/login/qr/create?key=${encodeURIComponent(keyResult.key)}`,
+          controller.signal,
+        );
+        setCloudQrKey(keyResult.key);
+        setCloudQrImage(qrResult.img);
+        setCloudStatus("请使用网易云音乐 App 扫码，并在手机上确认登录");
+      } catch (error) {
+        if (!controller.signal.aborted) setCloudError(cloudErrorMessage(error));
+      } finally {
+        if (!controller.signal.aborted) setCloudLoading(false);
+      }
+    };
+
+    void load();
+    return () => controller.abort();
+  }, [cloudRefresh, legacyPanel, musicApiUrl, searchText]);
+
+  useEffect(() => {
+    if (legacyPanel !== "login" || !cloudQrKey || cloudUser?.loggedIn) return;
+    let stopped = false;
+    let timer = 0;
+
+    const poll = async () => {
+      try {
+        const result = await requestCloud<CloudUser & { code: number; message?: string }>(
+          musicApiUrl,
+          `/api/login/qr/check?key=${encodeURIComponent(cloudQrKey)}`,
+        );
+        if (stopped) return;
+        if (result.code === 803) {
+          setCloudUser(result.loggedIn ? result : { loggedIn: true, nickname: result.nickname });
+          setCloudQrImage("");
+          setCloudQrKey("");
+          setCloudStatus("登录成功，云端推荐现在可以使用。");
+          return;
+        }
+        if (result.code === 802) setCloudStatus("二维码已扫描，请在手机上确认登录");
+        else if (result.code === 800) {
+          setCloudQrImage("");
+          setCloudQrKey("");
+          setCloudError("二维码已过期，请刷新后重试。");
+          return;
+        }
+      } catch (error) {
+        if (!stopped) setCloudError(cloudErrorMessage(error));
+        return;
+      }
+      if (!stopped) timer = window.setTimeout(poll, 2200);
+    };
+
+    timer = window.setTimeout(poll, 2200);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [cloudQrKey, cloudUser?.loggedIn, legacyPanel, musicApiUrl]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -285,7 +444,9 @@ export function MineradioPlayer() {
   useEffect(
     () => () => {
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
-      audioContextRef.current?.close();
+      const context = audioContextRef.current;
+      audioContextRef.current = null;
+      if (context && context.state !== "closed") void context.close().catch(() => {});
     },
     [],
   );
@@ -293,17 +454,22 @@ export function MineradioPlayer() {
   const togglePlayback = useCallback(async () => {
     const audio = audioRef.current;
     if (!audio || !effectiveTrack || !canControl) return;
-    await ensureAudioGraph();
-    if (mode === "room") {
-      room.sendCommand({ action: room.state?.playing ? "pause" : "play" });
-      return;
-    }
-    if (audio.paused) {
-      await audio.play();
-      setSoloPlaying(true);
-    } else {
-      audio.pause();
+    try {
+      await ensureAudioGraph();
+      if (mode === "room") {
+        room.sendCommand({ action: room.state?.playing ? "pause" : "play" });
+        return;
+      }
+      if (audio.paused) {
+        await audio.play();
+        setSoloPlaying(true);
+      } else {
+        audio.pause();
+        setSoloPlaying(false);
+      }
+    } catch {
       setSoloPlaying(false);
+      setNotice("浏览器无法开始播放，请检查媒体权限，或尝试另一首歌曲。");
     }
   }, [canControl, effectiveTrack, ensureAudioGraph, mode, room]);
 
@@ -452,12 +618,56 @@ export function MineradioPlayer() {
     window.setTimeout(() => setCopied(false), 1600);
   }, [shareUrl]);
 
+  const selectCloudSong = useCallback((song: CloudSong) => {
+    const track: TrackDescriptor = {
+      id: `cloud-${song.id}`,
+      name: song.artist ? `${song.name} · ${song.artist}` : song.name,
+      type: "audio/mpeg",
+      size: 0,
+      path: `/api/cloud/${song.id}`,
+    };
+    if (mode === "room") {
+      if (!roomConnected || !roomIsLeader) {
+        setNotice("请等待房间连接；只有主控设备可以更换在线歌曲。");
+        return;
+      }
+      sendRoomCommand({ action: "track", track });
+      setNotice("在线歌曲已送入同步房间，所有设备将从同一受限音频代理加载。");
+    } else {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = "";
+      setLocalTrack({
+        ...track,
+        url: `${musicApiUrl.replace(/\/+$/, "")}/api/stream?id=${encodeURIComponent(song.id)}`,
+      });
+      setSoloPlaying(false);
+      setNotice("已从第三方音乐接口加载歌曲，点击播放即可开始。");
+    }
+    setLegacyPanel(null);
+  }, [mode, musicApiUrl, roomConnected, roomIsLeader, sendRoomCommand]);
+
+  const logoutCloud = useCallback(async () => {
+    setCloudLoading(true);
+    setCloudError("");
+    try {
+      await requestCloud<{ ok: boolean }>(musicApiUrl, "/api/logout");
+      setCloudUser({ loggedIn: false });
+      setCloudStatus("已退出登录，账号凭证已从本机清除。");
+      setCloudRefresh((value) => value + 1);
+    } catch (error) {
+      setCloudError(cloudErrorMessage(error));
+    } finally {
+      setCloudLoading(false);
+    }
+  }, [musicApiUrl]);
+
   const onSearchSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (searchText.trim()) {
-      setNotice(`网页改编版不调用第三方搜索接口；请从本机导入“${searchText.trim()}”。`);
+    if (!searchText.trim()) {
+      setNotice("请输入歌曲或歌手名称后再搜索。");
+      return;
     }
-    fileInputRef.current?.click();
+    setLegacyPanel("search");
   }, [searchText]);
 
   const stageStyle = {
@@ -529,7 +739,14 @@ export function MineradioPlayer() {
 
   return (
     <main ref={stageRef} className="mineradio-shell" style={stageStyle}>
-      <audio ref={audioRef} crossOrigin="anonymous" preload="metadata" />
+      <audio
+        ref={audioRef}
+        crossOrigin="anonymous"
+        preload="metadata"
+        onError={() => {
+          if (audioSource) setNotice("音源加载失败，歌曲可能受版权、会员或网络限制。请尝试另一首。");
+        }}
+      />
       <input
         ref={fileInputRef}
         className="visually-hidden"
@@ -549,8 +766,8 @@ export function MineradioPlayer() {
             placeholder="搜索歌曲、歌手…"
             aria-label="搜索歌曲或歌手"
           />
-          <button type="submit" aria-label="从本机导入音乐">
-            <UploadSimple size={18} aria-hidden="true" />
+          <button type="submit" aria-label="调用第三方音乐接口搜索">
+            <MagnifyingGlass size={18} aria-hidden="true" />
           </button>
         </form>
 
@@ -664,18 +881,85 @@ export function MineradioPlayer() {
 
       {legacyPanel ? (
         <>
-        <button className="legacy-scrim" type="button" onClick={() => setLegacyPanel(null)} aria-label="关闭原版云端面板" />
-        <section className="legacy-modal" role="dialog" aria-modal="true" aria-labelledby="legacy-title">
-          <button type="button" onClick={() => setLegacyPanel(null)} aria-label="关闭原版云端面板"><X size={20} aria-hidden="true" /></button>
-          <span>MINERADIO CLOUD</span>
-          <h2 id="legacy-title">{legacyPanel === "login" ? "登录" : legacyPanel === "daily" ? "每日推荐" : "推荐歌曲"}</h2>
-          <p>该入口保留原版云端服务边界，不经过局域网同步中继。登录状态和推荐数据仍由原版接口提供。</p>
-          <div className="legacy-state">
-            <ArrowsClockwise size={20} aria-hidden="true" />
-            <span>{legacyPanel === "login" ? "等待原版登录服务" : "登录后同步云端内容"}</span>
-          </div>
-          <button className="legacy-close" type="button" onClick={() => setLegacyPanel(null)}>返回音乐库</button>
-        </section>
+          <button className="legacy-scrim" type="button" onClick={() => setLegacyPanel(null)} aria-label="关闭云端音乐面板" />
+          <section className="legacy-modal cloud-modal" role="dialog" aria-modal="true" aria-labelledby="legacy-title">
+            <button type="button" onClick={() => setLegacyPanel(null)} aria-label="关闭云端音乐面板"><X size={20} aria-hidden="true" /></button>
+            <span>MINERADIO CLOUD · NETEASE ADAPTER</span>
+            <h2 id="legacy-title">
+              {legacyPanel === "login"
+                ? "登录"
+                : legacyPanel === "daily"
+                  ? "每日推荐"
+                  : legacyPanel === "recommend"
+                    ? "推荐歌曲"
+                    : `搜索“${searchText.trim()}”`}
+            </h2>
+            <p>
+              {legacyPanel === "login"
+                ? "扫码登录由本机第三方适配服务完成；账号 Cookie 只保存在这台电脑，不会发送到浏览器或同步房间。"
+                : legacyPanel === "search"
+                  ? "搜索结果来自第三方网易云兼容接口；可直接加载到本机或当前局域网同步房间。"
+                  : "云端推荐从第三方音乐服务读取；在线音源仍会经过受限代理，真实地址不会进入房间状态。"}
+            </p>
+
+            {cloudLoading ? (
+              <div className="legacy-state is-loading" role="status">
+                <ArrowsClockwise size={20} aria-hidden="true" />
+                <span>正在连接第三方音乐服务…</span>
+              </div>
+            ) : null}
+
+            {cloudError ? (
+              <div className="cloud-error" role="alert">
+                <span>{cloudError}</span>
+                <button type="button" onClick={() => setCloudRefresh((value) => value + 1)}>重试</button>
+              </div>
+            ) : null}
+
+            {!cloudLoading && !cloudError && legacyPanel === "login" ? (
+              cloudUser?.loggedIn ? (
+                <div className="cloud-profile">
+                  <img src={cloudUser.avatar || "/mineradio-card-art.png"} width="72" height="72" alt="" />
+                  <div><small>网易云账号</small><strong>{cloudUser.nickname || "已登录用户"}</strong></div>
+                  <button type="button" onClick={() => void logoutCloud()}>退出登录</button>
+                </div>
+              ) : (
+                <div className="cloud-login">
+                  {cloudQrImage ? <img className="cloud-qr" src={cloudQrImage} width="190" height="190" alt="网易云音乐扫码登录二维码" /> : null}
+                  <span>{cloudStatus || "正在生成登录二维码…"}</span>
+                </div>
+              )
+            ) : null}
+
+            {!cloudLoading && !cloudError && legacyPanel !== "login" ? (
+              legacyPanel !== "search" && !cloudUser?.loggedIn ? (
+                <div className="cloud-empty">
+                  <strong>需要先登录</strong>
+                  <span>{cloudStatus || "每日推荐与账号偏好相关。"}</span>
+                  <button type="button" onClick={() => setLegacyPanel("login")}>扫码登录</button>
+                </div>
+              ) : (
+                <>
+                  {cloudStatus ? <div className="cloud-result-status">{cloudStatus}</div> : null}
+                  <div className="cloud-song-list" role="list">
+                    {cloudSongs.map((song) => (
+                      <button type="button" onClick={() => selectCloudSong(song)} key={song.id}>
+                        <img src={song.cover || "/mineradio-card-art.png"} width="54" height="54" alt="" />
+                        <span><strong>{song.name}</strong><small>{[song.artist, song.album].filter(Boolean).join(" · ") || "网易云音乐"}</small></span>
+                        <time>{formatTime(song.duration / 1000)}</time>
+                        <Play size={17} weight="fill" aria-hidden="true" />
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )
+            ) : null}
+
+            <div className="cloud-modal-footer">
+              <small>本机接口 {musicApiUrl.replace(/^https?:\/\//, "")}</small>
+              <button className="legacy-close" type="button" onClick={() => setLegacyPanel(null)}>返回音乐库</button>
+            </div>
+          </section>
         </>
       ) : null}
 
@@ -819,7 +1103,7 @@ export function MineradioPlayer() {
         </div>
       ) : null}
 
-      {(notice || room.error) ? (
+      {(notice || room.error) && !legacyPanel ? (
         <div className="toast" role="status">
           <MusicNotes size={18} aria-hidden="true" />
           <span>{room.error || notice}</span>

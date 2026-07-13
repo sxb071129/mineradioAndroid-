@@ -11,6 +11,7 @@ import { WebSocketServer, WebSocket } from "ws";
 
 const DEFAULT_PORT = Number(process.env.MINERADIO_SYNC_PORT || 8787);
 const DEFAULT_HOST = process.env.MINERADIO_SYNC_HOST || "0.0.0.0";
+const MUSIC_API_PORT = Number(process.env.MINERADIO_MUSIC_PORT || 8790);
 const DEFAULT_DATA_DIR = path.resolve(".mineradio-lan", "tracks");
 const MAX_TRACK_BYTES = Number(
   process.env.MINERADIO_MAX_TRACK_BYTES || 512 * 1024 * 1024,
@@ -18,12 +19,14 @@ const MAX_TRACK_BYTES = Number(
 const MAX_WS_PAYLOAD = 64 * 1024;
 const ROOM_RE = /^[A-Z0-9]{4,8}$/;
 const TRACK_ID_RE = /^[a-f0-9]{24}$/;
+const CLOUD_TRACK_RE = /^cloud-([1-9]\d{0,19})$/;
 
 function corsHeaders(extra = {}) {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Headers": "content-type,range",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Expose-Headers": "accept-ranges,content-length,content-range",
     "Cross-Origin-Resource-Policy": "cross-origin",
     ...extra,
   };
@@ -61,14 +64,30 @@ function normalizeRoom(value) {
 }
 
 function normalizeTrack(value) {
-  if (!value || !TRACK_ID_RE.test(String(value.id || ""))) return null;
+  if (!value) return null;
+  const id = String(value.id || "");
+  const cloudMatch = CLOUD_TRACK_RE.exec(id);
+  if (cloudMatch) {
+    return {
+      id,
+      name: cleanName(value.name),
+      type: "audio/mpeg",
+      size: 0,
+      path: `/api/cloud/${cloudMatch[1]}`,
+    };
+  }
+  if (!TRACK_ID_RE.test(id)) return null;
   return {
-    id: String(value.id),
+    id,
     name: cleanName(value.name),
     type: cleanMime(value.type),
     size: Math.max(0, Number(value.size) || 0),
     path: `/api/tracks/${value.id}`,
   };
+}
+
+function isLocalTrack(track) {
+  return Boolean(track && TRACK_ID_RE.test(track.id));
 }
 
 function networkAddresses() {
@@ -230,10 +249,55 @@ async function uploadTrack(req, res, dataDir, url) {
   }
 }
 
+async function proxyCloudTrack(req, res, songId, musicApiHost, musicApiPort) {
+  await new Promise((resolve) => {
+    const upstream = http.request(
+      {
+        hostname: musicApiHost,
+        port: musicApiPort,
+        path: `/api/stream?id=${encodeURIComponent(songId)}`,
+        method: "GET",
+        headers: req.headers.range ? { range: req.headers.range } : {},
+      },
+      (response) => {
+        const headers = corsHeaders({
+          "Content-Type": response.headers["content-type"] || "audio/mpeg",
+          "Accept-Ranges": response.headers["accept-ranges"] || "bytes",
+          "Cache-Control": "private, max-age=300",
+        });
+        for (const name of ["content-length", "content-range"]) {
+          const value = response.headers[name];
+          if (value) headers[name] = value;
+        }
+        res.writeHead(response.statusCode || 502, headers);
+        response.pipe(res);
+        response.once("end", resolve);
+        res.once("close", () => {
+          if (!response.complete) response.destroy();
+          resolve();
+        });
+        response.once("error", () => {
+          res.destroy();
+          resolve();
+        });
+      },
+    );
+    upstream.setTimeout(20_000, () => upstream.destroy(new Error("music_api_timeout")));
+    upstream.once("error", () => {
+      if (!res.headersSent) json(res, 502, { error: "music_api_unavailable" });
+      else res.destroy();
+      resolve();
+    });
+    upstream.end();
+  });
+}
+
 export async function createLanRelay({
   port = DEFAULT_PORT,
   host = DEFAULT_HOST,
   dataDir = DEFAULT_DATA_DIR,
+  musicApiHost = "127.0.0.1",
+  musicApiPort = MUSIC_API_PORT,
 } = {}) {
   await mkdir(dataDir, { recursive: true });
   const rooms = new Map();
@@ -262,6 +326,11 @@ export async function createLanRelay({
     const trackMatch = /^\/api\/tracks\/([a-f0-9]{24})$/.exec(url.pathname);
     if (req.method === "GET" && trackMatch) {
       await serveTrack(req, res, dataDir, trackMatch[1]);
+      return;
+    }
+    const cloudMatch = /^\/api\/cloud\/([1-9]\d{0,19})$/.exec(url.pathname);
+    if (req.method === "GET" && cloudMatch) {
+      await proxyCloudTrack(req, res, cloudMatch[1], musicApiHost, musicApiPort);
       return;
     }
     json(res, 404, { error: "not_found" });
@@ -383,7 +452,7 @@ export async function createLanRelay({
         state.volume = Math.max(0, Math.min(Number(message.volume) || 0, 1));
       } else if (action === "track") {
         const track = normalizeTrack(message.track);
-        if (!track || !(await readTrackMeta(dataDir, track.id))) {
+        if (!track || (isLocalTrack(track) && !(await readTrackMeta(dataDir, track.id)))) {
           send(ws, { type: "error", code: "invalid_track" });
           return;
         }
@@ -456,4 +525,3 @@ if (isMain) {
     console.log(`LAN relay: http://${address}:${relay.port}`);
   }
 }
-
