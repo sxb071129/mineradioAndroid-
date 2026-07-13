@@ -22,6 +22,8 @@ npm run dev:lan
 
 Windows PowerShell 若阻止 `npm.ps1`，可使用 `npm.cmd run dev:lan`。
 
+也可以直接双击桌面的 `启动-MR-ROOM局域网.cmd`。启动窗口会列出当前局域网 IP、网页端口 `3000` 和同步端口 `8787`，并在缺少生产构建时自动完成构建。
+
 ## 同步模型
 
 - 本地 Node 中继监听 `0.0.0.0:8787`，以 WebSocket 广播权威播放状态。
