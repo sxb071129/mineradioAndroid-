@@ -1,0 +1,49 @@
+# MR//ROOM
+
+MR//ROOM 是一个受 Mineradio 启发的响应式网页音乐播放器。它保留沉浸式暗色声场和音频响应视觉，但重新实现了跨平台界面，并加入可信局域网内的多设备同步：同一曲目、播放/暂停、进度和应用内音量。
+
+> 这是非官方 clean-room 改编，不捆绑原项目的 Logo、骷髅模型、音乐平台 Cookie/API 或第三方专辑内容。请只播放和分享你有权使用的音频。
+
+## 快速启动
+
+需要 Node.js 22.13 或更高版本。
+
+```bash
+npm install
+npm run dev:lan
+```
+
+启动后：
+
+- 主机打开 `http://localhost:3000`。
+- 同一局域网的其他设备打开 `http://主机IP:3000`。
+- 主机创建房间并复制链接；首台设备是主控，其余设备自动跟随。
+- 每台手机/平板第一次收到播放命令时，需要点一次“启用声音并追赶”，这是浏览器的自动播放限制。
+
+Windows PowerShell 若阻止 `npm.ps1`，可使用 `npm.cmd run dev:lan`。
+
+## 同步模型
+
+- 本地 Node 中继监听 `0.0.0.0:8787`，以 WebSocket 广播权威播放状态。
+- 主控上传所选音频到本机 `.mineradio-lan/tracks`，所有设备通过 Range 请求读取同一文件。
+- 客户端以 ping/pong 估算时钟偏移；80–280ms 漂移通过短时 `playbackRate` 微调，更大漂移直接校准。
+- 主控离开后，新主控会自动选举并暂停房间，避免双主控竞争。
+- 同步的是网页播放器内音量，无法修改设备的物理/系统音量。
+
+自用可信局域网模式默认不加登录、PIN 或设备审批。请勿把 `8787` 端口直接映射到公网。
+
+## 命令
+
+```bash
+npm run dev       # 只启动网站
+npm run relay     # 只启动局域网中继
+npm run dev:lan   # 网站 + 中继
+npm run start:lan # 生产构建后，以 0.0.0.0 启动网站 + 中继
+npm run build     # 生产构建
+npm test          # 构建、SSR 与中继协议测试
+npm run lint      # ESLint
+```
+
+## 许可与归属
+
+本项目按 GPL-3.0 衍生发布意图编写。上游和修改说明见 [ATTRIBUTION.md](./ATTRIBUTION.md)。Mineradio、音乐平台名称和相关标识归各自权利人所有。

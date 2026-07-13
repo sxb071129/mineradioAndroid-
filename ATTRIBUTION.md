@@ -1,0 +1,12 @@
+# Attribution and modification notice
+
+MR//ROOM is an unofficial, clean-room web adaptation inspired by [Mineradio-Kugou-Modified](https://github.com/zws84952324-create/Mineradio-Kugou-Modified), itself based on Mineradio by XxHuberrr.
+
+- Upstream license: GNU General Public License v3.0.
+- Web adaptation created on 2026-07-13.
+- The implementation replaces the Electron/Node monolith with a vinext/React website and a separate LAN relay.
+- No upstream MR logo, installer artwork, donation QR code, skull model, platform trademark, account cookie flow, or proprietary music-platform API is bundled.
+- Users provide audio they have the right to play and share on their own local network.
+
+The source of this adaptation is likewise intended to be distributed under GPL-3.0. Mineradio and third-party platform names and marks remain with their respective owners.
+

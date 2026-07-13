@@ -1,0 +1,43 @@
+{
+  "name": "mineradio-lan",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "node scripts/run-vinext.mjs dev",
+    "dev:lan": "node scripts/dev-lan.mjs dev",
+    "relay": "node scripts/lan-relay.mjs",
+    "build": "node scripts/run-vinext.mjs build",
+    "start": "node scripts/run-vinext.mjs start",
+    "start:lan": "node scripts/dev-lan.mjs start",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .upstream-review"
+  },
+  "dependencies": {
+    "next": "16.2.6",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.44.0",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.26",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.2.6",
+    "react-server-dom-webpack": "19.2.6",
+    "typescript": "5.9.3",
+    "vinext": "0.0.50",
+    "vite": "^8.1.4",
+    "wrangler": "^4.110.0"
+  },
+  "overrides": {
+    "postcss": "^8.5.10"
+  },
+  "type": "module"
+}
