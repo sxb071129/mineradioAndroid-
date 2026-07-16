@@ -1,59 +1,60 @@
-# Dependencies
-node_modules/
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
-# Build output
-dist/
-dist-*/
-out/
-release/
-releases/
-win-unpacked/
-*.exe
-*.msi
-*.blockmap
-*.zip
-*.7z
-*.asar
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
 
-# User data and private state
-.cookie
-.qq-cookie
-updates/
-backups/
-*.log
-*.tmp
-*.cache
-.env
-.env.*
+# testing
+/coverage
 
-# Local development noise
+# next.js
+/.next/
+/.vinext/
+/out/
+
+# misc
 .DS_Store
-Thumbs.db
-desktop.ini
+*.pem
+
+# debug
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.pnpm-debug.log*
 
-# Historical local experiment files
-public/index.*.html
-!public/index.html
+# env files (can opt-in for committing if needed)
+.env*
 
-# Screenshots and transient verification artifacts
-.playwright-cli/
-output/
-tmp/
-*.png.tmp
-verification/
-screenshots/
+# vercel
+.vercel
 
-# Android local build and portable toolchain
-android/.gradle/
-android/app/.cxx/
-android/app/build/
-android/app/libnode/
-android/app/src/main/assets/nodejs-project.*
-android/app/src/main/jniLibs/
-android/app/src/main/res/drawable/icon.png
-tools/
-work/
-outputs/
+# typescript
+next-env.d.ts
+*.tsbuildinfo
+/dist/
+/.wrangler/
+/outputs/
+/work/
+/.upstream-review/
+/.mineradio-lan/
+/.sites-dev.*.log
+/.dev-lan.*.log
+/accounts/
+*.cookie
+*.token
+*.log
+*.tmp
+*.bak
+/.cache/
+/.turbo/
+/.vite/
+/.idea/
+/.vscode/
+Thumbs.db
+Desktop.ini

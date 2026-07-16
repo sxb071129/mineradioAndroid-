@@ -48,3 +48,11 @@ may fail to load or some songs may not be playable.
 
 Please do not use this project to infringe music platform copyrights or bypass
 paid access restrictions.
+
+## Web Adaptation Addendum
+
+Beginning on 2026-07-13, this repository also contains an unofficial responsive
+web adaptation with a separate LAN synchronization relay and restricted local
+music adapter. The original copyright, GPL-3.0 license, attribution, design
+notice, and acknowledgements above remain unchanged. Additional details are in
+`ATTRIBUTION.md`.
