@@ -763,6 +763,180 @@ input:disabled {
   line-height: 1.08;
 }
 
+.queue-drawer {
+  overflow: hidden;
+}
+
+.queue-room-note {
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 199, 110, 0.16);
+  border-radius: 14px;
+  color: rgba(255, 229, 190, 0.72);
+  background: rgba(255, 180, 80, 0.055);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.queue-toolbar {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+  padding: 18px 0 14px;
+}
+
+.queue-toolbar button {
+  display: flex;
+  min-height: 43px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  color: rgba(255, 255, 255, 0.66);
+  background: rgba(255, 255, 255, 0.035);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.queue-toolbar button.is-active {
+  border-color: rgba(0, 245, 212, 0.28);
+  color: var(--mint);
+  background: rgba(0, 245, 212, 0.07);
+}
+
+.queue-toolbar button:disabled,
+.queue-item-action:disabled,
+.queue-track-select:disabled,
+.drawer-leave:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.queue-list {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 -8px 0 0;
+  padding: 0 8px 4px 0;
+  overflow-y: auto;
+  list-style: none;
+  overscroll-behavior: contain;
+}
+
+.queue-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px 36px;
+  align-items: center;
+  gap: 3px;
+  padding: 4px;
+  border: 1px solid transparent;
+  border-radius: 15px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.queue-list li.is-active {
+  border-color: rgba(0, 245, 212, 0.18);
+  background: rgba(0, 245, 212, 0.055);
+}
+
+.queue-track-select {
+  display: grid;
+  min-width: 0;
+  min-height: 54px;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border: 0;
+  color: rgba(255, 255, 255, 0.9);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.queue-index {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--dim);
+  background: rgba(255, 255, 255, 0.045);
+  font: 650 10px/1 var(--font-mono);
+}
+
+.queue-list li.is-active .queue-index {
+  color: var(--mint);
+  background: rgba(0, 245, 212, 0.09);
+}
+
+.queue-track-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.queue-track-copy strong,
+.queue-track-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-track-copy strong {
+  font-size: 12.5px;
+  font-weight: 680;
+}
+
+.queue-track-copy small {
+  color: var(--dim);
+  font-size: 10.5px;
+}
+
+.queue-item-action {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 0;
+  border-radius: 10px;
+  color: rgba(255, 255, 255, 0.48);
+  background: transparent;
+  cursor: pointer;
+}
+
+.queue-item-action:hover:not(:disabled) {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.queue-empty {
+  display: flex;
+  min-height: 240px;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 9px;
+  color: var(--dim);
+  text-align: center;
+}
+
+.queue-empty strong {
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 14px;
+}
+
+.queue-empty span {
+  max-width: 26ch;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .room-lobby,
 .room-live {
   display: flex;

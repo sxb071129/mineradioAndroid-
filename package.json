@@ -2,6 +2,12 @@
   "name": "mineradio-lan",
   "version": "1.0.0",
   "private": true,
+  "author": "Mineradio",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sxb071129/mineradioweb.git"
+  },
   "engines": {
     "node": ">=22.13.0"
   },

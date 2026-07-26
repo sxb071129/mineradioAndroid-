@@ -1,6 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createClockSample,
+  targetRoomPosition,
+  updateClockEstimate,
+  type ClockEstimate,
+  type ClockSample,
+} from "../lib/room-sync-timing.mjs";
 import type { RoomCommand, RoomState, SyncStatus } from "../lib/sync-types";
 
 function asWebSocketUrl(value: string) {
@@ -43,15 +50,33 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
   const [clientId, setClientId] = useState("");
   const [isLeader, setIsLeader] = useState(false);
   const [latency, setLatency] = useState(0);
+  const [clockQuality, setClockQuality] = useState({ ready: false, jitterMs: 0 });
   const [addresses, setAddresses] = useState<string[]>([]);
   const [error, setError] = useState("");
   const socketRef = useRef<WebSocket | null>(null);
   const clientIdRef = useRef("");
   const offsetRef = useRef(0);
+  const clockSamplesRef = useRef<ClockSample[]>([]);
+  const clockEstimateRef = useRef<ClockEstimate>({
+    samples: [],
+    offsetMs: 0,
+    latencyMs: 0,
+    jitterMs: 0,
+    initialized: false,
+  });
   const wsUrl = useMemo(() => asWebSocketUrl(relayUrl), [relayUrl]);
   const httpBase = useMemo(() => toHttpBase(relayUrl), [relayUrl]);
 
   useEffect(() => {
+    clockSamplesRef.current = [];
+    clockEstimateRef.current = {
+      samples: [],
+      offsetMs: 0,
+      latencyMs: 0,
+      jitterMs: 0,
+      initialized: false,
+    };
+    offsetRef.current = 0;
     if (!enabled || !roomCode || !wsUrl) return;
 
     let disposed = false;
@@ -69,14 +94,19 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
       socket.addEventListener("open", () => {
         attempt = 0;
         setStatus("connected");
-        socket.send(JSON.stringify({ type: "join", room: roomCode, name: deviceName }));
+        setState(null);
+        setIsLeader(false);
+        setClientId("");
+        setLatency(0);
+        setClockQuality({ ready: false, jitterMs: 0 });
         const ping = () => {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "ping", clientTime: Date.now() }));
           }
         };
         ping();
-        pingTimer = setInterval(ping, 5000);
+        socket.send(JSON.stringify({ type: "join", room: roomCode, name: deviceName }));
+        pingTimer = setInterval(ping, 2500);
       });
 
       socket.addEventListener("message", (event) => {
@@ -91,6 +121,10 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
           clientIdRef.current = id;
           setClientId(id);
           setAddresses(Array.isArray(message.addresses) ? message.addresses.map(String) : []);
+          const serverTime = Number(message.serverTime);
+          if (!clockEstimateRef.current.initialized && Number.isFinite(serverTime)) {
+            offsetRef.current = serverTime - Date.now();
+          }
           return;
         }
         if (message.type === "joined") {
@@ -110,13 +144,20 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
         if (message.type === "pong") {
           const receivedAt = Date.now();
           const sentAt = Number(message.clientTime) || receivedAt;
-          const serverTime = Number(message.serverTime) || receivedAt;
-          const roundTrip = Math.max(0, receivedAt - sentAt);
-          const sampleOffset = serverTime - (sentAt + roundTrip / 2);
-          offsetRef.current = offsetRef.current
-            ? offsetRef.current * 0.72 + sampleOffset * 0.28
-            : sampleOffset;
-          setLatency(Math.round(roundTrip / 2));
+          const serverSentAt = Number(message.serverTime) || receivedAt;
+          const serverReceivedAt = Number(message.serverReceivedAt) || serverSentAt;
+          const sample = createClockSample(sentAt, receivedAt, serverReceivedAt, serverSentAt);
+          const estimate = updateClockEstimate(
+            clockSamplesRef.current,
+            sample,
+            clockEstimateRef.current,
+          );
+          clockSamplesRef.current = estimate.samples;
+          clockEstimateRef.current = estimate;
+          offsetRef.current = estimate.offsetMs;
+          setLatency(Math.round(estimate.latencyMs));
+          setClockQuality({ ready: estimate.initialized, jitterMs: estimate.jitterMs });
+          setState((current) => current ? { ...current } : current);
           return;
         }
         if (message.type === "error") {
@@ -169,15 +210,17 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
   const sendCommand = useCallback((command: RoomCommand) => {
     const socket = socketRef.current;
     if (socket?.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify({ type: "command", ...command }));
+    const payload = command.action === "progress"
+      ? { ...command, sampledServerTime: Date.now() + offsetRef.current }
+      : command;
+    socket.send(JSON.stringify({ type: "command", ...payload }));
     return true;
   }, []);
 
   const targetPosition = useCallback((roomState: RoomState) => {
-    if (!roomState.playing) return roomState.position;
-    const serverNow = Date.now() + offsetRef.current;
-    return Math.max(0, roomState.position + (serverNow - roomState.updatedAt) / 1000);
+    return targetRoomPosition(roomState, Date.now(), offsetRef.current);
   }, []);
+  const serverNow = useCallback(() => Date.now() + offsetRef.current, []);
 
   const publicStatus: SyncStatus = !enabled ? "idle" : !wsUrl ? "error" : status;
   const publicError = !enabled ? "" : !wsUrl ? "中继地址无效" : error;
@@ -188,10 +231,13 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
     clientId,
     isLeader,
     latency,
+    clockReady: clockQuality.ready,
+    clockJitter: clockQuality.jitterMs,
     addresses,
     error: publicError,
     httpBase,
     sendCommand,
     targetPosition,
+    serverNow,
   };
 }

@@ -17,6 +17,12 @@ const MAX_TRACK_BYTES = Number(
   process.env.MINERADIO_MAX_TRACK_BYTES || 512 * 1024 * 1024,
 );
 const MAX_WS_PAYLOAD = 64 * 1024;
+const ROOM_BROADCAST_INTERVAL_MS = 1000;
+// Hi-Res / lossless streams can need more than 12 seconds to reach a
+// playable buffer on the first LAN request. Keep the barrier long enough for
+// slow devices to finish instead of racing the timeout by a few milliseconds.
+const PLAYBACK_PREPARE_TIMEOUT_MS = 30_000;
+const PLAYBACK_START_LEAD_MS = 1_200;
 const ROOM_RE = /^[A-Z0-9]{4,8}$/;
 const TRACK_ID_RE = /^[a-f0-9]{24}$/;
 const CLOUD_TRACK_RE = /^cloud-([1-9]\d{0,19})$/;
@@ -124,13 +130,15 @@ function networkAddresses() {
 
 function currentPosition(state, now = Date.now()) {
   if (!state.playing) return state.position;
-  return Math.max(0, state.position + (now - state.updatedAt) / 1000);
+  return Math.max(0, state.position + Math.max(0, now - state.updatedAt) / 1000);
 }
 
 function publicState(room) {
   return {
     ...room.state,
     deviceCount: room.clients.size,
+    readyCount: room.state.preparing ? room.readyClients.size : 0,
+    requiredCount: room.state.preparing ? room.prepareParticipants.size : 0,
     leaderId: room.leaderId,
     serverTime: Date.now(),
   };
@@ -151,6 +159,54 @@ function broadcastRoom(room) {
   broadcast(room, { type: "state", state: publicState(room) });
 }
 
+function cancelPlaybackPreparation(room, now = Date.now(), error = "") {
+  room.readyClients.clear();
+  room.readyTiming.clear();
+  room.prepareParticipants.clear();
+  room.prepareDeadline = 0;
+  room.state.preparing = false;
+  room.state.prepareId = "";
+  room.state.prepareError = error;
+  room.state.scheduledAt = 0;
+  room.state.playing = false;
+  room.state.updatedAt = now;
+}
+
+function beginPlaybackPreparation(room, now = Date.now()) {
+  room.readyClients.clear();
+  room.readyTiming.clear();
+  room.prepareParticipants = new Set(
+    [...room.clients]
+      .filter((client) => client.readyState === WebSocket.OPEN)
+      .map((client) => client.clientId),
+  );
+  room.prepareDeadline = now + room.playbackPrepareTimeoutMs;
+  room.state.playing = false;
+  room.state.preparing = Boolean(room.state.track);
+  room.state.prepareId = room.state.preparing ? randomUUID() : "";
+  room.state.prepareError = "";
+  room.state.scheduledAt = 0;
+  room.state.updatedAt = now;
+}
+
+function schedulePreparedPlayback(room, now = Date.now()) {
+  if (!room.state.preparing) return false;
+  room.prepareDeadline = 0;
+  room.state.preparing = false;
+  room.state.prepareError = "";
+  room.state.playing = Boolean(room.state.track);
+  const networkLeadMs = Math.max(
+    0,
+    ...room.readyTiming.values().map(({ latencyMs, jitterMs }) => 2 * latencyMs + 4 * jitterMs),
+  );
+  const startLeadMs = Math.max(750, Math.min(2500, room.playbackStartLeadMs + networkLeadMs));
+  room.state.scheduledAt = room.state.playing ? now + startLeadMs : 0;
+  room.state.updatedAt = room.state.scheduledAt || now;
+  room.state.revision += 1;
+  broadcastRoom(room);
+  return true;
+}
+
 async function readTrackMeta(dataDir, id) {
   if (!TRACK_ID_RE.test(id)) return null;
   try {
@@ -159,6 +215,27 @@ async function readTrackMeta(dataDir, id) {
   } catch {
     return null;
   }
+}
+
+function parseSingleByteRange(value, size) {
+  if (typeof value !== "string" || size <= 0) return null;
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(value);
+  if (!match || (!match[1] && !match[2])) return null;
+
+  const sizeBigInt = BigInt(size);
+  if (!match[1]) {
+    const suffixLength = BigInt(match[2]);
+    if (suffixLength === 0n) return null;
+    const start = suffixLength >= sizeBigInt ? 0n : sizeBigInt - suffixLength;
+    return { start: Number(start), end: size - 1 };
+  }
+
+  const start = BigInt(match[1]);
+  if (start >= sizeBigInt) return null;
+  const requestedEnd = match[2] ? BigInt(match[2]) : sizeBigInt - 1n;
+  if (start > requestedEnd) return null;
+  const end = requestedEnd >= sizeBigInt ? sizeBigInt - 1n : requestedEnd;
+  return { start: Number(start), end: Number(end) };
 }
 
 async function serveTrack(req, res, dataDir, id) {
@@ -186,8 +263,8 @@ async function serveTrack(req, res, dataDir, id) {
     return;
   }
 
-  const match = /^bytes=(\d*)-(\d*)$/.exec(range);
-  if (!match) {
+  const parsedRange = parseSingleByteRange(range, fileStat.size);
+  if (!parsedRange) {
     res.writeHead(416, {
       ...baseHeaders,
       "Content-Range": `bytes */${fileStat.size}`,
@@ -196,16 +273,7 @@ async function serveTrack(req, res, dataDir, id) {
     return;
   }
 
-  const start = match[1] ? Number(match[1]) : 0;
-  const end = match[2] ? Number(match[2]) : fileStat.size - 1;
-  if (start > end || start >= fileStat.size || end >= fileStat.size) {
-    res.writeHead(416, {
-      ...baseHeaders,
-      "Content-Range": `bytes */${fileStat.size}`,
-    });
-    res.end();
-    return;
-  }
+  const { start, end } = parsedRange;
 
   res.writeHead(206, {
     ...baseHeaders,
@@ -283,16 +351,20 @@ async function proxyCloudTrack(req, res, provider, sourceId, quality, musicApiHo
         headers: req.headers.range ? { range: req.headers.range } : {},
       },
       (response) => {
+        const statusCode = response.statusCode || 502;
+        const isAudioResponse = statusCode >= 200 && statusCode < 300;
         const headers = corsHeaders({
           "Content-Type": response.headers["content-type"] || "audio/mpeg",
-          "Accept-Ranges": response.headers["accept-ranges"] || "bytes",
-          "Cache-Control": "private, max-age=300",
+          "Cache-Control": isAudioResponse ? "private, max-age=300" : "no-store",
+          ...(isAudioResponse
+            ? { "Accept-Ranges": response.headers["accept-ranges"] || "bytes" }
+            : {}),
         });
-        for (const name of ["content-length", "content-range"]) {
+        for (const name of ["content-length", ...(isAudioResponse ? ["content-range"] : [])]) {
           const value = response.headers[name];
           if (value) headers[name] = value;
         }
-        res.writeHead(response.statusCode || 502, headers);
+        res.writeHead(statusCode, headers);
         response.pipe(res);
         response.once("end", resolve);
         res.once("close", () => {
@@ -321,9 +393,61 @@ export async function createLanRelay({
   dataDir = DEFAULT_DATA_DIR,
   musicApiHost = "127.0.0.1",
   musicApiPort = MUSIC_API_PORT,
+  playbackPrepareTimeoutMs = PLAYBACK_PREPARE_TIMEOUT_MS,
+  playbackStartLeadMs = PLAYBACK_START_LEAD_MS,
 } = {}) {
   await mkdir(dataDir, { recursive: true });
   const rooms = new Map();
+
+  function detachClientFromRoom(ws, now = Date.now()) {
+    const room = rooms.get(ws.roomCode);
+    ws.roomCode = "";
+    if (!room || !room.clients.delete(ws)) return;
+    room.readyClients.delete(ws.clientId);
+    room.readyTiming.delete(ws.clientId);
+    room.prepareParticipants.delete(ws.clientId);
+    if (!room.clients.size) {
+      rooms.delete(room.code);
+      return;
+    }
+    if (room.leaderId === ws.clientId) {
+      room.leaderId = room.clients.values().next().value.clientId;
+      if (room.state.preparing) {
+        if (room.readyClients.size >= room.prepareParticipants.size) {
+          schedulePreparedPlayback(room, now);
+        } else {
+          room.state.revision += 1;
+          broadcastRoom(room);
+        }
+        return;
+      }
+      if (room.state.playing && room.state.scheduledAt > now) {
+        room.state.revision += 1;
+        broadcastRoom(room);
+        return;
+      }
+      if (room.state.playing) {
+        room.state.position = currentPosition(room.state, now);
+        room.readyClients.clear();
+        room.readyTiming.clear();
+        room.prepareParticipants.clear();
+        room.prepareDeadline = 0;
+        room.state.preparing = false;
+        room.state.prepareId = "";
+        room.state.prepareError = "";
+        room.state.scheduledAt = 0;
+        room.state.updatedAt = now;
+      }
+      room.state.revision += 1;
+      broadcastRoom(room);
+      return;
+    }
+    if (room.state.preparing && room.readyClients.size >= room.prepareParticipants.size) {
+      schedulePreparedPlayback(room, now);
+      return;
+    }
+    broadcastRoom(room);
+  }
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://relay.local");
@@ -387,6 +511,11 @@ export async function createLanRelay({
     ws.roomCode = "";
     ws.displayName = "设备";
     ws.commandWindow = { startedAt: Date.now(), count: 0 };
+    ws.messageChain = Promise.resolve();
+    ws.isAlive = true;
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
 
     send(ws, {
       type: "welcome",
@@ -395,7 +524,7 @@ export async function createLanRelay({
       addresses: networkAddresses(),
     });
 
-    ws.on("message", async (raw) => {
+    const processMessage = async (raw, receivedAt) => {
       let message;
       try {
         message = JSON.parse(raw.toString());
@@ -408,6 +537,7 @@ export async function createLanRelay({
         send(ws, {
           type: "pong",
           clientTime: Number(message.clientTime) || 0,
+          serverReceivedAt: Number(receivedAt) || Date.now(),
           serverTime: Date.now(),
         });
         return;
@@ -419,19 +549,39 @@ export async function createLanRelay({
           send(ws, { type: "error", code: "invalid_room" });
           return;
         }
-        if (ws.roomCode && rooms.has(ws.roomCode)) {
-          rooms.get(ws.roomCode).clients.delete(ws);
+        const currentRoom = rooms.get(ws.roomCode);
+        if (ws.roomCode === code && currentRoom?.clients.has(ws)) {
+          ws.displayName = cleanName(message.name || "设备").slice(0, 32);
+          send(ws, {
+            type: "joined",
+            room: code,
+            clientId: ws.clientId,
+            leader: currentRoom.leaderId === ws.clientId,
+            state: publicState(currentRoom),
+          });
+          return;
         }
+        if (ws.roomCode) detachClientFromRoom(ws, receivedAt);
         let room = rooms.get(code);
         if (!room) {
           room = {
             code,
             leaderId: ws.clientId,
             clients: new Set(),
+            readyClients: new Set(),
+            readyTiming: new Map(),
+            prepareParticipants: new Set(),
+            prepareDeadline: 0,
+            playbackPrepareTimeoutMs: Math.max(100, Number(playbackPrepareTimeoutMs) || PLAYBACK_PREPARE_TIMEOUT_MS),
+            playbackStartLeadMs: Math.max(0, Number(playbackStartLeadMs) || PLAYBACK_START_LEAD_MS),
             state: {
               revision: 0,
               track: null,
               playing: false,
+              preparing: false,
+              prepareId: "",
+              prepareError: "",
+              scheduledAt: 0,
               position: 0,
               volume: 0.72,
               updatedAt: Date.now(),
@@ -442,6 +592,19 @@ export async function createLanRelay({
         ws.roomCode = code;
         ws.displayName = cleanName(message.name || "设备").slice(0, 32);
         room.clients.add(ws);
+        const joinedAt = Date.now();
+        if (room.state.preparing) {
+          room.prepareParticipants.add(ws.clientId);
+          room.prepareDeadline = Math.max(
+            room.prepareDeadline,
+            joinedAt + room.playbackPrepareTimeoutMs,
+          );
+        } else if (room.state.playing
+          && room.state.scheduledAt > joinedAt
+          && room.state.prepareId) {
+          beginPlaybackPreparation(room, joinedAt);
+          room.state.revision += 1;
+        }
         send(ws, {
           type: "joined",
           room: code,
@@ -459,11 +622,6 @@ export async function createLanRelay({
         return;
       }
       if (message.type !== "command") return;
-      if (room.leaderId !== ws.clientId) {
-        send(ws, { type: "error", code: "leader_only" });
-        return;
-      }
-
       const now = Date.now();
       if (now - ws.commandWindow.startedAt > 1000) {
         ws.commandWindow = { startedAt: now, count: 0 };
@@ -476,15 +634,89 @@ export async function createLanRelay({
 
       const state = room.state;
       const action = String(message.action || "");
+      if (action === "ready") {
+        const prepareId = String(message.prepareId || "");
+        if (!prepareId || prepareId !== state.prepareId || !room.prepareParticipants.has(ws.clientId)) return;
+        const ready = message.ready !== false;
+        if (!state.preparing) {
+          if (!ready && state.playing && state.scheduledAt > now) {
+            room.readyClients.delete(ws.clientId);
+            room.readyTiming.delete(ws.clientId);
+            state.playing = false;
+            state.preparing = true;
+            state.scheduledAt = 0;
+            state.prepareError = "";
+            state.updatedAt = now;
+            room.prepareDeadline = now + room.playbackPrepareTimeoutMs;
+            state.revision += 1;
+            broadcastRoom(room);
+          }
+          return;
+        }
+        if (!ready) {
+          if (!room.readyClients.delete(ws.clientId)) return;
+          room.readyTiming.delete(ws.clientId);
+          state.revision += 1;
+          broadcastRoom(room);
+          return;
+        }
+        if (room.readyClients.has(ws.clientId)) return;
+        room.readyClients.add(ws.clientId);
+        room.readyTiming.set(ws.clientId, {
+          latencyMs: Math.max(0, Math.min(Number(message.latencyMs) || 0, 5000)),
+          jitterMs: Math.max(0, Math.min(Number(message.jitterMs) || 0, 1000)),
+        });
+        if (room.readyClients.size >= room.prepareParticipants.size) {
+          schedulePreparedPlayback(room, now);
+        } else {
+          state.revision += 1;
+          broadcastRoom(room);
+        }
+        return;
+      }
+      if (action === "start-failed") {
+        const prepareId = String(message.prepareId || "");
+        if (prepareId
+          && prepareId === state.prepareId
+          && room.prepareParticipants.has(ws.clientId)
+          && state.playing
+          && state.scheduledAt
+          && now <= state.scheduledAt + 5000) {
+          cancelPlaybackPreparation(room, now, "start_failed");
+          state.revision += 1;
+          broadcastRoom(room);
+        }
+        return;
+      }
+      if (room.leaderId !== ws.clientId) {
+        send(ws, { type: "error", code: "leader_only" });
+        return;
+      }
+
       if (action === "play") {
         state.position = currentPosition(state, now);
-        state.playing = !!state.track;
+        beginPlaybackPreparation(room, now);
       } else if (action === "pause") {
         state.position = currentPosition(state, now);
-        state.playing = false;
+        cancelPlaybackPreparation(room, now);
       } else if (action === "seek") {
+        const restartPreparation = state.preparing || (state.playing && state.scheduledAt > now);
         state.position = Math.max(0, Math.min(Number(message.position) || 0, 86400));
+        if (restartPreparation) beginPlaybackPreparation(room, now);
+        else state.scheduledAt = 0;
+      } else if (action === "progress") {
+        const sampledServerTime = Number(message.sampledServerTime);
+        if (!Number.isFinite(sampledServerTime)
+          || sampledServerTime < now - 5000
+          || sampledServerTime > now + 1000) return;
+        const sampleAgeMs = Math.max(0, Math.min(now - sampledServerTime, 5000));
+        const reportedPosition = Math.max(0, Math.min(Number(message.position) || 0, 86400));
+        state.position = Math.min(
+          86400,
+          reportedPosition + (message.advancing !== false && state.playing && now >= state.updatedAt ? sampleAgeMs / 1000 : 0),
+        );
       } else if (action === "volume") {
+        state.position = currentPosition(state, now);
         state.volume = Math.max(0, Math.min(Number(message.volume) || 0, 1));
       } else if (action === "quality") {
         const quality = String(message.quality || "").toLowerCase();
@@ -493,6 +725,7 @@ export async function createLanRelay({
           send(ws, { type: "error", code: "quality_unavailable" });
           return;
         }
+        const shouldResume = state.playing || state.preparing;
         state.position = currentPosition(state, now);
         const id = `cloud-v2-${cloud.provider}-${cloud.sourceId}-${quality}`;
         state.track = cloudTrackDescriptor(state.track, {
@@ -502,47 +735,61 @@ export async function createLanRelay({
           quality,
           legacy: false,
         });
+        if (shouldResume) beginPlaybackPreparation(room, now);
       } else if (action === "track") {
         const track = normalizeTrack(message.track);
         if (!track || (isLocalTrack(track) && !(await readTrackMeta(dataDir, track.id)))) {
           send(ws, { type: "error", code: "invalid_track" });
           return;
         }
+        if (rooms.get(ws.roomCode) !== room || room.leaderId !== ws.clientId) return;
+        cancelPlaybackPreparation(room, now);
         state.track = track;
         state.position = 0;
-        state.playing = false;
       } else {
         send(ws, { type: "error", code: "invalid_command" });
         return;
       }
-      state.updatedAt = now;
+      state.updatedAt = state.playing && state.scheduledAt > now ? state.scheduledAt : now;
       state.revision += 1;
       broadcastRoom(room);
+    };
+
+    ws.on("message", (raw) => {
+      const receivedAt = Date.now();
+      ws.messageChain = ws.messageChain.then(() => processMessage(raw, receivedAt)).catch(() => {
+        send(ws, { type: "error", code: "command_failed" });
+      });
     });
 
     ws.on("close", () => {
-      const room = rooms.get(ws.roomCode);
-      if (!room) return;
-      room.clients.delete(ws);
-      if (!room.clients.size) {
-        rooms.delete(room.code);
-        return;
-      }
-      if (room.leaderId === ws.clientId) {
-        room.leaderId = room.clients.values().next().value.clientId;
-        room.state.position = currentPosition(room.state);
-        room.state.playing = false;
-        room.state.updatedAt = Date.now();
-        room.state.revision += 1;
-      }
-      broadcastRoom(room);
+      detachClientFromRoom(ws);
     });
   });
 
   const tick = setInterval(() => {
-    for (const room of rooms.values()) broadcastRoom(room);
-  }, 2000);
+    const now = Date.now();
+    for (const room of rooms.values()) {
+      if (room.state.preparing && room.prepareDeadline && now >= room.prepareDeadline) {
+        cancelPlaybackPreparation(room, now, "timeout");
+        room.state.revision += 1;
+      }
+      broadcastRoom(room);
+    }
+  }, ROOM_BROADCAST_INTERVAL_MS);
   tick.unref();
+
+  const heartbeat = setInterval(() => {
+    for (const client of wss.clients) {
+      if (!client.isAlive) {
+        client.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      client.ping();
+    }
+  }, 15000);
+  heartbeat.unref();
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -557,6 +804,7 @@ export async function createLanRelay({
     port: actualPort,
     async close() {
       clearInterval(tick);
+      clearInterval(heartbeat);
       for (const client of wss.clients) client.terminate();
       await new Promise((resolve) => wss.close(resolve));
       await new Promise((resolve) => server.close(resolve));

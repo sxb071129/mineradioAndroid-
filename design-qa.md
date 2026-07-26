@@ -2,16 +2,16 @@
 
 **Source visual truth**
 
-- `C:\Users\sxb07\OneDrive\Desktop\Web—mineradio\design-reference-original-controls.png`
+- `design-reference-original-controls.png`
 - Original repository rendered at 1440 × 900 in the Mineradio home state with the playback dock expanded.
 
 **Implementation evidence**
 
-- Desktop: `C:\Users\sxb07\OneDrive\Desktop\Web—mineradio\design-implementation-desktop-final2.png`
-- Mobile: `C:\Users\sxb07\OneDrive\Desktop\Web—mineradio\design-implementation-mobile-pass1.png`
-- Room sheet: `C:\Users\sxb07\OneDrive\Desktop\Web—mineradio\design-implementation-mobile-room.png`
-- Full-view comparison: `C:\Users\sxb07\OneDrive\Desktop\Web—mineradio\design-comparison-desktop.png`
-- Focused comparison: `C:\Users\sxb07\OneDrive\Desktop\Web—mineradio\design-comparison-focused.png`
+- Desktop: `design-implementation-desktop-final2.png`
+- Mobile: `design-implementation-mobile-pass1.png`
+- Room sheet: `design-implementation-mobile-room.png`
+- Full-view comparison: `design-comparison-desktop.png`
+- Focused comparison: `design-comparison-focused.png`
 
 **Viewport and state**
 

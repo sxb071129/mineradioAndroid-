@@ -36,6 +36,7 @@ yarn-error.log*
 
 # typescript
 next-env.d.ts
+*.tsbuildinfo
 /dist/
 /.wrangler/
 /outputs/
@@ -43,3 +44,17 @@ next-env.d.ts
 /.upstream-review/
 /.mineradio-lan/
 /.sites-dev.*.log
+/.dev-lan.*.log
+/accounts/
+*.cookie
+*.token
+*.log
+*.tmp
+*.bak
+/.cache/
+/.turbo/
+/.vite/
+/.idea/
+/.vscode/
+Thumbs.db
+Desktop.ini

@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Exact upstream runtime copies; lint our bridge and route code instead.
+    "public/classic/vendor/**",
   ]),
 ]);
 

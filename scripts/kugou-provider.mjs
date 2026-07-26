@@ -7,7 +7,7 @@ import {
   randomInt,
   randomUUID,
 } from "node:crypto";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 
@@ -29,18 +29,25 @@ const BROWSER_USER_AGENT =
 const GATEWAY_ORIGIN = "https://gateway.kugou.com";
 const LOGIN_ORIGIN = "https://login-user.kugou.com";
 const USER_SERVICE_ORIGIN = "https://userservice.kugou.com";
+const VIP_ORIGIN = "https://kugouvip.kugou.com";
 const TRACKER_ORIGIN = "https://trackercdn.kugou.com";
+const LYRICS_ORIGIN = "https://lyrics.kugou.com";
 const FIXED_API_ORIGINS = new Set([
   GATEWAY_ORIGIN,
   LOGIN_ORIGIN,
   USER_SERVICE_ORIGIN,
+  VIP_ORIGIN,
   TRACKER_ORIGIN,
+  LYRICS_ORIGIN,
 ]);
 const STREAM_HOST_SUFFIXES = ["kugou.com", "kgimg.com", "kugou.net"];
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_LYRIC_BYTES = 512 * 1024;
 const MAX_AUTH_FILE_BYTES = 64 * 1024;
+const MAX_COOKIE_INPUT_BYTES = 32 * 1024;
+const QUALITY_METADATA_TTL_MS = 60 * 60 * 1000;
 const QR_TTL_MS = 10 * 60 * 1000;
 const MAX_QR_SESSIONS = 16;
 const MAX_PLAYLIST_PAGES = 10;
@@ -53,6 +60,7 @@ const USER_ID_RE = /^\d{1,24}$/;
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DEVICE_TOKEN_RE = /^[A-Z0-9]{8,64}$/;
 const DFID_RE = /^[A-Za-z0-9_-]{0,128}$/;
+const LYRIC_CANDIDATE_RE = /^[A-Za-z0-9._~+-]{1,256}$/;
 const QUALITY_LEVELS = Object.freeze([
   "jymaster",
   "hires",
@@ -119,6 +127,89 @@ function cleanText(value, maxLength = 256) {
     .slice(0, maxLength);
 }
 
+function decodeCookieValue(value) {
+  const raw = String(value ?? "").trim();
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function parseKugouCookieInput(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw makeError("invalid_kugou_cookie", 400);
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_COOKIE_INPUT_BYTES ||
+      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
+    throw makeError("invalid_kugou_cookie", 400);
+  }
+
+  const fields = new Map();
+  for (const line of value.split(/\r?\n/)) {
+    const normalizedLine = line.replace(/^\s*cookie\s*:\s*/i, "");
+    for (const part of normalizedLine.split(";")) {
+      const separator = part.indexOf("=");
+      if (separator <= 0) continue;
+      const key = part.slice(0, separator).trim().toLowerCase();
+      const rawValue = part.slice(separator + 1).trim();
+      if (!key || !rawValue) continue;
+      fields.set(key, decodeCookieValue(rawValue));
+    }
+  }
+
+  function firstField(...names) {
+    for (const name of names) {
+      const field = fields.get(name);
+      if (field != null && String(field).trim()) return String(field).trim();
+    }
+    return "";
+  }
+
+  const userId = firstField(
+    "userid", "user_id", "uid", "kugooid", "kugou_id", "kugouid", "kg_uid",
+  );
+  const token = firstField("token", "user_token", "access_token", "key", "kugoo", "t");
+  if (!USER_ID_RE.test(userId) || !token || token.length > 2_048 ||
+      /[\u0000-\u001f\u007f]/.test(token)) {
+    throw makeError("invalid_kugou_cookie", 400);
+  }
+
+  function boundedNumber(raw) {
+    if (/^(?:true|yes)$/i.test(raw)) return 1;
+    return Math.max(0, Math.min(1_000_000, Number(raw) || 0));
+  }
+
+  const device = {};
+  const guid = firstField("kugou_api_guid", "guid");
+  const mid = firstField("kugou_api_mid", "kg_mid", "mid");
+  const mac = firstField("kugou_api_mac", "mac");
+  const dev = firstField("kugou_api_dev", "dev");
+  const dfid = firstField("dfid");
+  if (GUID_RE.test(guid)) device.guid = guid;
+  if (/^\d{1,64}$/.test(mid)) device.mid = mid;
+  if (DEVICE_TOKEN_RE.test(mac)) device.mac = mac;
+  if (DEVICE_TOKEN_RE.test(dev)) device.dev = dev;
+  if (dfid === "-" || (dfid && DFID_RE.test(dfid))) device.dfid = dfid;
+
+  return {
+    session: {
+      userId,
+      token,
+      nickname: cleanText(firstField("nickname", "nick", "username", "user_name", "uname"), 128),
+      avatar: safePublicUrl(
+        firstField(
+          "avatar", "pic", "img", "icon", "headpic", "head_img", "headimg", "user_pic", "userpic",
+        ),
+        { providerOnly: true },
+      ),
+      vipType: boundedNumber(firstField("viptype", "vip_type", "isvip", "is_vip", "vip")),
+      svipLevel: boundedNumber(firstField("svip_level", "sviplevel")),
+    },
+    device,
+  };
+}
+
 function cleanTrackText(value) {
   return cleanText(value, 300)
     .replace(/\.(mp3|flac|m4a|aac|ogg|wav)$/i, "")
@@ -176,9 +267,79 @@ function safePublicUrl(value, { allowHttp = true, providerOnly = false } = {}) {
   return resolved.toString();
 }
 
+function safeProviderStreamUrl(value) {
+  const raw = String(value ?? "").trim();
+  let resolved;
+  try {
+    resolved = new URL(raw);
+  } catch {
+    return "";
+  }
+
+  if (resolved.protocol === "http:") {
+    const allowlistedHttpUrl = safePublicUrl(resolved.toString(), {
+      allowHttp: true,
+      providerOnly: true,
+    });
+    if (!allowlistedHttpUrl) return "";
+    resolved = new URL(allowlistedHttpUrl);
+    resolved.protocol = "https:";
+  }
+
+  return safePublicUrl(resolved.toString(), { allowHttp: false, providerOnly: true });
+}
+
+function browserUnsupportedAudioFormat(data, streamUrl) {
+  const declared = cleanText(
+    data?.extName ?? data?.extname ?? data?.fileExt ?? data?.file_ext,
+    24,
+  ).toLowerCase().replace(/^\./, "");
+  let pathnameExt = "";
+  try {
+    const match = /\.([a-z0-9]{2,8})$/i.exec(new URL(streamUrl).pathname);
+    pathnameExt = String(match?.[1] || "").toLowerCase();
+  } catch {
+    pathnameExt = "";
+  }
+  const unsupported = new Set(["ape", "dsf", "dff", "wv", "wavpack"]);
+  return unsupported.has(declared) || unsupported.has(pathnameExt);
+}
+
 function safeProviderMessage(value) {
   return cleanText(value, 300)
-    .replace(/((?:token|cookie|kugoo)\s*[=:]\s*)[^\s,;]+/gi, "$1[redacted]");
+    .replace(/https?:\/\/[^\s,;]+/gi, "[redacted-url]")
+    .replace(/\b[a-f0-9]{32}\b/gi, "[redacted-hash]")
+    .replace(/((?:access[_-]?token|refresh[_-]?token|token|cookie|kugoo|authorization)\s*[=:]\s*)[^\s,;]+/gi, "$1[redacted]");
+}
+
+function normalizeLyricText(value) {
+  const normalized = String(value ?? "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .trim();
+  if (Buffer.byteLength(normalized) > MAX_LYRIC_BYTES) {
+    throw makeError("provider_lyric_too_large");
+  }
+  return normalized;
+}
+
+function decodeKugouLyricContent(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  if (Buffer.byteLength(raw) > MAX_RESPONSE_BYTES) throw makeError("provider_response_too_large");
+  const compact = raw.replace(/\s+/g, "");
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(compact) && compact.length >= 8) {
+    try {
+      const decoded = Buffer.from(compact, "base64").toString("utf8");
+      if (decoded && (decoded.includes("[") || /[\u4e00-\u9fff]/.test(decoded))) {
+        return normalizeLyricText(decoded);
+      }
+    } catch {
+      // Some provider responses already contain plain-text LRC despite the content field name.
+    }
+  }
+  return normalizeLyricText(raw);
 }
 
 function signValue(value) {
@@ -235,12 +396,51 @@ function normalizeSession(existing) {
     throw makeError("invalid_auth_session", 500);
   }
   const vipType = Math.max(0, Math.min(1_000_000, Number(existing.vipType) || 0));
+  const svipLevel = Math.max(0, Math.min(1_000_000, Number(existing.svipLevel) || 0));
   return {
     userId,
     token,
     nickname: cleanText(existing.nickname, 128),
     avatar: safePublicUrl(existing.avatar, { providerOnly: true }),
     vipType,
+    svipLevel,
+  };
+}
+
+function normalizeIsoTime(value) {
+  const parsed = Date.parse(String(value ?? ""));
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : "";
+}
+
+function normalizeValidation(existing, hasSession) {
+  const value = isPlainObject(existing) ? existing : {};
+  const allowedStates = new Set(["unvalidated", "valid", "stale", "unavailable"]);
+  let validationState = allowedStates.has(value.validationState)
+    ? value.validationState
+    : (allowedStates.has(value.state) ? value.state : "unvalidated");
+  if (!hasSession) validationState = "unvalidated";
+  return {
+    validationState,
+    validatedAt: normalizeIsoTime(value.validatedAt),
+    lastAttemptAt: normalizeIsoTime(value.lastAttemptAt),
+    code: cleanText(value.code, 80),
+  };
+}
+
+function normalizeDeviceRegistration(existing, device) {
+  const value = isPlainObject(existing) ? existing : {};
+  const allowedStates = new Set(["unregistered", "registered", "failed"]);
+  let registrationState = allowedStates.has(value.registrationState)
+    ? value.registrationState
+    : (allowedStates.has(value.state) ? value.state : "unregistered");
+  if (registrationState === "unregistered" && device.dfid && device.dfid !== "-") {
+    registrationState = "registered";
+  }
+  return {
+    registrationState,
+    attemptedAt: normalizeIsoTime(value.attemptedAt),
+    registeredAt: normalizeIsoTime(value.registeredAt),
+    code: cleanText(value.code, 80),
   };
 }
 
@@ -250,6 +450,8 @@ function serializeState(state) {
       version: 1,
       device: state.device,
       session: state.session,
+      validation: state.validation,
+      deviceRegistration: state.deviceRegistration,
       updatedAt: new Date().toISOString(),
     },
     null,
@@ -267,13 +469,23 @@ async function loadAuthState(authFile) {
     if (!isPlainObject(parsed) || (parsed.version != null && parsed.version !== 1)) {
       throw makeError("invalid_auth_file", 500);
     }
+    const device = createDeviceIdentity(parsed.device);
+    const session = normalizeSession(parsed.session);
     return {
-      device: createDeviceIdentity(parsed.device),
-      session: normalizeSession(parsed.session),
+      device,
+      session,
+      validation: normalizeValidation(parsed.validation, Boolean(session)),
+      deviceRegistration: normalizeDeviceRegistration(parsed.deviceRegistration, device),
     };
   } catch (error) {
     if (error?.code === "ENOENT") {
-      return { device: createDeviceIdentity(), session: null };
+      const device = createDeviceIdentity();
+      return {
+        device,
+        session: null,
+        validation: normalizeValidation(null, false),
+        deviceRegistration: normalizeDeviceRegistration(null, device),
+      };
     }
     if (error?.code && String(error.code).startsWith("invalid_")) throw error;
     throw makeError("invalid_auth_file", 500);
@@ -572,21 +784,106 @@ export async function createKugouProvider({
   let state = await loadAuthState(resolvedAuthFile);
   let saveTail = Promise.resolve();
   const qrSessions = new Map();
+  const qualityMetadataCache = new Map();
 
   function persistState() {
     const snapshot = serializeState(state);
-    saveTail = saveTail.then(async () => {
-      await writeFile(resolvedAuthFile, snapshot, { encoding: "utf8", mode: 0o600 });
-      await chmod(resolvedAuthFile, 0o600);
+    saveTail = saveTail.catch(() => {}).then(async () => {
+      const temporaryFile = `${resolvedAuthFile}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(temporaryFile, snapshot, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        await chmod(temporaryFile, 0o600);
+        await rename(temporaryFile, resolvedAuthFile);
+        await chmod(resolvedAuthFile, 0o600);
+      } catch (error) {
+        await unlink(temporaryFile).catch(() => {});
+        throw error;
+      }
     });
     return saveTail;
   }
 
   function publicProviderMessage(value) {
     let message = safeProviderMessage(value);
-    const token = state.session?.token;
-    if (token) message = message.split(token).join("[redacted]");
+    const secrets = [
+      state.session?.token,
+      state.device?.guid,
+      state.device?.mid,
+      state.device?.mac,
+      state.device?.dev,
+      state.device?.dfid === "-" ? "" : state.device?.dfid,
+    ].filter(Boolean);
+    for (const secret of secrets) message = message.split(secret).join("[redacted]");
     return message;
+  }
+
+  function safeOutcomeCode(value, fallback = "") {
+    const normalized = cleanText(value, 80).toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+    return normalized.replace(/^_+|_+$/g, "") || fallback;
+  }
+
+  function responseCode(value) {
+    for (const candidate of [value?.error_code, value?.errcode, value?.status, value?.code]) {
+      const code = Number(candidate);
+      if (Number.isFinite(code) && code !== 0) return code;
+    }
+    return 0;
+  }
+
+  function providerAuthRejected(value) {
+    const code = responseCode(value);
+    if ([401, 403, 1001, 1002, 20001, 20002].includes(code)) return true;
+    const message = cleanText(value?.error || value?.errmsg || value?.message, 200).toLowerCase();
+    return /(?:token|session|login|auth).*(?:invalid|expired|rejected)|(?:invalid|expired).*(?:token|session)/i.test(message);
+  }
+
+  function accountRestriction() {
+    if (!state.session) return "login_required";
+    if (state.validation.validationState === "stale") return "stale_session";
+    return "";
+  }
+
+  function classifyProviderRestriction(response, data, requestedQuality) {
+    const code = responseCode(response);
+    const message = publicProviderMessage(
+      response?.error || response?.errmsg || response?.message ||
+      data?.error || data?.errmsg || data?.message,
+    );
+    const normalized = message.toLowerCase();
+    if (providerAuthRejected(response) || providerAuthRejected(data)) return "stale_session";
+    if (/region|geo|地区|区域|海外|所在国家/.test(normalized)) return "region_restricted";
+    if (/copyright|版权|下架|已失效|not available/.test(normalized)) return "copyright_unavailable";
+    if (/quality|音质|码率|hash/.test(normalized) || (code === 404 && requestedQuality !== "standard")) {
+      return "quality_unavailable";
+    }
+    if (/vip|paid|pay|会员|付费|购买|权益/.test(normalized) || [3, 6, 8, 20010, 20011].includes(code)) {
+      return "paid_required";
+    }
+    return state.session ? "provider_contract_changed" : "login_required";
+  }
+
+  function restrictionDetails(category, { code = 0, rawMessage = "" } = {}) {
+    const details = {
+      login_required: ["login", "酷狗歌曲需要登录后获取播放地址"],
+      stale_session: ["login", "酷狗登录会话已失效，请重新登录"],
+      device_registration_failed: ["retry", "酷狗设备注册失败，播放尚未就绪"],
+      paid_required: ["upgrade", "当前酷狗账号没有该歌曲的播放权限，可能需要会员或购买"],
+      copyright_unavailable: ["none", "该歌曲因版权原因暂不可播放"],
+      region_restricted: ["none", "该歌曲在当前地区不可播放"],
+      quality_unavailable: ["change_quality", "请求的音质暂不可用"],
+      stream_host_rejected: ["none", "酷狗返回了不受信任的播放地址"],
+      provider_contract_changed: ["retry", "酷狗响应格式已变化，暂时无法解析播放地址"],
+      provider_unavailable: ["retry", "酷狗服务暂时不可用，请稍后重试"],
+    };
+    const [action, message] = details[category] || details.provider_contract_changed;
+    return {
+      provider: PROVIDER,
+      category,
+      action,
+      message,
+      code: Number(code) || 0,
+      rawMessage: publicProviderMessage(rawMessage),
+    };
   }
 
   await persistState();
@@ -651,7 +948,14 @@ export async function createKugouProvider({
         return fetchFixed(next, init, responseType, redirectCount + 1);
       }
       if (!(response?.ok ?? (statusCode >= 200 && statusCode < 300))) {
-        throw makeError("provider_request_failed");
+        const error = makeError(
+          statusCode === 401 || statusCode === 403
+            ? "provider_auth_rejected"
+            : "provider_request_failed",
+          statusCode || 502,
+        );
+        error.providerStatus = statusCode;
+        throw error;
       }
       if (responseType === "buffer") return responseBuffer(response);
       const text = await responseText(response);
@@ -726,6 +1030,82 @@ export async function createKugouProvider({
     );
   }
 
+  async function fetchVipProfile() {
+    const response = await gatewayRequest("/v1/get_union_vip", {
+      origin: VIP_ORIGIN,
+      params: { busi_type: "concept" },
+    });
+    if (providerAuthRejected(response)) throw makeError("provider_auth_rejected", 401);
+    const errorCode = Number(response?.error_code ?? response?.errcode) || 0;
+    const status = Number(response?.status ?? response?.code) || 0;
+    if (errorCode > 0 || status <= 0) throw makeError("provider_unavailable");
+    const data = isPlainObject(response?.data) ? response.data : response;
+    const isVip = Number(data?.is_vip ?? data?.isVip) > 0 || data?.is_vip === true || data?.isVip === true;
+    const vipType = Math.max(
+      isVip ? 1 : 0,
+      Math.min(1_000_000, Math.max(0, Number(data?.vip_type ?? data?.vipType ?? data?.viptype) || 0)),
+    );
+    const svipLevel = Math.min(
+      1_000_000,
+      Math.max(0, Number(data?.svip_level ?? data?.svipLevel ?? data?.sviplevel) || 0),
+    );
+    return { vipType, svipLevel };
+  }
+
+  async function fetchAudioQualityHashes(baseHash) {
+    const cached = qualityMetadataCache.get(baseHash);
+    if (cached && cached.expiresAt > Date.now()) return cached.hashes;
+    const requestTime = Date.now();
+    const response = await gatewayRequest("/v1/audio/audio", {
+      method: "POST",
+      headers: { "x-router": "kmr.service.kugou.com" },
+      data: {
+        appid: Number(APP_ID),
+        clienttime: requestTime,
+        clientver: Number(CLIENT_VERSION),
+        data: [{ hash: baseHash, audio_id: 0 }],
+        dfid: state.device.dfid,
+        key: md5(`${APP_ID}${ANDROID_SIGNATURE_KEY}${CLIENT_VERSION}${requestTime}`),
+        mid: state.device.mid,
+        ...(state.session?.token ? { token: state.session.token } : {}),
+        ...(state.session?.userId ? { userid: state.session.userId } : {}),
+      },
+    });
+    if (providerAuthRejected(response)) throw makeError("provider_auth_rejected", 401);
+    const errorCode = Number(response?.error_code ?? response?.errcode) || 0;
+    const status = Number(response?.status ?? response?.code) || 0;
+    if (errorCode > 0 || status <= 0) throw makeError("provider_unavailable");
+    const rows = Array.isArray(response?.data)
+      ? response.data
+      : (Array.isArray(response?.data?.data) ? response.data.data : []);
+    const row = rows.find((value) => isPlainObject(value)) || {};
+    function safeHash(...values) {
+      const value = firstNonEmpty(...values);
+      try {
+        return normalizeHash(value, { optional: true, label: "quality_hash" });
+      } catch {
+        return "";
+      }
+    }
+    const hashes = {
+      // `hash_super` is Kugou's DSD/super source, not the Viper master source.
+      // Keep the master tier truthful and only accept fields explicitly marked as master.
+      jymaster: safeHash(row.masterhash, row.jymaster_hash),
+      hires: safeHash(row.hash_high, row.high_hash, row.hrhash),
+      lossless: safeHash(row.hash_flac, row.flac_hash, row.hash_ape, row.sqhash),
+      exhigh: safeHash(row.hash_320, row["320hash"], row.HQFileHash),
+      standard: safeHash(row.hash_128, row["128hash"], row.hash, baseHash),
+    };
+    while (qualityMetadataCache.size >= 512) {
+      qualityMetadataCache.delete(qualityMetadataCache.keys().next().value);
+    }
+    qualityMetadataCache.set(baseHash, {
+      hashes,
+      expiresAt: Date.now() + QUALITY_METADATA_TTL_MS,
+    });
+    return hashes;
+  }
+
   async function cloudlistRequest(pathname, params, data) {
     const clientTime = String(Math.floor(Date.now() / 1_000));
     const finalParams = {
@@ -765,7 +1145,8 @@ export async function createKugouProvider({
   }
 
   async function registerDevice() {
-    if (!state.session) return;
+    if (!state.session) return false;
+    const attemptedAt = new Date().toISOString();
     const dataMap = {
       availableRamSize: 4_983_533_568,
       availableRomSize: 48_114_719,
@@ -817,50 +1198,228 @@ export async function createKugouProvider({
       { key: KUGOU_RSA_PUBLIC_KEY, padding: cryptoConstants.RSA_PKCS1_PADDING },
       Buffer.from(rsaPayload),
     ).toString("hex");
-    const response = await gatewayRequest("/risk/v2/r_register_dev", {
-      origin: USER_SERVICE_ORIGIN,
-      method: "POST",
-      responseType: "buffer",
-      params: { part: 1, platid: 1, p: encryptedParams },
-      data: encrypted,
-      headers: { "x-router": "userservice.kugou.com" },
-    });
-    let parsed;
-    const plain = response.toString("utf8").trim();
-    if (plain.startsWith("{")) {
-      parsed = parseJson(plain);
-    } else {
-      const decipher = createDecipheriv("aes-128-cbc", key, iv);
-      const decrypted = Buffer.concat([decipher.update(response), decipher.final()]).toString("utf8");
-      parsed = parseJson(decrypted);
-    }
-    const dfid = String(safeGet(parsed, ["data", "dfid"], "")).trim();
-    if (dfid && DFID_RE.test(dfid)) {
-      state = { ...state, device: { ...state.device, dfid } };
+    try {
+      const response = await gatewayRequest("/risk/v2/r_register_dev", {
+        origin: USER_SERVICE_ORIGIN,
+        method: "POST",
+        responseType: "buffer",
+        params: { part: 1, platid: 1, p: encryptedParams },
+        data: encrypted,
+        headers: { "x-router": "userservice.kugou.com" },
+      });
+      let parsed;
+      const plain = response.toString("utf8").trim();
+      if (plain.startsWith("{")) {
+        parsed = parseJson(plain);
+      } else {
+        const decipher = createDecipheriv("aes-128-cbc", key, iv);
+        const decrypted = Buffer.concat([decipher.update(response), decipher.final()]).toString("utf8");
+        parsed = parseJson(decrypted);
+      }
+      const dfid = String(safeGet(parsed, ["data", "dfid"], "")).trim();
+      const code = responseCode(parsed);
+      if (!dfid || !DFID_RE.test(dfid) || (code && code !== 1 && code !== 200)) {
+        throw makeError(code ? `device_registration_${code}` : "device_registration_rejected");
+      }
+      state = {
+        ...state,
+        device: { ...state.device, dfid },
+        deviceRegistration: {
+          registrationState: "registered",
+          attemptedAt,
+          registeredAt: new Date().toISOString(),
+          code: code ? String(code) : "ok",
+        },
+      };
       await persistState();
+      return true;
+    } catch (error) {
+      state = {
+        ...state,
+        deviceRegistration: {
+          registrationState: "failed",
+          attemptedAt,
+          registeredAt: "",
+          code: safeOutcomeCode(error?.code, "provider_unavailable"),
+        },
+      };
+      await persistState();
+      return false;
     }
   }
 
   async function loginStatus() {
     const session = state.session;
-    const loggedIn = Boolean(session?.userId && session?.token);
-    const vipType = loggedIn ? Math.max(0, Number(session.vipType) || 0) : 0;
-    const isVip = vipType > 0;
+    const hasLocalSession = Boolean(session?.userId && session?.token);
+    const accountValidated = hasLocalSession && state.validation.validationState === "valid";
+    const deviceRegistered = state.deviceRegistration.registrationState === "registered";
+    const restrictionCode = accountRestriction();
+    const playbackReady = hasLocalSession && state.validation.validationState !== "stale";
+    const vipType = hasLocalSession ? Math.max(0, Number(session.vipType) || 0) : 0;
+    const svipLevel = hasLocalSession ? Math.max(0, Number(session.svipLevel) || 0) : 0;
+    const isSvip = svipLevel > 0;
+    const isVip = isSvip || vipType > 0;
     return {
       provider: PROVIDER,
-      loggedIn,
-      hasCookie: loggedIn,
-      userId: loggedIn ? session.userId : "",
-      nickname: loggedIn ? (session.nickname || "酷狗音乐用户") : "酷狗音乐",
-      avatar: loggedIn ? session.avatar : "",
+      loggedIn: hasLocalSession,
+      hasCookie: hasLocalSession,
+      hasLocalSession,
+      storedLocalSession: hasLocalSession,
+      accountValidated,
+      validationState: state.validation.validationState,
+      validatedAt: state.validation.validatedAt,
+      validationAttemptedAt: state.validation.lastAttemptAt,
+      validationCode: publicProviderMessage(state.validation.code),
+      deviceRegistered,
+      deviceRegistrationState: state.deviceRegistration.registrationState,
+      deviceRegistrationAttemptedAt: state.deviceRegistration.attemptedAt,
+      deviceRegisteredAt: state.deviceRegistration.registeredAt,
+      deviceRegistrationCode: publicProviderMessage(state.deviceRegistration.code),
+      playbackReady,
+      playbackKeyReady: playbackReady,
+      restrictionCode,
+      userId: hasLocalSession ? session.userId : "",
+      nickname: hasLocalSession ? (session.nickname || "酷狗音乐用户") : "酷狗音乐",
+      avatar: hasLocalSession ? session.avatar : "",
       vipType,
-      vipLevel: isVip ? "vip" : "none",
+      svipLevel,
+      vipLevel: isSvip ? "svip" : (isVip ? "vip" : "none"),
       isVip,
-      isSvip: false,
-      vipLabel: isVip ? "Kugou VIP" : "无 VIP",
-      playbackKeyReady: loggedIn,
-      preview: !loggedIn,
-      message: loggedIn ? "已保存酷狗网页登录会话" : "未登录酷狗音乐",
+      isSvip,
+      vipLabel: isSvip ? "Kugou SVIP" : (isVip ? "Kugou VIP" : "无 VIP"),
+      preview: !playbackReady,
+      message: !hasLocalSession
+        ? "未登录酷狗音乐"
+        : (restrictionCode === "stale_session"
+          ? "酷狗本机会话已失效，请重新登录"
+          : (accountValidated
+            ? (deviceRegistered ? "酷狗账号已验证" : "酷狗账号已验证；设备注册未完成，将直接尝试播放")
+            : "已保存酷狗网页登录会话；播放时将继续确认账号与歌曲权限")),
+    };
+  }
+
+  async function validateSession() {
+    if (!state.session) return { ...(await loginStatus()), ok: false };
+    const lastAttemptAt = new Date().toISOString();
+    try {
+      const data = await gatewayRequest("/v7/get_all_list", {
+        method: "POST",
+        params: {
+          total_ver: 979,
+          type: 2,
+          page: 1,
+          pagesize: 1,
+          userid: state.session.userId,
+          token: state.session.token,
+        },
+        data: {
+          total_ver: 979,
+          type: 2,
+          page: 1,
+          pagesize: 1,
+          userid: Number(state.session.userId) || state.session.userId,
+          token: state.session.token,
+        },
+        headers: { "x-router": "cloudlist.service.kugou.com" },
+      });
+      if (providerAuthRejected(data)) throw makeError("provider_auth_rejected", 401);
+      const providerErrorCode = [data?.error_code, data?.errcode]
+        .map(Number)
+        .find((code) => Number.isFinite(code) && code > 0) || 0;
+      const providerSuccessCode = [data?.status, data?.code]
+        .map(Number)
+        .find((code) => Number.isFinite(code) && code > 0) || 0;
+      if (providerErrorCode > 0 || providerSuccessCode <= 0) {
+        throw makeError("provider_unavailable");
+      }
+      let vipProfile = null;
+      try {
+        vipProfile = await fetchVipProfile();
+      } catch {
+        // VIP metadata is useful for tracker authorization and display, but a
+        // temporary VIP endpoint failure must not invalidate a proven session.
+      }
+      state = {
+        ...state,
+        session: vipProfile ? { ...state.session, ...vipProfile } : state.session,
+        validation: {
+          validationState: "valid",
+          validatedAt: new Date().toISOString(),
+          lastAttemptAt,
+          code: "ok",
+        },
+      };
+      await persistState();
+      return { ...(await loginStatus()), ok: true };
+    } catch (error) {
+      const rejected = error?.code === "provider_auth_rejected";
+      state = {
+        ...state,
+        validation: {
+          ...state.validation,
+          validationState: rejected ? "stale" : "unavailable",
+          lastAttemptAt,
+          code: safeOutcomeCode(error?.code, rejected ? "auth_rejected" : "provider_unavailable"),
+        },
+      };
+      await persistState();
+      return { ...(await loginStatus()), ok: false };
+    }
+  }
+
+  async function loginCookie(rawCookie) {
+    const imported = parseKugouCookieInput(rawCookie);
+    const previousState = {
+      ...state,
+      device: { ...state.device },
+      session: state.session ? { ...state.session } : null,
+      validation: { ...state.validation },
+      deviceRegistration: { ...state.deviceRegistration },
+    };
+    const identityChanged = ["guid", "mid", "mac", "dev"].some(
+      (key) => imported.device[key] && imported.device[key] !== state.device[key],
+    );
+    const deviceInput = { ...state.device, ...imported.device };
+    if (imported.device.guid && !imported.device.mid) {
+      deviceInput.mid = calculateMid(imported.device.guid);
+    }
+    if (identityChanged && !Object.hasOwn(imported.device, "dfid")) deviceInput.dfid = "-";
+    const device = createDeviceIdentity(deviceInput);
+    const importedDfid = Object.hasOwn(imported.device, "dfid") && imported.device.dfid !== "-";
+    const keepRegistration = !identityChanged && !Object.hasOwn(imported.device, "dfid");
+    const now = new Date().toISOString();
+
+    state = {
+      ...state,
+      device,
+      session: normalizeSession(imported.session),
+      validation: normalizeValidation(null, true),
+      deviceRegistration: importedDfid
+        ? {
+            registrationState: "registered",
+            attemptedAt: now,
+            registeredAt: now,
+            code: "imported",
+          }
+        : (keepRegistration
+          ? { ...state.deviceRegistration }
+          : normalizeDeviceRegistration(null, device)),
+    };
+    await persistState();
+
+    const validated = await validateSession();
+    if (validated.validationState === "stale" || validated.restrictionCode === "stale_session") {
+      state = previousState;
+      await persistState();
+      throw makeError("invalid_provider_credentials", 401);
+    }
+
+    if (state.deviceRegistration.registrationState !== "registered") {
+      void registerDevice().catch(() => {});
+    }
+    return {
+      ...(await loginStatus()),
+      saved: true,
     };
   }
 
@@ -1009,17 +1568,40 @@ export async function createKugouProvider({
         ) || 0,
       ),
     );
+    const svipLevel = Math.max(
+      0,
+      Math.min(
+        1_000_000,
+        Number(
+          safeGet(data, ["data", "svip_level"], 0) ||
+          safeGet(data, ["data", "svipLevel"], 0) ||
+          deepFind(data, ["svip_level", "svipLevel", "sviplevel"]),
+        ) || 0,
+      ),
+    );
     state = {
       ...state,
-      session: { userId, token, nickname, avatar, vipType },
+      session: { userId, token, nickname, avatar, vipType, svipLevel },
+      validation: {
+        validationState: "unvalidated",
+        validatedAt: "",
+        lastAttemptAt: "",
+        code: "",
+      },
+      deviceRegistration: {
+        registrationState: "unregistered",
+        attemptedAt: "",
+        registeredAt: "",
+        code: "",
+      },
     };
     await persistState();
     qrSessions.delete(key);
-    try {
-      await registerDevice();
-    } catch {
-      // The authenticated session is already safely persisted. Device registration is best effort.
-    }
+    // Device registration is a best-effort compatibility hint. The session is
+    // already durable at this point, so a slow registration endpoint must not
+    // turn a successful QR login into a client-side timeout.
+    void registerDevice().catch(() => {});
+    void validateSession().catch(() => {});
     return {
       ...(await loginStatus()),
       code: 803,
@@ -1030,7 +1612,12 @@ export async function createKugouProvider({
   }
 
   async function logout() {
-    state = { ...state, session: null };
+    state = {
+      ...state,
+      session: null,
+      validation: normalizeValidation(null, false),
+      deviceRegistration: normalizeDeviceRegistration(null, state.device),
+    };
     qrSessions.clear();
     await persistState();
     return { provider: PROVIDER, ok: true, loggedIn: false };
@@ -1153,6 +1740,60 @@ export async function createKugouProvider({
     };
   }
 
+  async function lyric(trackValue) {
+    if (!isPlainObject(trackValue)) throw makeError("invalid_track", 400);
+    const hash = normalizeHash(trackValue.hash);
+    const duration = Math.min(
+      24 * 60 * 60 * 1_000,
+      Math.max(0, Math.round(Number(trackValue.duration) || 0)),
+    );
+    const searchUrl = new URL("/search", LYRICS_ORIGIN);
+    searchUrl.searchParams.set("ver", "1");
+    searchUrl.searchParams.set("man", "yes");
+    searchUrl.searchParams.set("client", "pc");
+    searchUrl.searchParams.set("hash", hash);
+    if (duration > 0) searchUrl.searchParams.set("duration", String(duration));
+    const search = await fetchFixed(searchUrl, {
+      headers: { "User-Agent": BROWSER_USER_AGENT },
+    });
+    const candidates = Array.isArray(search?.candidates) ? search.candidates : [];
+    const candidate = candidates.find((value) => {
+      const id = String(value?.id ?? "").trim();
+      const accessKey = String(value?.accesskey ?? value?.access_key ?? "").trim();
+      return LYRIC_CANDIDATE_RE.test(id) && LYRIC_CANDIDATE_RE.test(accessKey);
+    });
+    if (!candidate) {
+      return {
+        provider: PROVIDER,
+        lyric: "",
+        tlyric: "",
+        yrc: "",
+        source: "kugou-empty",
+      };
+    }
+
+    const candidateId = String(candidate.id).trim();
+    const accessKey = String(candidate.accesskey ?? candidate.access_key).trim();
+    const downloadUrl = new URL("/download", LYRICS_ORIGIN);
+    downloadUrl.searchParams.set("ver", "1");
+    downloadUrl.searchParams.set("client", "pc");
+    downloadUrl.searchParams.set("id", candidateId);
+    downloadUrl.searchParams.set("accesskey", accessKey);
+    downloadUrl.searchParams.set("fmt", "lrc");
+    downloadUrl.searchParams.set("charset", "utf8");
+    const body = await fetchFixed(downloadUrl, {
+      headers: { "User-Agent": BROWSER_USER_AGENT },
+    });
+    const text = decodeKugouLyricContent(body?.content);
+    return {
+      provider: PROVIDER,
+      lyric: text,
+      tlyric: "",
+      yrc: "",
+      source: text ? "kugou-lyrics" : "kugou-empty",
+    };
+  }
+
   async function trackerPlayUrl(hash, { albumAudioId, albumId } = {}) {
     const session = state.session;
     const params = {
@@ -1194,7 +1835,43 @@ export async function createKugouProvider({
     if (!isPlainObject(trackValue)) throw makeError("invalid_track", 400);
     const quality = normalizeQuality(qualityValue);
     const baseHash = normalizeHash(trackValue.hash ?? trackValue.id, { label: "track_hash" });
+    const accountCategory = accountRestriction();
+    if (accountCategory) {
+      const info = await loginStatus();
+      const restriction = restrictionDetails(accountCategory);
+      return {
+        provider: PROVIDER,
+        url: "",
+        playable: false,
+        loggedIn: info.loggedIn,
+        vipType: info.vipType,
+        vipLevel: info.vipLevel,
+        level: quality,
+        quality: "",
+        requestedQuality: quality,
+        resolvedHash: "",
+        downgraded: false,
+        trial: false,
+        message: restriction.message,
+        reason: restriction.category,
+        restriction,
+        kugouCode: 0,
+      };
+    }
     const hashes = normalizeQualityHashes(trackValue.qualityHashes);
+    const shouldEnrichQuality = quality !== "standard" && QUALITY_FALLBACKS[quality]
+      .some((level) => level !== "standard" && !hashes[level]);
+    if (shouldEnrichQuality) {
+      try {
+        const enrichedHashes = await fetchAudioQualityHashes(baseHash);
+        for (const level of QUALITY_LEVELS) {
+          if (!hashes[level] && enrichedHashes[level]) hashes[level] = enrichedHashes[level];
+        }
+      } catch {
+        // Keep the hashes embedded in the playlist entry and use the existing
+        // quality fallback chain when the metadata service is unavailable.
+      }
+    }
     const albumAudioId = optionalNumericIdentifier(
       trackValue.albumAudioId ?? trackValue.album_audio_id,
       "album_audio_id",
@@ -1228,11 +1905,15 @@ export async function createKugouProvider({
         const firstUrl = Array.isArray(rawUrl) ? rawUrl[0] : rawUrl;
         const backupUrl = Array.isArray(data.backup_url) ? data.backup_url[0] : data.backup_url;
         const candidateUrl = firstUrl || backupUrl || "";
-        const url = safePublicUrl(candidateUrl, { allowHttp: false, providerOnly: true });
-        if (candidateUrl && !url) throw makeError("unsafe_kugou_stream_url");
+        const url = safeProviderStreamUrl(candidateUrl);
         lastResponse = response;
         lastData = data;
         lastSelected = selected;
+        if (candidateUrl && !url) throw makeError("stream_host_rejected");
+        if (url && browserUnsupportedAudioFormat(data, url)) {
+          lastError = makeError("unsupported_audio_format");
+          continue;
+        }
         if (url) {
           const info = await loginStatus();
           return {
@@ -1256,26 +1937,40 @@ export async function createKugouProvider({
         }
       } catch (error) {
         lastError = error;
+        if (error?.code === "stream_host_rejected") break;
       }
     }
-    if (!Object.keys(lastResponse).length && lastError) throw lastError;
-    const statusCode = Number(lastResponse.error_code ?? lastResponse.errcode ?? lastResponse.status) || 0;
+    const statusCode = responseCode(lastResponse);
     const info = await loginStatus();
-    const category = info.loggedIn ? "paid_required" : "login_required";
-    const url = "";
-    const restriction = {
-      provider: PROVIDER,
-      category,
-      action: info.loggedIn ? "upgrade" : "login",
-      message: info.loggedIn
-        ? "酷狗没有返回当前账号可播放地址，可能需要会员、购买或官方客户端权限"
-        : "酷狗歌曲需要登录后获取播放地址",
+    let category;
+    if (lastError?.code === "stream_host_rejected") {
+      category = "stream_host_rejected";
+    } else if (!Object.keys(lastResponse).length && lastError) {
+      category = lastError?.code === "invalid_provider_response"
+        ? "provider_contract_changed"
+        : "provider_unavailable";
+    } else {
+      category = classifyProviderRestriction(lastResponse, lastData, quality);
+    }
+    if (category === "stale_session") {
+      state = {
+        ...state,
+        validation: {
+          ...state.validation,
+          validationState: "stale",
+          lastAttemptAt: new Date().toISOString(),
+          code: "provider_auth_rejected",
+        },
+      };
+      await persistState();
+    }
+    const restriction = restrictionDetails(category, {
       code: statusCode,
-      rawMessage: publicProviderMessage(lastResponse.error || lastResponse.errmsg || lastResponse.message),
-    };
+      rawMessage: lastResponse.error || lastResponse.errmsg || lastResponse.message || lastError?.code,
+    });
     return {
       provider: PROVIDER,
-      url,
+      url: "",
       playable: false,
       loggedIn: info.loggedIn,
       vipType: info.vipType,
@@ -1283,11 +1978,11 @@ export async function createKugouProvider({
       level: lastSelected.level,
       quality: cleanText(lastData.fileName ?? lastData.songName ?? lastData.extName, 200),
       requestedQuality: quality,
-      resolvedHash: lastSelected.hash,
+      resolvedHash: "",
       downgraded: lastSelected.level !== quality,
       trial: false,
-      message: restriction?.message || "",
-      reason: restriction?.category || "",
+      message: restriction.message,
+      reason: restriction.category,
       restriction,
       kugouCode: statusCode,
     };
@@ -1295,11 +1990,15 @@ export async function createKugouProvider({
 
   return Object.freeze({
     loginStatus,
+    validateSession,
+    refreshAccount: validateSession,
+    loginCookie,
     loginQrKey,
     loginQrCheck,
     logout,
     userPlaylists,
     playlistTracks,
+    lyric,
     resolveStream,
   });
 }

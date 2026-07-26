@@ -109,6 +109,38 @@ test("cloud proxy forwards Range and only accepts canonical song ids", async (t)
   assert.equal(upstreamRequests.length, 1);
 });
 
+test("cloud proxy never caches login, entitlement, or transient upstream errors", async (t) => {
+  const music = http.createServer((_req, res) => {
+    const body = JSON.stringify({ error: "paid_required" });
+    res.writeHead(403, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": Buffer.byteLength(body),
+    });
+    res.end(body);
+  });
+  const musicPort = await listen(music);
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-cloud-error-relay-"));
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+    musicApiHost: "127.0.0.1",
+    musicApiPort: musicPort,
+  });
+  t.after(async () => {
+    await relay.close();
+    await new Promise((resolve) => music.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  const response = await fetch(`http://127.0.0.1:${relay.port}/api/cloud/123456`);
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("accept-ranges"), null);
+  assert.match(response.headers.get("content-type") || "", /^application\/json/);
+  assert.deepEqual(await response.json(), { error: "paid_required" });
+});
+
 test("room canonicalizes cloud tracks and ignores client transport fields", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-cloud-room-"));
   const relay = await createLanRelay({ port: 0, host: "127.0.0.1", dataDir });
@@ -170,14 +202,32 @@ test("room canonicalizes cloud tracks and ignores client transport fields", asyn
   leader.ws.send(JSON.stringify({ type: "command", action: "seek", position: 42 }));
   await follower.next((message) => message.type === "state" && message.state?.position === 42);
   leader.ws.send(JSON.stringify({ type: "command", action: "play" }));
-  await follower.next((message) => message.type === "state" && message.state?.playing === true);
+  const preparing = await follower.next(
+    (message) => message.type === "state" && message.state?.preparing === true,
+  );
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId: preparing.state.prepareId,
+  }));
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId: preparing.state.prepareId,
+  }));
+  await follower.next(
+    (message) => message.type === "state"
+      && message.state?.playing === true
+      && message.state?.scheduledAt > message.state?.serverTime,
+  );
   leader.ws.send(JSON.stringify({ type: "command", action: "quality", quality: "lossless" }));
   const qualityState = await follower.next(
     (message) => message.type === "state" && message.state?.track?.quality === "lossless",
   );
   assert.equal(qualityState.state.track.id, "cloud-v2-netease-123456-lossless");
   assert.equal(qualityState.state.track.path, "/api/cloud/v2/netease/123456/lossless");
-  assert.equal(qualityState.state.playing, true);
+  assert.equal(qualityState.state.playing, false);
+  assert.equal(qualityState.state.preparing, true);
   assert.ok(qualityState.state.position >= 42);
 
   follower.ws.send(JSON.stringify({ type: "command", action: "quality", quality: "standard" }));
