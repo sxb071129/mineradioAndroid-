@@ -32,7 +32,13 @@ test("classic bundle carries its visual engine and Web bridge", async () => {
   const html = await readFile(path.join(classicRoot, "index.html"), "utf8");
   const bridge = await readFile(path.join(classicRoot, "classic-web-bridge.js"), "utf8");
 
-  assert.match(html, /<script src="classic-web-bridge\.js\?v=20260715-start-barrier-v2"><\/script>/);
+  assert.match(html, /<script src="room-sync-core\.js\?v=20260726-device-center-v1"><\/script>/);
+  assert.match(html, /<script src="classic-web-bridge\.js\?v=20260726-device-center-v1"><\/script>/);
+  assert.ok(
+    html.indexOf('src="room-sync-core.js?v=20260726-device-center-v1"')
+      < html.indexOf('src="classic-web-bridge.js?v=20260726-device-center-v1"'),
+    "shared room sync core must load before the Classic bridge",
+  );
   assert.match(html, /<script src="vendor\/three\.r128\.min\.js"><\/script>/);
   assert.match(html, /MineradioWebBridge\.audioUrl/);
   assert.match(html, /MineradioWebBridge\.coverUrl/);
@@ -89,6 +95,16 @@ test("classic player exposes and wires the LAN room controls", async () => {
     "room-sync-role",
     "room-sync-status",
     "room-sync-devices",
+    "room-service-relay",
+    "room-service-relay-value",
+    "room-service-music",
+    "room-service-music-value",
+    "room-service-room",
+    "room-service-room-value",
+    "room-sync-buffer-label",
+    "room-sync-buffer-bar",
+    "room-sync-device-list",
+    "room-sync-protocol-error",
     "room-sync-input",
     "room-sync-join",
     "room-sync-link",
@@ -103,6 +119,9 @@ test("classic player exposes and wires the LAN room controls", async () => {
   assert.match(html, /\.room-sync-link\{[^}]*user-select:text/);
   assert.match(html, /id="room-sync-panel"[^>]*\sinert>/);
   assert.match(html, /class="room-sync-meta" aria-live="polite"/);
+  assert.match(html, /class="room-service-grid" aria-label="服务状态"/);
+  assert.match(html, /id="room-sync-device-list"[^>]*role="list"/);
+  assert.match(html, /id="room-sync-protocol-error"[^>]*role="alert"[^>]*hidden/);
   assert.match(bridge, /function installRoomSyncUi\(\)/);
   assert.match(bridge, /function updateRoomSyncUi\(\)/);
   assert.match(bridge, /bridge\.sync\.addresses = Array\.isArray\(message\.addresses\)/);
@@ -124,13 +143,33 @@ test("classic player exposes and wires the LAN room controls", async () => {
   assert.match(bridge, /Math\.max\(0\.96, Math\.min\(1\.04, 1 \+ drift \* 0\.3\)\)/);
   assert.match(bridge, /media\.addEventListener\("waiting", onLeaderWaiting\)/);
   assert.match(bridge, /Date\.now\(\) - lastPositionSentAt < 1000/);
-  assert.match(bridge, /sendCommand\("ready", prepareId\)/);
+  assert.match(bridge, /sendCommand\("ready", readyPayload\)/);
   assert.match(bridge, /Number\(state\.scheduledAt\) - \(Date\.now\(\) \+ serverOffset\)/);
   assert.match(bridge, /hasBufferedPlaybackWindow\(media, target\)/);
+  assert.match(bridge, /window\.MineradioRoomSyncCore/);
+  assert.match(bridge, /core\.measureBufferedWindow\(media, target,/);
+  assert.match(bridge, /sendCommand\("device-status", immediate\)/);
+  assert.match(bridge, /bufferedSeconds:\s*measurement\.bufferedSeconds/);
+  assert.match(bridge, /bufferGoalSeconds:\s*measurement\.bufferGoalSeconds/);
+  assert.match(bridge, /Object\.assign\(\{\}, deviceStatus\.payload, \{ ready: true \}\)/);
+  assert.match(bridge, /window\.setInterval\(function \(\) \{\s*reportCurrentRoomDeviceStatus\(false\);\s*\}, 500\)/);
+  assert.match(bridge, /\["loadedmetadata", "durationchange"\]\.forEach[\s\S]*?media\.addEventListener\(eventName/);
+  assert.match(bridge, /checkServiceHealth\("relay", relayHttpOrigin\)/);
+  assert.match(bridge, /checkServiceHealth\("music", apiOrigin\)/);
+  assert.match(bridge, /new URL\("\/health", origin \+ "\/"\)/);
+  assert.match(bridge, /document\.visibilityState === "visible"/);
+  assert.match(bridge, /message\.type === "error"/);
+  assert.match(bridge, /protocolErrorMessage\(message\.code\)/);
   assert.match(bridge, /deferPlayback: true/);
   assert.match(html, /opts\.deferPlayback/);
   assert.match(html, /等待全部设备缓冲就绪，再按统一时刻起播/);
   assert.match(bridge, /installRoomSyncUi\(\);[\s\S]*?connectRoom\(\);/);
+
+  const deviceRenderer = sourceBetween(bridge, "function renderRoomDevices", "function protocolErrorMessage");
+  assert.match(deviceRenderer, /document\.createElement\("div"\)/);
+  assert.match(deviceRenderer, /name\.textContent = String\(device\.name/);
+  assert.match(deviceRenderer, /state\.textContent = stateLabel\.text/);
+  assert.doesNotMatch(deviceRenderer, /\.innerHTML\s*=/);
 });
 
 test("classic media URLs no longer depend on the removed upstream proxy", async () => {
@@ -590,7 +629,7 @@ test("classic room leader aligns changed sources without feeding programmatic se
   const bridge = await readFile(path.join(root, "public", "classic", "classic-web-bridge.js"), "utf8");
   assert.match(bridge, /leaderNeedsAlignment = bridge\.sync\.leader/);
   assert.match(bridge, /state\.preparing \|\| !state\.playing \|\| scheduledInFuture/);
-  assert.match(bridge, /var aligned = Math\.abs\(\(Number\(media\.currentTime\) \|\| 0\) - target\) <= 0\.08/);
+  assert.match(bridge, /var aligned = Math\.abs\(\(Number\(media && media\.currentTime\) \|\| 0\) - target\) <= 0\.08/);
   assert.match(bridge, /function seekForRoomSync\(media, target\)/);
   assert.match(bridge, /if \(suppressNextSeekCommand\)[\s\S]*?reconcileRoomPlayback\(lastRoomState, false\)/);
 });

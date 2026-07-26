@@ -44,6 +44,22 @@ type Options = {
   deviceName: string;
 };
 
+function syncErrorMessage(code: string) {
+  const messages: Record<string, string> = {
+    command_failed: "同步命令执行失败，请稍后重试",
+    invalid_command: "中继无法识别此同步操作，请更新主机 LAN 服务",
+    invalid_json: "同步数据格式错误，请刷新页面后重试",
+    invalid_room: "房间码无效，请使用 4–8 位字母或数字",
+    invalid_track: "这首歌曲无法通过局域网中继播放",
+    leader_only: "只有房间主控可以执行此操作",
+    not_joined: "设备尚未加入房间，正在重新连接",
+    quality_unavailable: "当前歌曲或账号暂不支持所选音质",
+    rate_limited: "操作过快，请稍后再试",
+    room_full: "房间已达到 64 台设备上限",
+  };
+  return messages[code] || `同步服务返回错误：${code}`;
+}
+
 export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options) {
   const [status, setStatus] = useState<SyncStatus>("idle");
   const [state, setState] = useState<RoomState | null>(null);
@@ -157,18 +173,11 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
           offsetRef.current = estimate.offsetMs;
           setLatency(Math.round(estimate.latencyMs));
           setClockQuality({ ready: estimate.initialized, jitterMs: estimate.jitterMs });
-          setState((current) => current ? { ...current } : current);
           return;
         }
         if (message.type === "error") {
           const code = String(message.code || "unknown_error");
-          setError(
-            code === "leader_only"
-              ? "只有房间主控可以操作"
-              : code === "rate_limited"
-                ? "操作太快，请稍后再试"
-                : `同步错误：${code}`,
-          );
+          setError(syncErrorMessage(code));
         }
       });
 

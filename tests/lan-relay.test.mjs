@@ -125,6 +125,18 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
   follower.ws.send(JSON.stringify({ type: "join", room: "ROOM42", name: "Follower" }));
   const followerJoined = await follower.next((message) => message.type === "joined");
   assert.equal(followerJoined.leader, false);
+  assert.deepEqual(
+    followerJoined.state.devices.map((device) => ({
+      name: device.name,
+      leader: device.leader,
+    })),
+    [
+      { name: "Leader", leader: true },
+      { name: "Follower", leader: false },
+    ],
+  );
+  const joinedHealth = await fetch(`${base}/health`).then((response) => response.json());
+  assert.equal(joinedHealth.devices, 2);
 
   // These frames intentionally arrive without waits. The relay must finish the
   // asynchronous local-track validation before applying seek/play.
@@ -171,6 +183,7 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
   );
   assert.equal(scheduledState.state.preparing, false);
   assert.equal(scheduledState.state.updatedAt, scheduledState.state.scheduledAt);
+  const scheduledHardDeadline = relay.rooms.get("ROOM42").prepareMaxDeadline;
 
   follower.ws.send(JSON.stringify({
     type: "command",
@@ -185,6 +198,7 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
       && message.state?.readyCount === 1,
   );
   assert.equal(rescheduledPreparation.state.playing, false);
+  assert.equal(relay.rooms.get("ROOM42").prepareMaxDeadline, scheduledHardDeadline);
   follower.ws.send(JSON.stringify({
     type: "command",
     action: "ready",
@@ -336,6 +350,265 @@ test("room preparation timeout stays paused instead of skipping an unready devic
   );
   assert.equal(timedOut.state.playing, false);
   assert.equal(timedOut.state.scheduledAt, 0);
+  assert.deepEqual(timedOut.state.prepareErrorClientIds, [
+    timedOut.state.devices[0].clientId,
+  ]);
+  assert.equal(timedOut.state.devices[0].name, "Slow device");
+  assert.equal(timedOut.state.devices[0].blocked, true);
+});
+
+test("device buffer telemetry is visible, validated, and extends only within the hard deadline", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-device-status-"));
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+    playbackPrepareTimeoutMs: 400,
+    playbackPrepareMaxTimeoutMs: 1200,
+    playbackPrepareProgressGraceMs: 500,
+  });
+  const leader = connect(`ws://127.0.0.1:${relay.port}/ws`);
+  const follower = connect(`ws://127.0.0.1:${relay.port}/ws`);
+  t.after(async () => {
+    leader.ws.close();
+    follower.ws.close();
+    await relay.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await Promise.all([leader.opened, follower.opened]);
+  const [leaderWelcome, followerWelcome] = await Promise.all([
+    leader.next((message) => message.type === "welcome"),
+    follower.next((message) => message.type === "welcome"),
+  ]);
+  leader.ws.send(JSON.stringify({ type: "join", room: "METER42", name: "Desktop" }));
+  await leader.next((message) => message.type === "joined");
+  follower.ws.send(JSON.stringify({ type: "join", room: "METER42", name: "Phone" }));
+  await follower.next((message) => message.type === "joined");
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "track",
+    track: {
+      id: "cloud-123456",
+      name: "Telemetry Test",
+      type: "audio/mpeg",
+      size: 0,
+      path: "/api/cloud/123456",
+    },
+  }));
+  leader.ws.send(JSON.stringify({ type: "command", action: "play" }));
+  const preparing = await follower.next(
+    (message) => message.type === "state" && message.state?.preparing === true,
+  );
+  const room = relay.rooms.get("METER42");
+  const initialDeadline = room.prepareDeadline;
+  const hardDeadline = room.prepareMaxDeadline;
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-status",
+    prepareId: preparing.state.prepareId,
+    bufferedSeconds: 0.5,
+    bufferGoalSeconds: 8,
+    bufferProgress: 0.99,
+    latencyMs: 99999,
+    jitterMs: 99999,
+    driftMs: -99999,
+    quality: "hires",
+    bufferState: "buffering",
+  }));
+  const firstBarrier = Date.now();
+  follower.ws.send(JSON.stringify({ type: "ping", clientTime: firstBarrier }));
+  await follower.next((message) => message.type === "pong" && message.clientTime === firstBarrier);
+  assert.ok(room.prepareDeadline > initialDeadline);
+  assert.ok(room.prepareDeadline <= hardDeadline);
+  const extendedDeadline = room.prepareDeadline;
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-status",
+    prepareId: preparing.state.prepareId,
+    bufferedSeconds: 0.5,
+    bufferGoalSeconds: 8,
+  }));
+  const repeatedBarrier = Date.now();
+  follower.ws.send(JSON.stringify({ type: "ping", clientTime: repeatedBarrier }));
+  await follower.next((message) => message.type === "pong" && message.clientTime === repeatedBarrier);
+  assert.equal(room.prepareDeadline, extendedDeadline);
+
+  leader.ws.send(JSON.stringify({ type: "command", action: "volume", volume: 0.61 }));
+  const visibleStatus = await leader.next(
+    (message) => message.type === "state" && message.state?.volume === 0.61,
+  );
+  const phone = visibleStatus.state.devices.find((device) => device.clientId === followerWelcome.clientId);
+  assert.equal(phone.name, "Phone");
+  assert.equal(phone.bufferedSeconds, 0.5);
+  assert.equal(phone.bufferGoalSeconds, 8);
+  assert.equal(phone.bufferProgress, 0.0625);
+  assert.equal(phone.latencyMs, 5000);
+  assert.equal(phone.jitterMs, 1000);
+  assert.equal(phone.driftMs, -10000);
+  assert.equal(phone.quality, "hires");
+  assert.equal(visibleStatus.state.prepareDeadline, extendedDeadline);
+  assert.equal(visibleStatus.state.devices.find((device) => device.clientId === leaderWelcome.clientId).leader, true);
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId: preparing.state.prepareId,
+    ready: true,
+    bufferedSeconds: 1,
+    bufferGoalSeconds: 8,
+  }));
+  const insufficientBarrier = Date.now();
+  follower.ws.send(JSON.stringify({ type: "ping", clientTime: insufficientBarrier }));
+  await follower.next((message) => message.type === "pong" && message.clientTime === insufficientBarrier);
+  assert.equal(room.readyClients.has(followerWelcome.clientId), false);
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId: preparing.state.prepareId,
+    ready: true,
+  }));
+  const compatibilityBarrier = Date.now();
+  follower.ws.send(JSON.stringify({ type: "ping", clientTime: compatibilityBarrier }));
+  await follower.next((message) => message.type === "pong" && message.clientTime === compatibilityBarrier);
+  assert.equal(room.readyClients.has(followerWelcome.clientId), false);
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-status",
+    prepareId: preparing.state.prepareId,
+    bufferedSeconds: 1,
+    bufferGoalSeconds: 0,
+  }));
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId: preparing.state.prepareId,
+    ready: true,
+  }));
+  const downgradeBarrier = Date.now();
+  follower.ws.send(JSON.stringify({ type: "ping", clientTime: downgradeBarrier }));
+  await follower.next((message) => message.type === "pong" && message.clientTime === downgradeBarrier);
+  assert.equal(room.readyClients.has(followerWelcome.clientId), false);
+  assert.equal(
+    room.deviceStatus.get(followerWelcome.clientId).bufferContractPrepareId,
+    preparing.state.prepareId,
+  );
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId: preparing.state.prepareId,
+    ready: true,
+    bufferedSeconds: 8,
+    bufferGoalSeconds: 8,
+    latencyMs: 40,
+    jitterMs: 5,
+  }));
+  const readyState = await leader.next(
+    (message) => message.type === "state"
+      && message.state?.prepareId === preparing.state.prepareId
+      && message.state?.readyCount === 1,
+  );
+  assert.equal(readyState.state.devices.find((device) => device.clientId === followerWelcome.clientId).ready, true);
+  assert.ok(room.prepareDeadline <= room.prepareMaxDeadline);
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "track",
+    track: {
+      id: "cloud-654321",
+      name: "Next Track",
+      type: "audio/mpeg",
+      size: 0,
+      path: "/api/cloud/654321",
+    },
+  }));
+  const nextTrack = await leader.next(
+    (message) => message.type === "state" && message.state?.track?.id === "cloud-654321",
+  );
+  const resetPhone = nextTrack.state.devices.find((device) => device.clientId === followerWelcome.clientId);
+  assert.equal(resetPhone.bufferedSeconds, 0);
+  assert.equal(resetPhone.bufferGoalSeconds, 0);
+  assert.equal(resetPhone.bufferState, "");
+  assert.equal(resetPhone.quality, "");
+
+  follower.ws.close();
+  const disconnected = await leader.next(
+    (message) => message.type === "state"
+      && message.state?.deviceCount === 1
+      && message.state?.track?.id === "cloud-654321",
+  );
+  assert.equal(disconnected.state.devices.some((device) => device.clientId === followerWelcome.clientId), false);
+  assert.equal(room.deviceStatus.has(followerWelcome.clientId), false);
+});
+
+test("real buffer progress can cross the soft deadline but never the hard deadline", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-hard-deadline-"));
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+    playbackPrepareTimeoutMs: 200,
+    playbackPrepareMaxTimeoutMs: 700,
+    playbackPrepareProgressGraceMs: 250,
+    roomBroadcastIntervalMs: 25,
+  });
+  const client = connect(`ws://127.0.0.1:${relay.port}/ws`);
+  t.after(async () => {
+    client.ws.close();
+    await relay.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await client.opened;
+  await client.next((message) => message.type === "welcome");
+  client.ws.send(JSON.stringify({ type: "join", room: "CAPS42", name: "Progressing device" }));
+  await client.next((message) => message.type === "joined");
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "track",
+    track: {
+      id: "cloud-123456",
+      name: "Hard Deadline",
+      type: "audio/mpeg",
+      size: 0,
+      path: "/api/cloud/123456",
+    },
+  }));
+  client.ws.send(JSON.stringify({ type: "command", action: "play" }));
+  const preparing = await client.next(
+    (message) => message.type === "state" && message.state?.preparing === true,
+  );
+  const room = relay.rooms.get("CAPS42");
+  const initialSoftDeadline = room.prepareDeadline;
+  const hardDeadline = room.prepareMaxDeadline;
+
+  for (let index = 1; index <= 5; index += 1) {
+    client.ws.send(JSON.stringify({
+      type: "command",
+      action: "device-status",
+      prepareId: preparing.state.prepareId,
+      bufferedSeconds: index * 0.3,
+      bufferGoalSeconds: 8,
+      bufferState: "buffering",
+    }));
+    const barrier = Date.now();
+    client.ws.send(JSON.stringify({ type: "ping", clientTime: barrier }));
+    await client.next((message) => message.type === "pong" && message.clientTime === barrier);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+
+  assert.ok(Date.now() > initialSoftDeadline);
+  assert.equal(room.state.preparing, true);
+  assert.equal(room.prepareMaxDeadline, hardDeadline);
+  assert.ok(room.prepareDeadline <= hardDeadline);
+  const timedOut = await client.next(
+    (message) => message.type === "state" && message.state?.prepareError === "timeout",
+  );
+  assert.equal(timedOut.state.playing, false);
+  assert.equal(timedOut.state.prepareErrorClientIds.length, 1);
 });
 
 test("leader handoff preserves an already-buffered future start", async (t) => {
@@ -400,7 +673,7 @@ test("leader handoff preserves an already-buffered future start", async (t) => {
   assert.equal(promoted.state.position, scheduled.state.position);
 });
 
-test("seeking and late joins restart the synchronized-start barrier", async (t) => {
+test("seeking starts a new attempt while late joins reopen the same bounded barrier", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-barrier-restart-"));
   const relay = await createLanRelay({
     port: 0,
@@ -504,6 +777,7 @@ test("seeking and late joins restart the synchronized-start barrier", async (t) 
       && message.state?.playing === true
       && message.state?.scheduledAt > message.state?.serverTime,
   );
+  const hardDeadlineBeforeLateJoin = relay.rooms.get("EDGE42").prepareMaxDeadline;
 
   const lateDevice = connect(`ws://127.0.0.1:${relay.port}/ws`);
   clients.push(lateDevice);
@@ -511,12 +785,13 @@ test("seeking and late joins restart the synchronized-start barrier", async (t) 
   await lateDevice.next((message) => message.type === "welcome");
   lateDevice.ws.send(JSON.stringify({ type: "join", room: "EDGE42", name: "Late device" }));
   const lateJoin = await lateDevice.next((message) => message.type === "joined");
-  assert.notEqual(lateJoin.state.prepareId, scheduleBeforeLateJoin.state.prepareId);
+  assert.equal(lateJoin.state.prepareId, scheduleBeforeLateJoin.state.prepareId);
   assert.equal(lateJoin.state.preparing, true);
   assert.equal(lateJoin.state.playing, false);
   assert.equal(lateJoin.state.scheduledAt, 0);
-  assert.equal(lateJoin.state.readyCount, 0);
+  assert.equal(lateJoin.state.readyCount, 2);
   assert.equal(lateJoin.state.requiredCount, 3);
+  assert.equal(relay.rooms.get("EDGE42").prepareMaxDeadline, hardDeadlineBeforeLateJoin);
 
   for (const client of [leader, follower, lateDevice]) {
     client.ws.send(JSON.stringify({
@@ -698,4 +973,13 @@ test("joining the current room again is idempotent during playback preparation",
   assert.deepEqual([...room.prepareParticipants], [welcome.clientId]);
   assert.equal(room.readyClients.size, 0);
   assert.equal(room.readyTiming.size, 0);
+
+  for (let index = 0; index < 11; index += 1) {
+    client.ws.send(JSON.stringify({ type: "join", room: "SAME42", name: "Join flood" }));
+  }
+  const limited = await client.next(
+    (message) => message.type === "error" && message.code === "rate_limited",
+  );
+  assert.equal(limited.code, "rate_limited");
+  assert.equal(room.clients.size, 1);
 });

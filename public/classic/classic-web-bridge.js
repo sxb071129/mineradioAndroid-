@@ -284,7 +284,16 @@
       preparing: false,
       readyCount: 0,
       requiredCount: 0,
-      prepareError: ""
+      prepareError: "",
+      bufferProgress: 0,
+      prepareDeadline: 0,
+      prepareMaxDeadline: 0,
+      devices: [],
+      protocolError: "",
+      services: {
+        relay: { state: "checking", latency: 0, detail: "检测中" },
+        music: { state: "checking", latency: 0, detail: "检测中" }
+      }
     }
   };
   window.MineradioWebBridge = bridge;
@@ -332,6 +341,13 @@
   var roomMediaPrimeActive = null;
   var roomMediaUnlockNoticeShown = false;
   var leaderStartRequestPending = null;
+  var lastDeviceStatusSentAt = 0;
+  var pendingDeviceStatus = null;
+  var deviceStatusTimer = 0;
+  var deviceStatusPulseTimer = 0;
+  var serviceHealthTimer = 0;
+  var serviceHealthInFlight = false;
+  var roomDeviceRenderSignature = "";
 
   bridge.shouldDeferRoomPlayback = function () {
     return joinedRoom && bridge.sync.leader;
@@ -379,6 +395,193 @@
     return url.toString();
   }
 
+  function boundedMetric(value, minimum, maximum) {
+    return Math.max(minimum, Math.min(maximum, Number(value) || 0));
+  }
+
+  function serviceState(kind) {
+    var services = bridge.sync.services || {};
+    return services[kind] || { state: "checking", latency: 0, detail: "检测中" };
+  }
+
+  function setServiceState(kind, state, latency, detail) {
+    if (!bridge.sync.services) bridge.sync.services = {};
+    bridge.sync.services[kind] = {
+      state: /^(online|offline|checking)$/.test(String(state || "")) ? String(state) : "offline",
+      latency: boundedMetric(latency, 0, 30000),
+      detail: String(detail || "")
+    };
+    updateRoomSyncUi();
+  }
+
+  function checkServiceHealth(kind, origin) {
+    var startedAt = Date.now();
+    var controller = typeof window.AbortController === "function" ? new window.AbortController() : null;
+    var timeout = window.setTimeout(function () {
+      if (controller) controller.abort();
+    }, 2800);
+    var endpoint;
+    try {
+      endpoint = new URL("/health", origin + "/").toString();
+    } catch {
+      window.clearTimeout(timeout);
+      setServiceState(kind, "offline", 0, "地址无效");
+      return Promise.resolve(false);
+    }
+    return nativeFetch(endpoint, {
+      cache: "no-store",
+      signal: controller ? controller.signal : undefined
+    }).then(function (response) {
+      if (!response.ok) throw new Error("HTTP_" + response.status);
+      return response.json().catch(function () { return {}; });
+    }).then(function (payload) {
+      window.clearTimeout(timeout);
+      if (payload && payload.ok === false) throw new Error("service_unavailable");
+      var latency = Math.max(0, Date.now() - startedAt);
+      setServiceState(kind, "online", latency, "在线 · " + latency + " ms");
+      return true;
+    }).catch(function () {
+      window.clearTimeout(timeout);
+      setServiceState(kind, "offline", 0, "无法访问");
+      return false;
+    });
+  }
+
+  function refreshServiceHealth() {
+    if (document.visibilityState === "hidden" || serviceHealthInFlight) return Promise.resolve(false);
+    serviceHealthInFlight = true;
+    return Promise.all([
+      checkServiceHealth("relay", relayHttpOrigin),
+      checkServiceHealth("music", apiOrigin)
+    ]).then(function (values) {
+      serviceHealthInFlight = false;
+      return values.some(Boolean);
+    }, function () {
+      serviceHealthInFlight = false;
+      return false;
+    });
+  }
+
+  function startServiceHealthPolling() {
+    window.clearInterval(serviceHealthTimer);
+    serviceHealthTimer = window.setInterval(function () {
+      if (document.visibilityState === "visible") refreshServiceHealth();
+    }, 15000);
+    refreshServiceHealth();
+  }
+
+  function updateServiceCard(kind, state, value) {
+    var card = document.getElementById("room-service-" + kind);
+    var text = document.getElementById("room-service-" + kind + "-value");
+    if (!card || !text) return;
+    card.classList.remove("online", "offline", "checking");
+    card.classList.add(state);
+    text.textContent = value;
+    text.title = value;
+  }
+
+  function deviceBufferStateLabel(device) {
+    if (device.blocked || device.bufferState === "error") return { text: "设备异常", className: "error" };
+    if (device.bufferState === "unlock_required") return { text: "需要点击播放", className: "waiting" };
+    if (device.bufferState === "stalled") return { text: "缓冲停滞", className: "error" };
+    if (device.participant && device.ready) return { text: "已就绪", className: "ready" };
+    if (device.bufferState === "ready") return { text: "缓冲充足", className: "ready" };
+    if (device.participant) {
+      var percent = Math.round(boundedMetric(device.bufferProgress, 0, 1) * 100);
+      return { text: "缓冲 " + percent + "%", className: "waiting" };
+    }
+    return { text: device.leader ? "主控设备" : "已连接", className: "" };
+  }
+
+  function appendDeviceStat(container, value) {
+    var item = document.createElement("span");
+    item.textContent = value;
+    container.appendChild(item);
+  }
+
+  function renderRoomDevices() {
+    var list = document.getElementById("room-sync-device-list");
+    if (!list) return;
+    var devices = Array.isArray(bridge.sync.devices) ? bridge.sync.devices : [];
+    var signature;
+    try { signature = clientId + ":" + JSON.stringify(devices); } catch { signature = String(Date.now()); }
+    if (signature === roomDeviceRenderSignature) return;
+    roomDeviceRenderSignature = signature;
+    while (list.firstChild) list.removeChild(list.firstChild);
+    if (!devices.length) {
+      var empty = document.createElement("div");
+      empty.className = "room-sync-device-empty";
+      empty.textContent = bridge.sync.connected ? "房间设备信息同步中" : "连接房间后显示设备状态";
+      list.appendChild(empty);
+      return;
+    }
+    var fragment = document.createDocumentFragment();
+    devices.forEach(function (rawDevice) {
+      var device = rawDevice && typeof rawDevice === "object" ? rawDevice : {};
+      var row = document.createElement("div");
+      row.className = "room-sync-device";
+      row.setAttribute("role", "listitem");
+      if (device.leader) row.classList.add("is-leader");
+      if (device.blocked || device.bufferState === "error" || device.bufferState === "stalled") row.classList.add("is-blocked");
+
+      var top = document.createElement("div");
+      top.className = "room-sync-device-top";
+      var name = document.createElement("span");
+      name.className = "room-sync-device-name";
+      name.textContent = String(device.name || "设备") + (String(device.clientId || "") === clientId ? " · 本机" : "");
+      var stateLabel = deviceBufferStateLabel(device);
+      var state = document.createElement("span");
+      state.className = "room-sync-device-state" + (stateLabel.className ? " " + stateLabel.className : "");
+      state.textContent = stateLabel.text;
+      top.appendChild(name);
+      top.appendChild(state);
+      row.appendChild(top);
+
+      var progress = boundedMetric(device.bufferProgress, 0, 1);
+      var progressTrack = document.createElement("div");
+      progressTrack.className = "room-sync-device-progress";
+      var progressFill = document.createElement("i");
+      progressFill.style.width = Math.round(progress * 100) + "%";
+      progressTrack.appendChild(progressFill);
+      row.appendChild(progressTrack);
+
+      var stats = document.createElement("div");
+      stats.className = "room-sync-device-stats";
+      var bufferedSeconds = boundedMetric(device.bufferedSeconds, 0, 86400);
+      var bufferGoalSeconds = boundedMetric(device.bufferGoalSeconds, 0, 120);
+      if (bufferGoalSeconds > 0) {
+        appendDeviceStat(stats, bufferedSeconds.toFixed(1) + " / " + bufferGoalSeconds.toFixed(1) + " 秒");
+      }
+      appendDeviceStat(stats, "延迟 " + Math.round(boundedMetric(device.latencyMs, 0, 5000)) + " ms");
+      appendDeviceStat(stats, "抖动 " + Math.round(boundedMetric(device.jitterMs, 0, 1000)) + " ms");
+      var drift = Math.max(-10000, Math.min(10000, Number(device.driftMs) || 0));
+      appendDeviceStat(stats, "漂移 " + (drift > 0 ? "+" : "") + Math.round(drift) + " ms");
+      var quality = String(device.quality || "").toUpperCase();
+      if (quality) appendDeviceStat(stats, "音质 " + quality);
+      row.appendChild(stats);
+      fragment.appendChild(row);
+    });
+    list.appendChild(fragment);
+  }
+
+  function protocolErrorMessage(code) {
+    var value = String(code || "unknown");
+    var messages = {
+      invalid_room: "房间码无效，请输入 4–8 位字母或数字",
+      invalid_command: "中继无法识别此同步操作，请更新主机 LAN 服务",
+      invalid_track: "这首歌曲无法通过局域网中继播放",
+      leader_only: "只有房间主控可以执行此操作",
+      not_joined: "设备尚未加入房间，正在尝试重新连接",
+      quality_unavailable: "当前歌曲或账号暂不支持所选音质",
+      rate_limited: "同步指令过于频繁，已自动降低发送频率",
+      room_full: "房间已达到 64 台设备上限",
+      command_failed: "同步指令处理失败，请重试播放",
+      invalid_message: "同步服务收到无法识别的数据",
+      message_too_large: "同步数据超过服务限制"
+    };
+    return messages[value] || ("同步协议错误：" + value);
+  }
+
   function updateRoomSyncUi() {
     var anchor = document.getElementById("room-sync-anchor");
     if (!anchor) return;
@@ -390,6 +593,9 @@
     var devices = document.getElementById("room-sync-devices");
     var dot = document.getElementById("room-sync-meta-dot");
     var link = document.getElementById("room-sync-link");
+    var bufferLabel = document.getElementById("room-sync-buffer-label");
+    var bufferBar = document.getElementById("room-sync-buffer-bar");
+    var protocolError = document.getElementById("room-sync-protocol-error");
     var deviceCount = Math.max(0, Number(bridge.sync.deviceCount) || 0);
     var connected = Boolean(bridge.sync.connected);
     var connectionError = Boolean(bridge.sync.error);
@@ -426,6 +632,33 @@
       link.textContent = shareUrl;
       link.title = shareUrl;
     }
+    var relayService = serviceState("relay");
+    var musicService = serviceState("music");
+    updateServiceCard("relay", relayService.state, relayService.detail || "检测中");
+    updateServiceCard("music", musicService.state, musicService.detail || "检测中");
+    var roomServiceState = connectionError ? "offline" : (connected && joinedRoom ? "online" : "checking");
+    var roomServiceValue = connectionError
+      ? "等待重连"
+      : (connected && joinedRoom
+      ? ((leader ? "主控" : "跟随") + " · " + deviceCount + " 台")
+      : "正在加入");
+    updateServiceCard("room", roomServiceState, roomServiceValue);
+    var scheduledInFuture = Boolean(lastRoomState && lastRoomState.playing)
+      && Number(lastRoomState.scheduledAt) > Date.now() + serverOffset;
+    var bufferProgress = scheduledInFuture ? 1 : boundedMetric(bridge.sync.bufferProgress, 0, 1);
+    if (bufferBar) bufferBar.style.width = Math.round(bufferProgress * 100) + "%";
+    if (bufferLabel) {
+      bufferLabel.textContent = bridge.sync.preparing
+        ? (Math.round(bufferProgress * 100) + "% · " + bridge.sync.readyCount + "/" + Math.max(1, bridge.sync.requiredCount) + " 已就绪")
+        : (bridge.sync.prepareError
+          ? "准备失败"
+          : (scheduledInFuture ? "全部就绪 · 即将同步起播" : "等待播放"));
+    }
+    if (protocolError) {
+      protocolError.hidden = !bridge.sync.protocolError;
+      protocolError.textContent = bridge.sync.protocolError;
+    }
+    renderRoomDevices();
   }
 
   function setRoomPanelOpen(open) {
@@ -439,6 +672,7 @@
     panel.setAttribute("aria-hidden", next ? "false" : "true");
     panel.inert = !next;
     if (next) {
+      refreshServiceHealth();
       window.setTimeout(function () {
         var input = document.getElementById("room-sync-input");
         if (input && panel.classList.contains("open")) input.focus({ preventScroll: true });
@@ -571,18 +805,41 @@
     updateRoomSyncUi();
   }
 
+  function appendDeviceStatusFields(message, value) {
+    var statusValue = value && typeof value === "object" ? value : {};
+    message.prepareId = String(statusValue.prepareId || "");
+    message.bufferedSeconds = boundedMetric(statusValue.bufferedSeconds, 0, 86400);
+    message.bufferGoalSeconds = boundedMetric(statusValue.bufferGoalSeconds, 0, 120);
+    message.latencyMs = boundedMetric(
+      statusValue.latencyMs == null ? bridge.sync.latency : statusValue.latencyMs,
+      0,
+      5000
+    );
+    message.jitterMs = boundedMetric(
+      statusValue.jitterMs == null ? bridge.sync.jitter : statusValue.jitterMs,
+      0,
+      1000
+    );
+    message.driftMs = Math.max(-10000, Math.min(10000, Number(statusValue.driftMs) || 0));
+    var quality = String(statusValue.quality || "").toLowerCase();
+    if (QUALITY_RE.test(quality)) message.quality = quality;
+    var bufferState = String(statusValue.bufferState || "").toLowerCase();
+    if (/^(loading|buffering|ready|stalled|error|unlock_required)$/.test(bufferState)) {
+      message.bufferState = bufferState;
+    }
+  }
+
   function sendCommand(action, value) {
-    var readiness = action === "ready" || action === "start-failed";
+    var readiness = action === "ready" || action === "start-failed" || action === "device-status";
     if ((!readiness && !bridge.sync.leader) || !joinedRoom || !socket || socket.readyState !== WebSocket.OPEN) return false;
     var message = { type: "command", action: action };
     if (action === "track") message.track = value;
     else if (action === "ready") {
       var readyValue = value && typeof value === "object" ? value : { prepareId: value };
-      message.prepareId = String(readyValue.prepareId || "");
+      appendDeviceStatusFields(message, readyValue);
       message.ready = readyValue.ready !== false;
-      message.latencyMs = Math.max(0, Number(bridge.sync.latency) || 0);
-      message.jitterMs = Math.max(0, Number(bridge.sync.jitter) || 0);
     }
+    else if (action === "device-status") appendDeviceStatusFields(message, value);
     else if (action === "start-failed") message.prepareId = String(value || "");
     else if (action === "seek" || action === "progress") {
       message.position = Number(value) || 0;
@@ -595,6 +852,27 @@
     else if (action === "quality") message.quality = String(value || "");
     socket.send(JSON.stringify(message));
     return true;
+  }
+
+  function sendDeviceStatusCommand(value, flush) {
+    pendingDeviceStatus = Object.assign({}, value || {});
+    var elapsed = Date.now() - lastDeviceStatusSentAt;
+    if (flush || elapsed >= 320) {
+      window.clearTimeout(deviceStatusTimer);
+      deviceStatusTimer = 0;
+      var immediate = pendingDeviceStatus;
+      pendingDeviceStatus = null;
+      if (sendCommand("device-status", immediate)) lastDeviceStatusSentAt = Date.now();
+      return;
+    }
+    window.clearTimeout(deviceStatusTimer);
+    deviceStatusTimer = window.setTimeout(function () {
+      deviceStatusTimer = 0;
+      if (!pendingDeviceStatus) return;
+      var trailing = pendingDeviceStatus;
+      pendingDeviceStatus = null;
+      if (sendCommand("device-status", trailing)) lastDeviceStatusSentAt = Date.now();
+    }, Math.max(0, 320 - elapsed));
   }
 
   function sendVolumeCommand(value, flush) {
@@ -1020,14 +1298,77 @@
     playForRoomSync(media, guard.prepareId);
   }
 
-  function hasBufferedPlaybackWindow(media, target) {
-    if (!media || !media.buffered) return false;
-    var duration = Number(media.duration);
-    var requiredEnd = Number.isFinite(duration) ? Math.min(duration, target + 1.2) : target + 1.2;
-    for (var index = 0; index < media.buffered.length; index += 1) {
-      if (media.buffered.start(index) <= target + 0.08 && media.buffered.end(index) >= requiredEnd - 0.05) return true;
+  function measureRoomBufferWindow(media, target) {
+    var core = window.MineradioRoomSyncCore;
+    if (!core || typeof core.measureBufferedWindow !== "function") {
+      bridge.sync.protocolError = "同步缓冲组件未加载，请刷新页面";
+      updateRoomSyncUi();
+      return { bufferedSeconds: 0, bufferGoalSeconds: 8, bufferProgress: 0, ready: false };
     }
-    return false;
+    return core.measureBufferedWindow(media, target, {
+      latencyMs: bridge.sync.latency,
+      jitterMs: bridge.sync.jitter
+    });
+  }
+
+  function hasBufferedPlaybackWindow(media, target) {
+    return measureRoomBufferWindow(media, target).ready;
+  }
+
+  function currentRoomPlaybackQuality(state) {
+    var quality = String(window.playbackQuality || (state && state.track && state.track.quality) || "").toLowerCase();
+    return QUALITY_RE.test(quality) ? quality : "";
+  }
+
+  function roomDeviceStatus(media, state, target, options) {
+    var input = options || {};
+    var measurement = measureRoomBufferWindow(media, target);
+    var aligned = Math.abs((Number(media && media.currentTime) || 0) - target) <= 0.08;
+    var readyState = Number(media && media.readyState) || 0;
+    var bufferState = input.bufferState || "";
+    if (!bufferState) {
+      if (media && media.error) bufferState = "error";
+      else if (readyState < 2) bufferState = "loading";
+      else if (!measurement.ready) bufferState = "buffering";
+      else if (!roomMediaUnlocked) bufferState = "unlock_required";
+      else bufferState = "ready";
+    }
+    var ready = measurement.ready
+      && aligned
+      && readyState >= 3
+      && roomMediaUnlocked
+      && bufferState !== "error"
+      && bufferState !== "stalled";
+    return {
+      measurement: measurement,
+      aligned: aligned,
+      ready: ready,
+      payload: {
+        prepareId: String(state && state.prepareId || ""),
+        bufferedSeconds: measurement.bufferedSeconds,
+        bufferGoalSeconds: measurement.bufferGoalSeconds,
+        latencyMs: bridge.sync.latency,
+        jitterMs: bridge.sync.jitter,
+        driftMs: bridge.sync.drift,
+        quality: currentRoomPlaybackQuality(state),
+        bufferState: ready ? "ready" : bufferState
+      }
+    };
+  }
+
+  function reportCurrentRoomDeviceStatus(flush, bufferState) {
+    var media = window.audio;
+    var state = lastRoomState;
+    if (!media || !state || !state.track) return null;
+    var scheduledInFuture = Boolean(state.playing)
+      && Number(state.scheduledAt) > Date.now() + serverOffset;
+    if (!state.preparing && !scheduledInFuture && !state.playing) return null;
+    var target = targetPosition(state);
+    var duration = Number(media.duration) || 0;
+    if (duration > 0) target = Math.min(target, Math.max(0, duration - 0.05));
+    var status = roomDeviceStatus(media, state, target, { bufferState: bufferState });
+    sendDeviceStatusCommand(status.payload, Boolean(flush));
+    return status;
   }
 
   function seekWhenReady(media, seconds, force) {
@@ -1104,27 +1445,30 @@
       setMediaPlaybackRate(media, 1);
       pauseForRoomSync(media);
       var prepareId = String(state.prepareId || "");
-      var aligned = Math.abs((Number(media.currentTime) || 0) - target) <= 0.08;
-      if (prepareId
-        && prepareId !== lastReadyPrepareId
-        && media.readyState >= 3
-        && aligned
+      resetRoomMediaUnlockFor(media);
+      var deviceStatus = roomDeviceStatus(media, state, target);
+      sendDeviceStatusCommand(deviceStatus.payload, deviceStatus.ready);
+      var readyForBarrier = prepareId
+        && deviceStatus.ready
         && correction.mode !== "seek"
-        && hasBufferedPlaybackWindow(media, target)) {
-        resetRoomMediaUnlockFor(media);
-        if (roomMediaUnlocked) {
-          if (sendCommand("ready", prepareId)) lastReadyPrepareId = prepareId;
-        } else {
-          primeRoomMediaForSync(media, false).then(function (unlocked) {
-            if (!unlocked
-              || media !== window.audio
-              || !lastRoomState
-              || !lastRoomState.preparing
-              || String(lastRoomState.prepareId || "") !== prepareId) return;
-            applyingRoomState = true;
-            try { reconcileRoomPlayback(lastRoomState, false); } finally { applyingRoomState = false; }
-          });
-        }
+        && hasBufferedPlaybackWindow(media, target);
+      if (readyForBarrier && prepareId !== lastReadyPrepareId) {
+        var readyPayload = Object.assign({}, deviceStatus.payload, { ready: true });
+        if (sendCommand("ready", readyPayload)) lastReadyPrepareId = prepareId;
+      } else if (!readyForBarrier && prepareId === lastReadyPrepareId) {
+        sendCommand("ready", Object.assign({}, deviceStatus.payload, { ready: false }));
+        lastReadyPrepareId = "";
+      }
+      if (deviceStatus.measurement.ready && deviceStatus.aligned && !roomMediaUnlocked) {
+        primeRoomMediaForSync(media, false).then(function (unlocked) {
+          if (!unlocked
+            || media !== window.audio
+            || !lastRoomState
+            || !lastRoomState.preparing
+            || String(lastRoomState.prepareId || "") !== prepareId) return;
+          applyingRoomState = true;
+          try { reconcileRoomPlayback(lastRoomState, false); } finally { applyingRoomState = false; }
+        });
       }
       return;
     }
@@ -1158,6 +1502,10 @@
     bridge.sync.readyCount = Math.max(0, Number(state.readyCount) || 0);
     bridge.sync.requiredCount = Math.max(0, Number(state.requiredCount) || 0);
     bridge.sync.prepareError = String(state.prepareError || "");
+    bridge.sync.bufferProgress = boundedMetric(state.bufferProgress, 0, 1);
+    bridge.sync.prepareDeadline = Math.max(0, Number(state.prepareDeadline) || 0);
+    bridge.sync.prepareMaxDeadline = Math.max(0, Number(state.prepareMaxDeadline) || 0);
+    bridge.sync.devices = Array.isArray(state.devices) ? state.devices.slice(0, 64) : [];
     updateRoomSyncUi();
     if (!bridge.sync.clockReady && Number(state.serverTime)) {
       var bootstrapOffset = Number(state.serverTime) - Date.now();
@@ -1298,7 +1646,11 @@
       if (roomMediaPrimeActive === media) return;
       if (lastRoomState && lastRoomState.prepareId
         && (lastRoomState.preparing || Number(lastRoomState.scheduledAt) > Date.now() + serverOffset)) {
-        sendCommand("ready", { prepareId: lastRoomState.prepareId, ready: false });
+        var stalledStatus = reportCurrentRoomDeviceStatus(true, "stalled");
+        sendCommand("ready", Object.assign(
+          { prepareId: lastRoomState.prepareId, ready: false, bufferState: "stalled" },
+          stalledStatus ? stalledStatus.payload : {}
+        ));
         lastReadyPrepareId = "";
       }
       if (applyingRoomState || !bridge.sync.leader || leaderBuffering) return;
@@ -1311,6 +1663,7 @@
     media.addEventListener("waiting", onLeaderWaiting);
     media.addEventListener("stalled", onLeaderWaiting);
     media.addEventListener("canplay", function () {
+      reportCurrentRoomDeviceStatus(true);
       if (lastRoomState && lastRoomState.preparing) {
         applyingRoomState = true;
         try { reconcileRoomPlayback(lastRoomState, false); } finally { applyingRoomState = false; }
@@ -1328,14 +1681,39 @@
       }
     });
     media.addEventListener("progress", function () {
-      if (!lastRoomState || !lastRoomState.preparing) return;
-      applyingRoomState = true;
-      try { reconcileRoomPlayback(lastRoomState, false); } finally { applyingRoomState = false; }
+      reportCurrentRoomDeviceStatus(false);
+      if (lastRoomState && lastRoomState.preparing) {
+        applyingRoomState = true;
+        try { reconcileRoomPlayback(lastRoomState, false); } finally { applyingRoomState = false; }
+      }
     });
     media.addEventListener("error", function () {
       if (!lastRoomState || !lastRoomState.prepareId) return;
-      sendCommand("ready", { prepareId: lastRoomState.prepareId, ready: false });
+      var errorStatus = reportCurrentRoomDeviceStatus(true, "error");
+      sendCommand("ready", Object.assign(
+        { prepareId: lastRoomState.prepareId, ready: false, bufferState: "error" },
+        errorStatus ? errorStatus.payload : {}
+      ));
       lastReadyPrepareId = "";
+    });
+    ["loadedmetadata", "durationchange"].forEach(function (eventName) {
+      media.addEventListener(eventName, function () {
+        reportCurrentRoomDeviceStatus(true);
+        if (!lastRoomState || !lastRoomState.preparing) return;
+        applyingRoomState = true;
+        try { reconcileRoomPlayback(lastRoomState, false); } finally { applyingRoomState = false; }
+      });
+    });
+    ["emptied", "abort"].forEach(function (eventName) {
+      media.addEventListener(eventName, function () {
+        if (!lastRoomState || !lastRoomState.prepareId) return;
+        var loadingStatus = reportCurrentRoomDeviceStatus(true, "loading");
+        sendCommand("ready", Object.assign(
+          { prepareId: lastRoomState.prepareId, ready: false, bufferState: "loading" },
+          loadingStatus ? loadingStatus.payload : {}
+        ));
+        lastReadyPrepareId = "";
+      });
     });
   }
 
@@ -1611,7 +1989,13 @@
     socket.addEventListener("message", function (event) {
       if (generation !== roomConnectionGeneration) return;
       var message;
-      try { message = JSON.parse(String(event.data)); } catch { return; }
+      try {
+        message = JSON.parse(String(event.data));
+      } catch {
+        bridge.sync.protocolError = "同步服务返回了无法解析的数据";
+        updateRoomSyncUi();
+        return;
+      }
       if (message.type === "welcome") {
         clientId = String(message.clientId || "");
         bridge.sync.addresses = Array.isArray(message.addresses) ? message.addresses.map(String) : [];
@@ -1624,9 +2008,15 @@
         if (lastRoomState && !bridge.sync.leader) enqueueRoomState(lastRoomState, generation);
         return;
       }
+      if (message.type === "error") {
+        bridge.sync.protocolError = protocolErrorMessage(message.code);
+        updateRoomSyncUi();
+        return;
+      }
       if (message.type === "joined") {
         joinedRoom = true;
         bridge.sync.leader = Boolean(message.leader);
+        bridge.sync.protocolError = "";
         if (message.state) bridge.sync.deviceCount = Math.max(0, Number(message.state.deviceCount) || 0);
         updateRoomSyncUi();
         if (message.state) enqueueRoomState(message.state, generation);
@@ -1644,6 +2034,7 @@
     socket.addEventListener("error", function () {
       if (generation !== roomConnectionGeneration) return;
       bridge.sync.error = true;
+      bridge.sync.protocolError = "同步连接发生错误，正在自动重连";
       updateRoomSyncUi();
     });
     socket.addEventListener("close", function () {
@@ -1661,6 +2052,10 @@
       bridge.sync.readyCount = 0;
       bridge.sync.requiredCount = 0;
       bridge.sync.prepareError = "";
+      bridge.sync.bufferProgress = 0;
+      bridge.sync.prepareDeadline = 0;
+      bridge.sync.prepareMaxDeadline = 0;
+      bridge.sync.devices = [];
       joinedRoom = false;
       leaderBuffering = false;
       lastReadyPrepareId = "";
@@ -1690,6 +2085,11 @@
       seekSyncTimer = 0;
       pendingSeek = null;
       lastSeekSentAt = 0;
+      window.clearTimeout(deviceStatusTimer);
+      deviceStatusTimer = 0;
+      pendingDeviceStatus = null;
+      lastDeviceStatusSentAt = 0;
+      roomDeviceRenderSignature = "";
       leaderStartRequestPending = null;
       updateRoomSyncUi();
       reconnectAttempt += 1;
@@ -1709,6 +2109,11 @@
     installLocalFileSync();
     installFollowerControlGuards();
     installRoomSyncUi();
+    startServiceHealthPolling();
+    window.clearInterval(deviceStatusPulseTimer);
+    deviceStatusPulseTimer = window.setInterval(function () {
+      reportCurrentRoomDeviceStatus(false);
+    }, 500);
     if (!roomUiInstalled) {
       var roomUiAttempts = 0;
       roomUiRetryTimer = window.setInterval(function () {
@@ -1723,9 +2128,13 @@
     document.addEventListener("visibilitychange", function () {
       if (document.visibilityState !== "visible") return;
       sendClockPing();
+      refreshServiceHealth();
       if (lastRoomState && !bridge.sync.leader) enqueueRoomState(lastRoomState, roomConnectionGeneration);
     });
-    window.addEventListener("online", sendClockPing);
+    window.addEventListener("online", function () {
+      sendClockPing();
+      refreshServiceHealth();
+    });
     connectRoom();
   }
 

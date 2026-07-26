@@ -44,19 +44,23 @@ test("room playback waits for buffered devices and uses the calibrated server st
   const hook = await readFile(new URL("../app/hooks/use-room-sync.ts", import.meta.url), "utf8");
   const relay = await readFile(new URL("../scripts/lan-relay.mjs", import.meta.url), "utf8");
 
-  assert.match(player, /hasBufferedPlaybackWindow\(audio, target\)/);
+  assert.match(player, /measureBufferedWindow\(audio, target/);
+  assert.doesNotMatch(player, /function hasBufferedPlaybackWindow/);
   assert.match(player, /const primeRoomPlayback = useCallback/);
   assert.match(player, /roomPlaybackUnlockedElementRef\.current !== audio[\s\S]*?primeRoomPlayback\(false\)/);
   assert.match(player, /const liveTarget = targetPosition\(\)[\s\S]*?audio\.currentTime = liveTarget/);
-  assert.match(player, /action: "ready"[\s\S]*?latencyMs: roomLatency[\s\S]*?jitterMs: roomClockJitter/);
+  assert.match(player, /action: "device-status"[\s\S]*?bufferedSeconds:[\s\S]*?bufferGoalSeconds:[\s\S]*?driftMs:/);
+  assert.match(player, /action: "ready"[\s\S]*?bufferedSeconds: metrics\.bufferedSeconds[\s\S]*?jitterMs: metrics\.jitterMs/);
+  assert.match(player, /ready: false[\s\S]*?bufferState,[\s\S]*?driftMs: metrics\.driftMs/);
   assert.match(player, /state\.scheduledAt - getRoomServerNow\(\)/);
   assert.match(player, /action: "start-failed"/);
   assert.match(player, /setInterval\(reconcile, 250\)/);
   assert.match(hook, /sampledServerTime: Date\.now\(\) \+ offsetRef\.current/);
+  assert.doesNotMatch(hook, /setState\(\(current\) => current \? \{ \.\.\.current \}/);
   assert.match(relay, /prepareParticipants = new Set/);
   assert.match(relay, /room\.readyClients\.size >= room\.prepareParticipants\.size/);
   assert.match(relay, /room\.playbackStartLeadMs \+ networkLeadMs/);
-  assert.match(relay, /prepareError = "start_failed"|cancelPlaybackPreparation\(room, now, "start_failed"\)/);
+  assert.match(relay, /prepareError = "start_failed"|cancelPlaybackPreparation\(room, now, "start_failed"(?:,|\))/);
   const togglePlayback = player.slice(
     player.indexOf("const togglePlayback"),
     player.indexOf("const unlockAudio"),
@@ -76,6 +80,27 @@ test("modern room controls preserve leader position, final slider values, and sa
   assert.match(player, /onPointerUp=\{\(event\) => seek\(Number\(event\.currentTarget\.value\), true\)\}/);
   assert.match(player, /preferredLanHost\(room\.addresses, url\.hostname\)/);
   assert.match(player, /document\.execCommand\("copy"\)/);
+});
+
+test("modern room drawer exposes service health and per-device diagnostics", async () => {
+  const player = await readFile(new URL("../app/components/MineradioPlayer.tsx", import.meta.url), "utf8");
+  const serviceCenter = await readFile(new URL("../app/components/RoomServiceCenter.tsx", import.meta.url), "utf8");
+  const healthHook = await readFile(new URL("../app/hooks/use-service-health.ts", import.meta.url), "utf8");
+  const syncTypes = await readFile(new URL("../app/lib/sync-types.ts", import.meta.url), "utf8");
+
+  assert.match(player, /<RoomServiceCenter/);
+  assert.match(player, /Music API 地址/);
+  assert.match(serviceCenter, /服务与设备中心/);
+  assert.match(serviceCenter, /device\.bufferProgress/);
+  assert.match(serviceCenter, /device\.latencyMs/);
+  assert.match(serviceCenter, /device\.jitterMs/);
+  assert.match(serviceCenter, /device\.driftMs/);
+  assert.match(serviceCenter, /prepareErrorClientIds/);
+  assert.match(healthHook, /Promise\.all\(\[/);
+  assert.match(healthHook, /url\.pathname = "\/health"/);
+  assert.match(syncTypes, /devices: RoomDeviceState\[\]/);
+  assert.match(syncTypes, /prepareDeadline: number/);
+  assert.match(syncTypes, /action: "device-status"/);
 });
 
 test("Kugou player uses the versioned prepare boundary", async () => {
@@ -101,6 +126,9 @@ test("responsive and accessible fallbacks are present", async () => {
   assert.match(css, /\.mineradio-shell\s*\{[\s\S]*?height:\s*auto;[\s\S]*?overflow:\s*visible;/);
   assert.match(css, /\.home-workspace\s*\{[\s\S]*?height:\s*auto;[\s\S]*?min-height:\s*610px;[\s\S]*?overflow:\s*visible;/);
   assert.match(css, /\.queue-list\s*\{[\s\S]*?overflow-y:\s*auto;/);
+  assert.match(css, /\.room-drawer\s*\{[\s\S]*?overflow:\s*auto;/);
+  assert.match(css, /overscroll-behavior:\s*contain/);
+  assert.match(css, /\.device-metrics\s*\{[\s\S]*?grid-template-columns:/);
 });
 
 test("modern overlays expose modal semantics and make closed popovers inert", async () => {

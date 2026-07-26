@@ -39,7 +39,9 @@ import {
   useRef,
   useState,
 } from "react";
+import { RoomServiceCenter } from "./RoomServiceCenter";
 import { useRoomSync } from "../hooks/use-room-sync";
+import { useServiceHealth } from "../hooks/use-service-health";
 import {
   AUDIO_EFFECTS,
   applyAudioEffect,
@@ -58,8 +60,9 @@ import {
   type RepeatMode,
 } from "../lib/player-queue.mjs";
 import { preferredLanHost } from "../lib/lan-address.mjs";
+import { measureBufferedWindow } from "../lib/room-sync-core";
 import { playbackCorrection } from "../lib/room-sync-timing.mjs";
-import type { PlaybackQuality, TrackDescriptor } from "../lib/sync-types";
+import type { PlaybackQuality, RoomBufferState, TrackDescriptor } from "../lib/sync-types";
 
 type LocalTrack = TrackDescriptor & {
   url: string;
@@ -141,6 +144,7 @@ const MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
 const PLAYER_QUEUE_STORAGE_KEY = "mineradio-player-queue-v2";
 const LIKED_TRACKS_STORAGE_KEY = "mineradio-liked-tracks-v1";
 const ROOM_CONTROL_THROTTLE_MS = 80;
+const ROOM_DEVICE_STATUS_THROTTLE_MS = 400;
 const REPEAT_LABELS: Record<RepeatMode, string> = {
   off: "循环关闭",
   all: "列表循环",
@@ -353,17 +357,6 @@ function formatTime(value: number) {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
-function hasBufferedPlaybackWindow(audio: HTMLAudioElement, target: number) {
-  const requiredEnd = Number.isFinite(audio.duration)
-    ? Math.min(audio.duration, target + 1.2)
-    : target + 1.2;
-  for (let index = 0; index < audio.buffered.length; index += 1) {
-    if (audio.buffered.start(index) <= target + 0.08
-      && audio.buffered.end(index) >= requiredEnd - 0.05) return true;
-  }
-  return false;
-}
-
 function updateRoomInUrl(room: string) {
   const url = new URL(window.location.href);
   if (room) url.searchParams.set("room", room);
@@ -482,6 +475,7 @@ export function MineradioPlayer() {
     seek: { lastSentAt: 0, pending: null, timer: null },
     volume: { lastSentAt: 0, pending: null, timer: null },
   });
+  const roomDeviceStatusRef = useRef({ lastSentAt: 0, signature: "" });
   const queueTransitionRef = useRef<{ autoplay: boolean; position: number } | null>(null);
   const cloudSourceCacheRef = useRef(new Map<string, string>());
   const settingsHydratedRef = useRef(false);
@@ -493,6 +487,11 @@ export function MineradioPlayer() {
     roomCode,
     relayUrl,
     deviceName,
+  });
+  const serviceHealth = useServiceHealth({
+    enabled: roomPanelOpen,
+    musicApiBase: musicApiUrl,
+    relayBase: room.httpBase,
   });
 
   const roomState = room.state;
@@ -1094,10 +1093,68 @@ export function MineradioPlayer() {
       getRoomTargetPosition(state),
       audio.duration || Infinity,
     );
-    const reportReady = () => {
-      if (!state.preparing || !state.prepareId || roomReadyPrepareRef.current === state.prepareId) return;
+    const deviceMetrics = (bufferStateOverride?: RoomBufferState) => {
       const target = targetPosition();
-      if (!Number.isFinite(target) || audio.readyState < 3 || !hasBufferedPlaybackWindow(audio, target)) return;
+      const buffer = measureBufferedWindow(audio, target, {
+        latencyMs: roomLatency,
+        jitterMs: roomClockJitter,
+      });
+      const bufferReady = audio.readyState >= 3 && buffer.ready;
+      const unlocked = roomPlaybackUnlockedElementRef.current === audio;
+      const bufferState: RoomBufferState = bufferStateOverride
+        || (audio.error
+          ? "error"
+          : bufferReady
+            ? unlocked || !state.preparing ? "ready" : "unlock_required"
+            : audio.readyState >= 2 ? "buffering" : "loading");
+      return {
+        bufferedSeconds: buffer.bufferedSeconds,
+        bufferGoalSeconds: buffer.bufferGoalSeconds,
+        bufferState,
+        latencyMs: roomLatency,
+        jitterMs: roomClockJitter,
+        driftMs: Number.isFinite(target)
+          ? Math.round((target - (audio.currentTime || 0)) * 1000)
+          : 0,
+        quality: effectiveQuality,
+        bufferReady,
+      };
+    };
+    const reportDeviceStatus = (bufferStateOverride?: RoomBufferState, force = false) => {
+      const metrics = deviceMetrics(bufferStateOverride);
+      const signature = [
+        state.prepareId,
+        Math.round(metrics.bufferedSeconds * 4),
+        Math.round(metrics.bufferGoalSeconds * 4),
+        metrics.bufferState,
+        Math.round(metrics.driftMs / 10),
+        metrics.quality,
+      ].join(":");
+      const now = Date.now();
+      const previous = roomDeviceStatusRef.current;
+      if (!force && now - previous.lastSentAt < ROOM_DEVICE_STATUS_THROTTLE_MS) return metrics;
+      if (!force && signature === previous.signature && now - previous.lastSentAt < 1500) return metrics;
+      if (sendRoomCommand({
+        action: "device-status",
+        prepareId: state.prepareId || undefined,
+        bufferedSeconds: metrics.bufferedSeconds,
+        bufferGoalSeconds: metrics.bufferGoalSeconds,
+        bufferState: metrics.bufferState,
+        latencyMs: metrics.latencyMs,
+        jitterMs: metrics.jitterMs,
+        driftMs: metrics.driftMs,
+        quality: metrics.quality,
+      })) {
+        roomDeviceStatusRef.current = { lastSentAt: now, signature };
+      }
+      return metrics;
+    };
+    const reportReady = () => {
+      if (!state.preparing || !state.prepareId) return;
+      const target = targetPosition();
+      const metrics = reportDeviceStatus();
+      if (roomReadyPrepareRef.current === state.prepareId) return;
+      if (!Number.isFinite(target) || !metrics.bufferReady) return;
       if (Math.abs((audio.currentTime || 0) - target) > 0.08) {
         if (audio.readyState >= 1) audio.currentTime = target;
         return;
@@ -1112,8 +1169,13 @@ export function MineradioPlayer() {
         action: "ready",
         prepareId: state.prepareId,
         ready: true,
-        latencyMs: roomLatency,
-        jitterMs: roomClockJitter,
+        bufferedSeconds: metrics.bufferedSeconds,
+        bufferGoalSeconds: metrics.bufferGoalSeconds,
+        bufferState: "ready",
+        latencyMs: metrics.latencyMs,
+        jitterMs: metrics.jitterMs,
+        driftMs: metrics.driftMs,
+        quality: metrics.quality,
       })) {
         roomReadyPrepareRef.current = state.prepareId;
       }
@@ -1149,6 +1211,7 @@ export function MineradioPlayer() {
         audio.currentTime = target;
       }
       audio.playbackRate = correction.rate;
+      reportDeviceStatus();
 
       if (state.preparing) {
         if (!audio.paused) audio.pause();
@@ -1179,16 +1242,25 @@ export function MineradioPlayer() {
     const onVisible = () => {
       if (document.visibilityState === "visible") reconcile();
     };
-    const onUnavailable = () => {
+    const onUnavailable = (event: Event) => {
       if (suppressRoomMediaEventsRef.current) return;
+      const bufferState: RoomBufferState = event.type === "error"
+        ? "error"
+        : event.type === "stalled" ? "stalled" : "buffering";
+      const metrics = reportDeviceStatus(bufferState, true);
       if (!state.prepareId || roomReadyPrepareRef.current !== state.prepareId) return;
       if (!state.preparing && (!state.scheduledAt || state.scheduledAt <= getRoomServerNow())) return;
       sendRoomCommand({
         action: "ready",
         prepareId: state.prepareId,
         ready: false,
-        latencyMs: roomLatency,
-        jitterMs: roomClockJitter,
+        bufferedSeconds: metrics.bufferedSeconds,
+        bufferGoalSeconds: metrics.bufferGoalSeconds,
+        bufferState,
+        latencyMs: metrics.latencyMs,
+        jitterMs: metrics.jitterMs,
+        driftMs: metrics.driftMs,
+        quality: metrics.quality,
       });
       roomReadyPrepareRef.current = "";
     };
@@ -1206,10 +1278,15 @@ export function MineradioPlayer() {
     if (!roomIsLeader && state.playing && (!state.scheduledAt || state.scheduledAt <= getRoomServerNow())) {
       correctionTimer = setInterval(reconcile, 250);
     }
+    const diagnosticTimer = setInterval(() => {
+      if (state.preparing) reportReady();
+      else reportDeviceStatus();
+    }, 750);
     return () => {
       disposed = true;
       if (startTimer) clearTimeout(startTimer);
       if (correctionTimer) clearInterval(correctionTimer);
+      clearInterval(diagnosticTimer);
       audio.removeEventListener("loadedmetadata", onReady);
       audio.removeEventListener("canplay", onReady);
       audio.removeEventListener("canplaythrough", onReady);
@@ -1223,6 +1300,7 @@ export function MineradioPlayer() {
     };
   }, [
     audioSource,
+    effectiveQuality,
     getRoomServerNow,
     getRoomTargetPosition,
     mode,
@@ -1994,12 +2072,16 @@ export function MineradioPlayer() {
     "--progress": `${duration ? Math.min(1, progress / duration) : 0}`,
   } as CSSProperties;
 
+  const waitingRoomDevices = (roomState?.devices || [])
+    .filter((device) => device.participant && !device.ready);
   const syncLabel =
     mode === "solo"
       ? "仅本机"
       : room.status === "connected"
         ? room.state?.preparing
-          ? `等待缓冲 · ${room.state.readyCount}/${room.state.requiredCount || 1}`
+          ? waitingRoomDevices.length
+            ? `等待 ${waitingRoomDevices[0].name} · ${Math.round(waitingRoomDevices[0].bufferProgress * 100)}%`
+            : `等待缓冲 · ${room.state.readyCount}/${room.state.requiredCount || 1}`
           : room.state?.prepareError
             ? "同步启动失败 · 请重试"
             : `${room.isLeader ? "主控" : "跟随"} · ${room.state?.deviceCount || 1} 台设备`
@@ -2409,9 +2491,27 @@ export function MineradioPlayer() {
           </div>
         )}
 
+        <RoomServiceCenter
+          clientId={mode === "room" ? room.clientId : ""}
+          clockReady={mode === "room" && room.clockReady}
+          localJitterMs={room.clockJitter}
+          localLatencyMs={room.latency}
+          musicApiBase={musicApiUrl}
+          musicApiHealth={serviceHealth.musicApi}
+          relayBase={room.httpBase || relayUrl}
+          relayHealth={serviceHealth.relay}
+          roomCode={mode === "room" ? roomCode : ""}
+          roomError={mode === "room" ? room.error : ""}
+          roomIsLeader={mode === "room" && room.isLeader}
+          roomState={mode === "room" ? roomState : null}
+          roomStatus={mode === "room" ? room.status : "idle"}
+          onRefresh={serviceHealth.refresh}
+        />
+
         <details className="relay-settings">
-          <summary><GearSix size={17} aria-hidden="true" />局域网中继设置</summary>
+          <summary><GearSix size={17} aria-hidden="true" />服务地址与设备设置</summary>
           <label><span>中继地址</span><input value={relayUrl} onChange={(event) => setRelayUrl(event.target.value)} spellCheck="false" /></label>
+          <label><span>Music API 地址</span><input value={musicApiUrl} onChange={(event) => setMusicApiUrl(event.target.value)} spellCheck="false" /></label>
           <label><span>设备名称</span><input value={deviceName} onChange={(event) => setDeviceName(event.target.value.slice(0, 32))} /></label>
           <p>主机运行桌面启动脚本后，同一 Wi‑Fi 的设备使用主机 IP 即可加入。</p>
         </details>
