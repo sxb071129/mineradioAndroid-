@@ -7,8 +7,10 @@
 <meta name="referrer" content="no-referrer">
 <link rel="icon" href="/mineradio-tile-art.png" type="image/png">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700;900&family=Inter:wght@200;300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700;900&family=UnifrakturCook:wght@700&display=swap" rel="stylesheet">
-<script src="room-sync-core.js?v=20260726-device-center-v1"></script>
-<script src="classic-web-bridge.js?v=20260726-device-center-v1"></script>
+<script src="vendor/qrcode.min.js?v=1.5.4"></script>
+<script src="room-sync-core.js?v=20260726-calibration-v1"></script>
+<script src="classic-web-bridge.js?v=20260730-sync-v2"></script>
+<script src="sonic-terrain.js?v=20260730-v1"></script>
 <script src="vendor/three.r128.min.js"></script>
 <script src="vendor/music-tempo.min.js"></script>
 <script src="vendor/gsap.min.js"></script>
@@ -469,6 +471,19 @@ body.empty-home-active #home-btn{border-color:rgba(255,83,103,.36);background:rg
 .room-sync-device-progress{height:3px;margin-top:8px;overflow:hidden;border-radius:99px;background:rgba(255,255,255,.065)}
 .room-sync-device-progress i{display:block;width:0;height:100%;border-radius:inherit;background:rgba(var(--fc-accent-rgb),.72);transition:width .24s}
 .room-sync-device-stats{display:flex;flex-wrap:wrap;gap:4px 9px;margin-top:7px;font-size:8.5px;color:rgba(255,255,255,.34)}
+.room-device-calibration{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:end;margin-top:9px;padding-top:9px;border-top:1px solid rgba(255,255,255,.055)}
+.room-device-calibration-field{min-width:0}
+.room-device-calibration-label{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:5px;font-size:8px;color:rgba(255,255,255,.42)}
+.room-device-calibration-label output{color:rgba(255,255,255,.72);font-variant-numeric:tabular-nums}
+.room-device-calibration input[type=range]{display:block;width:100%;height:15px;margin:0;accent-color:rgb(var(--fc-accent-rgb));cursor:pointer}
+.room-device-calibration-reset{height:27px;padding:0 8px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.035);color:rgba(255,255,255,.52);font:8.5px/1 inherit;cursor:pointer}
+.room-device-calibration-reset:hover{border-color:rgba(var(--fc-accent-rgb),.28);color:#fff;background:rgba(var(--fc-accent-rgb),.08)}
+.room-sync-qr-wrap{display:grid;grid-template-columns:96px minmax(0,1fr);gap:12px;align-items:center;margin:0 0 14px;padding:11px;border:1px solid rgba(255,255,255,.07);border-radius:14px;background:rgba(255,255,255,.025)}
+#room-sync-qr{display:block;width:96px;height:96px;padding:5px;border-radius:10px;background:#fff;image-rendering:pixelated}
+.room-sync-qr-copy{min-width:0}
+.room-sync-qr-copy strong{display:block;margin-bottom:5px;font-size:10px;color:rgba(255,255,255,.82)}
+.room-sync-qr-copy p{margin:0;font-size:9px;line-height:1.5;color:rgba(255,255,255,.40)}
+#room-sync-qr-status{display:block;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px;color:rgba(var(--fc-accent-rgb),.72)}
 .room-sync-protocol-error{margin:0 0 12px;padding:9px 11px;border:1px solid rgba(255,102,119,.22);border-radius:11px;background:rgba(255,102,119,.065);font-size:9.5px;line-height:1.45;color:#ffadb6}
 .room-sync-field-label{display:block;margin:0 2px 7px;font-size:10px;letter-spacing:.08em;color:rgba(255,255,255,.48)}
 .room-sync-join{display:grid;grid-template-columns:minmax(0,1fr) 74px;gap:8px}
@@ -2088,6 +2103,8 @@ body.immersive-mode .mobile-gesture-btn{opacity:0!important;visibility:hidden!im
   body.mobile-optimized #room-sync-panel,body.android-shell #room-sync-panel{top:calc(env(safe-area-inset-top,0px) + 64px);bottom:calc(env(safe-area-inset-bottom,0px) + 10px);left:max(10px,env(safe-area-inset-left,0px));right:max(10px,env(safe-area-inset-right,0px));width:auto;max-height:none;padding:16px;overflow-y:auto;-webkit-overflow-scrolling:touch}
   .room-service-grid{gap:6px}
   .room-service-card{padding:9px 8px}
+  .room-device-calibration{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px 10px}
+  .room-device-calibration-reset{grid-column:1/-1;height:36px}
   .room-sync-btn{height:44px}
   #room-sync-input{height:44px}
   .room-sync-close{width:44px;height:44px}
@@ -2393,6 +2410,14 @@ body.mobile-optimized #user-capsule-hide-btn,body.mobile-optimized #fx-fab-hide-
     <div class="room-sync-buffer-head"><span>总体缓冲</span><strong id="room-sync-buffer-label">等待播放</strong></div>
     <div class="room-sync-buffer-track" aria-hidden="true"><i id="room-sync-buffer-bar"></i></div>
   </div>
+  <div class="room-sync-qr-wrap">
+    <img id="room-sync-qr" width="192" height="192" alt="局域网同步房间二维码">
+    <div class="room-sync-qr-copy">
+      <strong>扫码加入此房间</strong>
+      <p>同一局域网设备扫描后会直接打开当前房间，不经过外部二维码服务。</p>
+      <span id="room-sync-qr-status" role="status" aria-live="polite">正在本地生成</span>
+    </div>
+  </div>
   <div class="room-sync-device-heading"><span>房间设备</span><span>缓冲 / 网络 / 音质</span></div>
   <div id="room-sync-device-list" class="room-sync-device-list" role="list"></div>
   <div id="room-sync-protocol-error" class="room-sync-protocol-error" role="alert" hidden></div>
@@ -2504,6 +2529,15 @@ body.mobile-optimized #user-capsule-hide-btn,body.mobile-optimized #fx-fab-hide-
   <div class="fx-slider"><label>封面清晰度</label><input id="fx-coverres" type="range" min="0.75" max="1.55" step="0.01"><output></output></div>
   <div class="fx-slider"><label>镜头晃动</label><input id="fx-cineshake" type="range" min="0" max="1.8" step="0.01"><output></output></div>
   <div class="fx-slider"><label>歌词溢光</label><input id="fx-lyricglow" type="range" min="0" max="0.85" step="0.01"><output></output></div>
+  <div class="fx-section-label">音域地形</div>
+  <div class="fx-seg" id="sonic-terrain-theme-seg" aria-label="音域地形配色">
+    <button type="button" data-sonic-terrain-theme="cover">封面取色</button>
+    <button type="button" data-sonic-terrain-theme="aurora">极光</button>
+    <button type="button" data-sonic-terrain-theme="ocean">深海</button>
+    <button type="button" data-sonic-terrain-theme="mono">单色</button>
+  </div>
+  <div class="fx-slider"><label>地形律动</label><input id="fx-sonicterrainintensity" type="range" min="0.4" max="2.5" step="0.01"><output></output></div>
+  <div class="fx-slider"><label>频谱响应</label><input id="fx-sonicterrainresponse" type="range" min="0.35" max="2" step="0.01"><output></output></div>
 
   <div class="fx-fold" id="fx-lyric-fold">
     <div class="fx-fold-head" onclick="document.getElementById('fx-lyric-fold').classList.toggle('open')">
@@ -3113,7 +3147,7 @@ body.mobile-optimized #user-capsule-hide-btn,body.mobile-optimized #fx-fab-hide-
 // ============================================================
 //  Global State
 // ============================================================
-var audio = null, audioCtx = null, source = null, analyser = null, beatAnalyser = null, gainNode = null, audioReady = false;
+var audio = null, audioCtx = null, source = null, analyser = null, beatAnalyser = null, gainNode = null, roomCalibrationGainNode = null, roomCalibrationLimiterNode = null, roomCalibrationDelayNode = null, audioReady = false;
 var uiSfxCtx = null, lastShelfSelectSfxAt = 0;
 var FFT_SIZE = 2048;
 var frequencyData = new Uint8Array(FFT_SIZE / 2);
@@ -3152,6 +3186,8 @@ var audioFadeTimer = null, audioElementFadeFrame = 0, audioFadeSerial = 0;
 var AUDIO_FADE_IN_MS = 460;
 var AUDIO_FADE_OUT_MS = 420;
 var AUDIO_SILENCE_GAIN = 0.0001;
+var ROOM_DEVICE_CALIBRATION_STORE_KEY = 'mineradio-room-device-calibration-v1';
+var roomDeviceCalibration = readRoomDeviceCalibrationPreference();
 var userPlaylists = [], qqPlaylists = [], kugouPlaylists = [], myPodcastCollections = [], myPodcastItems = {}, playlistCoverCache = {};
 var CUSTOM_COVER_STORE_KEY = 'mineradio-custom-covers';
 var CUSTOM_LYRIC_STORE_KEY = 'mineradio-custom-lyrics-v1';
@@ -3342,7 +3378,18 @@ function updateUserCapsuleAutoHideFromPointer(x, y) {
     document.body.classList.remove('user-capsule-peek');
     return;
   }
-  var nearTopRight = x > innerWidth - 112 && y < 126;
+  // Keep the capsule revealed while the pointer crosses from the edge trigger
+  // onto one of its own controls. A fixed 112 px zone is narrower than the
+  // full cluster when DIY is present, which otherwise makes the DIY button
+  // disappear immediately before it can be clicked.
+  var capsule = document.getElementById('top-right');
+  var rect = capsule ? capsule.getBoundingClientRect() : null;
+  var insideCapsule = !!(rect && rect.width > 0 && rect.height > 0
+    && x >= Math.max(0, rect.left - 12)
+    && x <= Math.min(innerWidth, rect.right + 12)
+    && y >= Math.max(0, rect.top - 16)
+    && y <= Math.min(innerHeight, rect.bottom + 16));
+  var nearTopRight = (x > innerWidth - 112 && y < 126) || insideCapsule;
   document.body.classList.toggle('user-capsule-peek', nearTopRight);
 }
 function applyFxFabAutoHideState(opts) {
@@ -3640,13 +3687,16 @@ function maybeAnnounceDjMode() {
 
 // fx 状态: 预设 + 主滑块 + 开关 + 三态
 var fxDefaults = {
-  preset: 0,            // 0=emily cover, 1=tunnel, 2=orbit, 3=void, 4=vinyl, 5=wallpaper, 6=skull
+  preset: 0,            // 0=emily cover, 1=tunnel, 2=orbit, 3=void, 4=vinyl, 5=wallpaper, 6=skull, 7=sonic terrain
   intensity: 0.85,
   cinemaShake: 0.5,
   depth: 1.0,
   coverResolution: 1.55,
   point: 1.0, speed: 1.0, twist: 0.0, color: 1.10, scatter: 0.0, bgFade: 0.20,
   bloomStrength: 0.62,
+  sonicTerrainIntensity: 1.15,
+  sonicTerrainResponse: 1.10,
+  sonicTerrainTheme: 'cover',
   lyricGlowStrength: 0.28,
   lyricScale: 1.0,
   lyricOffsetX: 0,
@@ -3729,6 +3779,9 @@ var PACKAGED_DEFAULT_FX_SNAPSHOT = Object.freeze({
   scatter: 0,
   bgFade: 0.2,
   bloomStrength: 0.62,
+  sonicTerrainIntensity: 1.15,
+  sonicTerrainResponse: 1.10,
+  sonicTerrainTheme: 'cover',
   lyricGlowStrength: 0.28,
   lyricScale: 1,
   lyricOffsetX: 0,
@@ -3830,7 +3883,7 @@ function readSavedPlaybackVisualPreset() {
   try {
     var raw = JSON.parse(localStorage.getItem(LYRIC_LAYOUT_STORE_KEY) || '{}') || {};
     if (!Object.prototype.hasOwnProperty.call(raw, 'preset')) return fxDefaults.preset;
-    var savedPreset = clampRange(Number(raw.preset) || 0, 0, 6);
+    var savedPreset = clampRange(Number(raw.preset) || 0, 0, 7);
     if (savedPreset === 3 && raw.visualPresetSchema !== VISUAL_PRESET_SCHEMA) savedPreset = 5;
     return savedPreset;
   } catch (e) {
@@ -7367,6 +7420,7 @@ function destroyFloatLayer() {
 //  安魂 — 3D 粒子建模层
 // ============================================================
 var SKULL_PRESET_INDEX = 6;
+var SONIC_TERRAIN_PRESET_INDEX = 7;
 var SKULL_MODEL_BASE_ROTATION_X = -0.26;
 var SKULL_MODEL_BASE_ROTATION_Y = 0.00;
 var SKULL_MODEL_SCALE = 2.34;
@@ -8458,7 +8512,7 @@ function readSavedLyricLayout() {
   try {
     var savedLayoutRaw = localStorage.getItem(LYRIC_LAYOUT_STORE_KEY);
     var raw = savedLayoutRaw ? (JSON.parse(savedLayoutRaw) || {}) : packagedDefaultLyricLayoutRaw();
-    var savedPreset = clampRange(Number(raw.preset) || 0, 0, 6);
+    var savedPreset = clampRange(Number(raw.preset) || 0, 0, 7);
     if (savedPreset === 3 && raw.visualPresetSchema !== VISUAL_PRESET_SCHEMA) {
       savedPreset = 5;
     }
@@ -8487,6 +8541,9 @@ function readSavedLyricLayout() {
       scatter: clampRange(finiteFxNumber(raw.scatter, fxDefaults.scatter), 0, 0.5),
       bgFade: clampRange(finiteFxNumber(raw.bgFade, fxDefaults.bgFade), 0, 1.2),
       bloomStrength: clampRange(finiteFxNumber(raw.bloomStrength, fxDefaults.bloomStrength), 0, 1.6),
+      sonicTerrainIntensity: clampRange(finiteFxNumber(raw.sonicTerrainIntensity, fxDefaults.sonicTerrainIntensity), 0.4, 2.5),
+      sonicTerrainResponse: clampRange(finiteFxNumber(raw.sonicTerrainResponse, fxDefaults.sonicTerrainResponse), 0.35, 2.0),
+      sonicTerrainTheme: normalizeSonicTerrainTheme(raw.sonicTerrainTheme),
       lyricGlowStrength: clampRange(finiteFxNumber(raw.lyricGlowStrength, fxDefaults.lyricGlowStrength), 0, 0.85),
       lyricScale: clampRange(Number(raw.lyricScale) || 1, 0.35, 1.65),
       lyricOffsetX: clampRange(Number(raw.lyricOffsetX) || 0, -2.0, 2.0),
@@ -8582,6 +8639,9 @@ function saveLyricLayout() {
       scatter: clampRange(finiteFxNumber(fx.scatter, fxDefaults.scatter), 0, 0.5),
       bgFade: clampRange(finiteFxNumber(fx.bgFade, fxDefaults.bgFade), 0, 1.2),
       bloomStrength: clampRange(finiteFxNumber(fx.bloomStrength, fxDefaults.bloomStrength), 0, 1.6),
+      sonicTerrainIntensity: clampRange(finiteFxNumber(fx.sonicTerrainIntensity, fxDefaults.sonicTerrainIntensity), 0.4, 2.5),
+      sonicTerrainResponse: clampRange(finiteFxNumber(fx.sonicTerrainResponse, fxDefaults.sonicTerrainResponse), 0.35, 2.0),
+      sonicTerrainTheme: normalizeSonicTerrainTheme(fx.sonicTerrainTheme),
       lyricGlowStrength: clampRange(finiteFxNumber(fx.lyricGlowStrength, fxDefaults.lyricGlowStrength), 0, 0.85),
       lyricScale: clampRange(Number(fx.lyricScale) || 1, 0.35, 1.65),
       lyricOffsetX: clampRange(Number(fx.lyricOffsetX) || 0, -2.0, 2.0),
@@ -8679,6 +8739,10 @@ function normalizeDesktopLyricsFps(value) {
   if (n <= 45) return 30;
   if (n <= 90) return 60;
   return 120;
+}
+function normalizeSonicTerrainTheme(value) {
+  value = String(value || '').toLowerCase();
+  return /^(cover|aurora|ocean|mono)$/.test(value) ? value : fxDefaults.sonicTerrainTheme;
 }
 function normalizeShelfCameraMode(value) {
   return String(value || '') === 'static' ? 'static' : 'dynamic';
@@ -14082,7 +14146,9 @@ function makeShelfManager() {
   var openCardIdx = -1;       // 已打开内容框的卡片 (-1 表示无)
   var contentList = null;     // 二级 PSP 滚动列表 manager
   var connectorParticles = null;
-  var floorMirror = null;
+  function shelfPointerSelectionForegroundActive() {
+    return selectedIdx >= 0 && !document.body.classList.contains('cursor-hidden');
+  }
 
   // 一次性返回完整 items 数组 (不只 5 张, 全部参与 PSP 滚动)
   function splitPlaylists() {
@@ -14395,12 +14461,6 @@ function makeShelfManager() {
       if (connectorParticles.material) connectorParticles.material.dispose();
       connectorParticles = null;
     }
-    if (floorMirror) {
-      if (floorMirror.parent) floorMirror.parent.remove(floorMirror);
-      if (floorMirror.geometry) floorMirror.geometry.dispose();
-      if (floorMirror.material) floorMirror.material.dispose();
-      floorMirror = null;
-    }
     allItems = currentItems();
     lastSig = sig(allItems);
     lastCardRedrawAt = -10;
@@ -14452,7 +14512,7 @@ function makeShelfManager() {
       var nowT = uniforms.uTime.value;
       var hoverBreath = (!shelfPinnedOpen && !detailOpenSide) ? shelfVisibility : 0;
       var passiveAlways = shelfAlwaysVisible() && !shelfPinnedOpen && !detailOpenSide;
-      var liftTarget = card.selected && !detailOpenSide ? 1 : 0;
+      var liftTarget = card.selected && shelfPointerSelectionForegroundActive() && !detailOpenSide ? 1 : 0;
       var liftRate = liftTarget > (card.floatMix || 0) ? 0.20 : 0.13;
       card.floatMix = (card.floatMix || 0) + (liftTarget - (card.floatMix || 0)) * liftRate;
       if (!liftTarget && card.floatMix < 0.004) card.floatMix = 0;
@@ -14613,20 +14673,6 @@ void main(){ vec4 t = texture2D(uDotTex, gl_PointCoord); if (t.a < 0.02) discard
     connectorParticles.renderOrder = 49;
     connectorParticles.position.set(0, -2.2, 0);
     if (group.parent) group.parent.add(connectorParticles); else scene.add(connectorParticles);
-    // 底部地面反射
-    var mGeo = new THREE.PlaneGeometry(10, 1.8);
-    var mCanvas = document.createElement('canvas'); mCanvas.width = 256; mCanvas.height = 64;
-    var mctx = mCanvas.getContext('2d');
-    var mg = mctx.createLinearGradient(0, 0, 0, 64);
-    mg.addColorStop(0, 'rgba(255,255,255,0.07)'); mg.addColorStop(1, 'rgba(255,255,255,0)');
-    mctx.fillStyle = mg; mctx.fillRect(0, 0, 256, 64);
-    var mTex = new THREE.CanvasTexture(mCanvas);
-    mTex.generateMipmaps = false;
-    var mMat = new THREE.MeshBasicMaterial({ map: mTex, transparent:true, depthWrite:false, opacity:0.55 });
-    floorMirror = new THREE.Mesh(mGeo, mMat);
-    floorMirror.position.set(0, -2.85, 0.4);
-    floorMirror.rotation.x = -Math.PI / 2;
-    if (group.parent) group.parent.add(floorMirror); else scene.add(floorMirror);
   }
 
   function sig(items) {
@@ -14759,7 +14805,6 @@ void main(){ vec4 t = texture2D(uDotTex, gl_PointCoord); if (t.a < 0.02) discard
       if (m === 'off') {
         if (group) { scene.remove(group); cards.forEach(function(c){ c.texture.dispose(); c.mesh.material.dispose(); c.mesh.geometry.dispose(); }); }
         if (connectorParticles) { scene.remove(connectorParticles); connectorParticles.geometry.dispose(); connectorParticles.material.dispose(); connectorParticles = null; }
-        if (floorMirror) { scene.remove(floorMirror); floorMirror.geometry.dispose(); floorMirror.material.dispose(); floorMirror = null; }
         group = null; cards = [];
         if (contentList) contentList.close();
         return;
@@ -14796,11 +14841,12 @@ void main(){ vec4 t = texture2D(uDotTex, gl_PointCoord); if (t.a < 0.02) discard
       if (shelfVisibility < 0.01 && targetVis === 0) shelfVisibility = 0;
       group.visible = appRevealed && (mode !== 'side' || shelfVisibility > 0) && (allItems.length > 0 || (contentList && contentList.isOpen()));
       if (connectorParticles) connectorParticles.visible = group.visible && mode === 'stage';
-      if (floorMirror) floorMirror.visible = group.visible && mode === 'stage';
       if (mode === 'side') {
-        var passiveAlwaysGroup = shelfAlwaysVisible() && !shelfPinnedOpen && !(contentList && contentList.isOpen());
-        var liftedCardActive = passiveAlwaysGroup && cards.some(function(c){ return c.selected || (c.floatMix || 0) > 0.025; });
-        group.renderOrder = passiveAlwaysGroup && !liftedCardActive ? 30 : 50;
+        var contentOpenForLayer = !!(contentList && contentList.isOpen());
+        var passiveAlwaysGroup = shelfAlwaysVisible() && !shelfPinnedOpen && !contentOpenForLayer;
+        var pointerSelectionForeground = shelfPointerSelectionForegroundActive();
+        var liftedCardActive = passiveAlwaysGroup && cards.some(function(c){ return (pointerSelectionForeground && c.selected) || (c.floatMix || 0) > 0.025; });
+        group.renderOrder = (contentOpenForLayer || shelfPinnedOpen || liftedCardActive) ? 300 : 30;
         group.position.set(0, 0, 0);
         var bindToCover = shelfAlwaysVisible() && particles && particles.rotation && !(contentList && contentList.isOpen());
         if (bindToCover) {
@@ -14813,7 +14859,7 @@ void main(){ vec4 t = texture2D(uDotTex, gl_PointCoord); if (t.a < 0.02) discard
           group.rotation.z += (0 - group.rotation.z) * 0.045;
         }
       } else {
-        group.renderOrder = 50;
+        group.renderOrder = ((contentList && contentList.isOpen()) || selectedIdx >= 0) ? 300 : 30;
         var t = uniforms.uTime.value;
         group.position.y = Math.sin(t * 0.3) * 0.04;
         group.position.x = px * 0.10;
@@ -18939,6 +18985,68 @@ async function doSearch(q, opts) {
 // ============================================================
 //  音频上下文 & 频谱分析
 // ============================================================
+function normalizeRoomDeviceCalibration(value) {
+  value = value && typeof value === 'object' ? value : {};
+  return {
+    volumeTrimDb: Math.round(clampRange(Number(value.volumeTrimDb) || 0, -24, 12) * 2) / 2,
+    delayMs: Math.round(clampRange(Number(value.delayMs) || 0, 0, 500) / 5) * 5
+  };
+}
+function readRoomDeviceCalibrationPreference() {
+  try {
+    return normalizeRoomDeviceCalibration(JSON.parse(localStorage.getItem(ROOM_DEVICE_CALIBRATION_STORE_KEY) || '{}'));
+  } catch (e) {
+    return { volumeTrimDb: 0, delayMs: 0 };
+  }
+}
+function saveRoomDeviceCalibrationPreference(value) {
+  try { localStorage.setItem(ROOM_DEVICE_CALIBRATION_STORE_KEY, JSON.stringify(value)); } catch (e) {}
+}
+function roomCalibrationLinearGain() {
+  return Math.pow(10, roomDeviceCalibration.volumeTrimDb / 20);
+}
+function calibratedElementVolume(value) {
+  return clampRange((Number(value) || 0) * roomCalibrationLinearGain(), 0, 1);
+}
+function applyRoomCalibrationNodes(immediate) {
+  var linearGain = roomCalibrationLinearGain();
+  var delaySeconds = roomDeviceCalibration.delayMs / 1000;
+  if (roomCalibrationGainNode && roomCalibrationGainNode.gain && audioCtx) {
+    var now = audioCtx.currentTime || 0;
+    roomCalibrationGainNode.gain.cancelScheduledValues(now);
+    if (immediate) roomCalibrationGainNode.gain.setValueAtTime(linearGain, now);
+    else roomCalibrationGainNode.gain.setTargetAtTime(linearGain, now, 0.025);
+  }
+  if (roomCalibrationDelayNode && roomCalibrationDelayNode.delayTime && audioCtx) {
+    var delayNow = audioCtx.currentTime || 0;
+    roomCalibrationDelayNode.delayTime.cancelScheduledValues(delayNow);
+    if (immediate) roomCalibrationDelayNode.delayTime.setValueAtTime(delaySeconds, delayNow);
+    else roomCalibrationDelayNode.delayTime.setTargetAtTime(delaySeconds, delayNow, 0.025);
+  }
+  if (audio && !gainNode) audio.volume = calibratedElementVolume(targetVolume);
+}
+function applyRoomDeviceCalibration(volumeTrimDb, delayMs, options) {
+  options = options || {};
+  roomDeviceCalibration = normalizeRoomDeviceCalibration({
+    volumeTrimDb: volumeTrimDb,
+    delayMs: delayMs
+  });
+  if (options.persist !== false) saveRoomDeviceCalibrationPreference(roomDeviceCalibration);
+  applyRoomCalibrationNodes(Boolean(options.immediate));
+  return {
+    volumeTrimDb: roomDeviceCalibration.volumeTrimDb,
+    delayMs: roomDeviceCalibration.delayMs
+  };
+}
+function getRoomDeviceCalibration() {
+  return {
+    volumeTrimDb: roomDeviceCalibration.volumeTrimDb,
+    delayMs: roomDeviceCalibration.delayMs
+  };
+}
+window.applyRoomDeviceCalibration = applyRoomDeviceCalibration;
+window.getRoomDeviceCalibration = getRoomDeviceCalibration;
+
 function initAudio() {
   if (audioReady) return;
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -18946,6 +19054,14 @@ function initAudio() {
   analyser = audioCtx.createAnalyser();
   beatAnalyser = audioCtx.createAnalyser();
   gainNode = audioCtx.createGain();
+  roomCalibrationGainNode = audioCtx.createGain();
+  roomCalibrationLimiterNode = audioCtx.createDynamicsCompressor();
+  roomCalibrationDelayNode = audioCtx.createDelay(0.55);
+  roomCalibrationLimiterNode.threshold.value = -1;
+  roomCalibrationLimiterNode.knee.value = 0;
+  roomCalibrationLimiterNode.ratio.value = 20;
+  roomCalibrationLimiterNode.attack.value = 0.003;
+  roomCalibrationLimiterNode.release.value = 0.12;
   analyser.fftSize = FFT_SIZE;
   analyser.smoothingTimeConstant = 0.58;
   beatAnalyser.fftSize = BEAT_FFT_SIZE;
@@ -18953,7 +19069,11 @@ function initAudio() {
   source.connect(analyser);
   source.connect(beatAnalyser);
   analyser.connect(gainNode);
-  gainNode.connect(audioCtx.destination);
+  gainNode.connect(roomCalibrationGainNode);
+  roomCalibrationGainNode.connect(roomCalibrationLimiterNode);
+  roomCalibrationLimiterNode.connect(roomCalibrationDelayNode);
+  roomCalibrationDelayNode.connect(audioCtx.destination);
+  applyRoomCalibrationNodes(true);
   applyVolumeToAudio();
   frequencyData.fill(0);
   beatFrequencyData.fill(0);
@@ -19093,7 +19213,7 @@ function setAudioOutputGainImmediate(value) {
     gainNode.gain.cancelScheduledValues(now);
     gainNode.gain.setValueAtTime(value, now);
   } else if (audio) {
-    audio.volume = value;
+    audio.volume = calibratedElementVolume(value);
   }
 }
 function rampAudioOutputGain(value, durationMs) {
@@ -19112,6 +19232,7 @@ function rampAudioOutputGain(value, durationMs) {
     return;
   }
   if (!audio) return;
+  value = calibratedElementVolume(value);
   var from = currentAudioOutputGain();
   var started = performance.now();
   function tickAudioFade(nowMs) {
@@ -19161,7 +19282,7 @@ function fadeOutAndPauseAudio() {
 function applyVolumeToAudio() {
   if (audio) {
     audio.muted = false;
-    audio.volume = gainNode ? 1 : targetVolume;
+    audio.volume = gainNode ? 1 : calibratedElementVolume(targetVolume);
   }
   if (gainNode && audioCtx) {
     var now = audioCtx.currentTime || 0;
@@ -19475,7 +19596,24 @@ function nextUnblockedQueueIndex(idx) {
   }
   return -1;
 }
+function isRoomControlledPlayback(opts) {
+  try {
+    if (
+      window.MineradioPlaybackRecovery &&
+      typeof window.MineradioPlaybackRecovery.isRoomAuthoritative === 'function' &&
+      window.MineradioPlaybackRecovery.isRoomAuthoritative()
+    ) return true;
+  } catch (e) {}
+  // If the recovery layer is still loading (or an older cached copy is
+  // present), explicitly injected follower state must remain fail-closed.
+  // Once the current layer is available, one-device HOME can fall back safely.
+  return !!(opts && opts.roomSync);
+}
 function skipFailedQueueItem(idx, token, message) {
+  // A browser that joined a room must never autonomously replace or advance
+  // its own queue. The relay's leader and preparation barrier remain the
+  // only source of playback authority.
+  if (isRoomControlledPlayback()) return;
   hideLoading();
   if (token !== trackSwitchToken) return;
   markQueueItemPlaybackFailed(idx);
@@ -19494,6 +19632,7 @@ function skipFailedQueueItem(idx, token, message) {
 }
 async function tryAutoPlaybackFallback(song, data, idx, token, opts) {
   opts = opts || {};
+  if (isRoomControlledPlayback(opts)) return false;
   if (opts.fallbackDepth > 0) {
     skipFailedQueueItem(idx, token, '自动换源后的版本仍不可播，正在播放下一首。');
     return true;
@@ -19506,8 +19645,12 @@ async function tryAutoPlaybackFallback(song, data, idx, token, opts) {
   showSourceFallbackNotice('正在自动换源', fromLabel + ' 当前不可播，正在查找 ' + targetLabel + ' 的同名同歌手版本。');
   try {
     var alternate = await searchAlternatePlatformSong(song);
-    if (token !== trackSwitchToken) return true;
+    // Joining a room while the alternate search was in flight transfers
+    // playback authority to the room leader. Do not mutate this device's
+    // queue or initiate a second local playback path after that point.
+    if (token !== trackSwitchToken || isRoomControlledPlayback(opts)) return true;
     if (!alternate) {
+      if (isRoomControlledPlayback(opts)) return true;
       if (category === 'login_required') return false;
       skipFailedQueueItem(idx, token, '没有找到同名同歌手的 ' + targetLabel + ' 版本，正在播放下一首。');
       return true;
@@ -19520,7 +19663,7 @@ async function tryAutoPlaybackFallback(song, data, idx, token, opts) {
     await playQueueAt(idx, { fallbackDepth: 1 });
     return true;
   } catch (e) {
-    if (token !== trackSwitchToken) return true;
+    if (token !== trackSwitchToken || isRoomControlledPlayback(opts)) return true;
     skipFailedQueueItem(idx, token, '自动换源搜索失败，正在播放下一首。');
     return true;
   }
@@ -21376,6 +21519,7 @@ var presetMeta = [
   { name: '唱片', desc: '唱片 · 圆形封面' },
   { name: '星河', desc: '壁纸粒子 · 音乐律动' },
   { name: '安魂', desc: '骷髅·YUI7W', descHtml: '骷髅·<span class="pc-yui7w">YUI7W</span>' },
+  { name: '音域地形', desc: '频谱地形 · 封面取色' },
 ];
 var presetIcons = [
   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 14c3-2 5-2 8 0s5 2 8 0M3 10c3-2 5-2 8 0s5 2 8 0M3 18c3-2 5-2 8 0s5 2 8 0"/></svg>',
@@ -21385,8 +21529,9 @@ var presetIcons = [
   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.4"/><path d="M16.5 5.2c2.1.9 3.4 2.4 4 4.5"/><path d="M18.8 3.2l1.5 4.8"/></svg>',
   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 15c2.2-4.4 4.4-4.4 6.6 0s4.4 4.4 6.6 0S20.6 10.6 23 15"/><path d="M3 9c2.2 2.2 4.4 2.2 6.6 0s4.4-2.2 6.6 0S20.6 11.2 23 9"/><circle cx="12" cy="12" r="1.7" fill="currentColor"/></svg>',
   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3.2h4v6.2h4.2v3.8H14v7.6h-4v-7.6H5.8V9.4H10z"/></svg>',
+  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17.5c2.1-4.2 4.2-4.2 6.3 0s4.2 4.2 6.3 0 4.2-4.2 5.4 0"/><path d="M3 12.2c2.1-3.1 4.2-3.1 6.3 0s4.2 3.1 6.3 0 4.2-3.1 5.4 0"/><path d="M3 7.2h18"/></svg>',
 ];
-var presetDisplayOrder = [0, 6, 5, 4, 2, 1, 3];
+var presetDisplayOrder = [0, 6, 5, 7, 4, 2, 1, 3];
 var lyricColorPresets = [
   { name:'雾蓝', color:'#a9b8c8' },
   { name:'银蓝', color:'#9db8cf' },
@@ -21452,6 +21597,9 @@ function normalizeFxArchiveSnapshot(raw) {
     scatter: archiveNumber(raw, 'scatter', fxDefaults.scatter, 0, 0.5),
     bgFade: archiveNumber(raw, 'bgFade', fxDefaults.bgFade, 0, 1.2),
     bloomStrength: archiveNumber(raw, 'bloomStrength', fxDefaults.bloomStrength, 0, 1.6),
+    sonicTerrainIntensity: archiveNumber(raw, 'sonicTerrainIntensity', fxDefaults.sonicTerrainIntensity, 0.4, 2.5),
+    sonicTerrainResponse: archiveNumber(raw, 'sonicTerrainResponse', fxDefaults.sonicTerrainResponse, 0.35, 2.0),
+    sonicTerrainTheme: archiveMode(raw, 'sonicTerrainTheme', /^(cover|aurora|ocean|mono)$/, fxDefaults.sonicTerrainTheme),
     lyricGlowStrength: archiveNumber(raw, 'lyricGlowStrength', fxDefaults.lyricGlowStrength, 0, 0.85),
     lyricScale: archiveNumber(raw, 'lyricScale', fxDefaults.lyricScale, 0.35, 1.65),
     lyricOffsetX: archiveNumber(raw, 'lyricOffsetX', fxDefaults.lyricOffsetX, -2.0, 2.0),
@@ -22850,7 +22998,10 @@ function setPreset(p, opts) {
   fx.preset = p;
   if (changed && prev === SKULL_PRESET_INDEX && p !== SKULL_PRESET_INDEX) clearSkullPresetResidue();
   if (p === SKULL_PRESET_INDEX) loadSkullParticleAsset(changed);
-  uniforms.uPreset.value = p;
+  uniforms.uPreset.value = p === SONIC_TERRAIN_PRESET_INDEX ? 5 : p;
+  if (changed && window.MineradioSonicTerrain && typeof window.MineradioSonicTerrain.onPresetChange === 'function') {
+    try { window.MineradioSonicTerrain.onPresetChange(prev, p); } catch (e) {}
+  }
   refreshPresetGrid();
   if (changed && !opts.skipTransition) triggerPresetParticleTransition(prev, p);
   // 每个预设对应的相机基线 (改 userOrbit)
@@ -22861,8 +23012,9 @@ function setPreset(p, opts) {
     else if (p === 4) { orbit.userRadius = 6.5; orbit.userPhi = 0.04; orbit.userTheta = 0.0; orbit.baselineRadius = 6.5; orbit.baselinePhi = 0.04; }
     else if (p === 5) { orbit.userRadius = 9.4; orbit.userPhi = 0.34; orbit.userTheta = -0.52; orbit.baselineRadius = 9.4; orbit.baselinePhi = 0.34; }
     else if (p === 6) { orbit.userRadius = 7.4; orbit.userPhi = 0.10; orbit.userTheta = 0.18; orbit.baselineRadius = 7.4; orbit.baselinePhi = 0.10; }
+    else if (p === SONIC_TERRAIN_PRESET_INDEX) { orbit.userRadius = 8.3; orbit.userPhi = 0.18; orbit.userTheta = -0.16; orbit.baselineRadius = 8.3; orbit.baselinePhi = 0.18; }
     else              { orbit.userRadius = 6.6; orbit.userPhi = 0.08; orbit.userTheta = 0.0; orbit.baselineRadius = 6.6; orbit.baselinePhi = 0.08; }
-    orbit.baselineTheta = p === 5 ? -0.52 : (p === 6 ? 0.18 : 0.0);
+    orbit.baselineTheta = p === 5 ? -0.52 : (p === 6 ? 0.18 : (p === SONIC_TERRAIN_PRESET_INDEX ? -0.16 : 0.0));
   }
   if (changed && !opts.silent) showToast('视觉预设: ' + presetMeta[p].name);
   if (typeof updateFxApplicabilityControls === 'function') updateFxApplicabilityControls();
@@ -22876,8 +23028,25 @@ function setPreset(p, opts) {
   }
 }
 
+function updateSonicTerrainControls() {
+  fx.sonicTerrainTheme = normalizeSonicTerrainTheme(fx.sonicTerrainTheme);
+  fx.sonicTerrainIntensity = clampRange(finiteFxNumber(fx.sonicTerrainIntensity, fxDefaults.sonicTerrainIntensity), 0.4, 2.5);
+  fx.sonicTerrainResponse = clampRange(finiteFxNumber(fx.sonicTerrainResponse, fxDefaults.sonicTerrainResponse), 0.35, 2.0);
+  document.querySelectorAll('#sonic-terrain-theme-seg [data-sonic-terrain-theme]').forEach(function(btn){
+    var active = btn.getAttribute('data-sonic-terrain-theme') === fx.sonicTerrainTheme;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+}
+function setSonicTerrainTheme(theme, silent) {
+  fx.sonicTerrainTheme = normalizeSonicTerrainTheme(theme);
+  updateSonicTerrainControls();
+  saveLyricLayout();
+  if (!silent) showToast('音域地形配色: ' + ({ cover:'封面取色', aurora:'极光', ocean:'深海', mono:'单色' }[fx.sonicTerrainTheme] || '封面取色'));
+}
+
 function syncFxUniforms() {
-  uniforms.uPreset.value = fx.preset;
+  uniforms.uPreset.value = fx.preset === SONIC_TERRAIN_PRESET_INDEX ? 5 : fx.preset;
   uniforms.uIntensity.value = fx.intensity;
   uniforms.uDepth.value = fx.depth;
   uniforms.uPointScale.value = fx.point;
@@ -23147,6 +23316,8 @@ function updateFxInputs() {
   setRange('fx-depth', fx.depth);
   setRange('fx-coverres', fx.coverResolution);
   setRange('fx-lyricglow', fx.lyricGlowStrength);
+  setRange('fx-sonicterrainintensity', fx.sonicTerrainIntensity);
+  setRange('fx-sonicterrainresponse', fx.sonicTerrainResponse);
   setRange('fx-bgopacity', fx.backgroundOpacity == null ? 1 : fx.backgroundOpacity);
   setRange('fx-glassaberration', fx.controlGlassChromaticOffset);
   setRange('fx-desktoplyricssize', fx.desktopLyricsSize);
@@ -23177,6 +23348,7 @@ function updateFxInputs() {
   setRange('fx-scatter', fx.scatter);
   setRange('fx-bgfade', fx.bgFade);
   updateLyricGlowControls();
+  updateSonicTerrainControls();
   // 同步开关
   var floatToggle = document.getElementById('t-float');
   if (floatToggle) floatToggle.classList.toggle('on', fx.floatLayer);
@@ -23247,6 +23419,7 @@ function resetFxSliderValue(id, key, btn) {
   setRange(id, fx[key]);
   if (key === 'coverResolution') applyCoverParticleResolution(fx[key], { reload: true });
   if (key === 'controlGlassChromaticOffset') applyControlGlassChromaticOffset();
+  if (key === 'sonicTerrainIntensity' || key === 'sonicTerrainResponse') updateSonicTerrainControls();
   syncFxUniforms();
   if (key === 'backgroundOpacity') updateCustomBackgroundControls();
   if (/^shelf(Size|OffsetX|OffsetY|OffsetZ|AngleY|Opacity|BgOpacity)$/.test(key) && shelfManager && shelfManager.refreshTheme) shelfManager.refreshTheme();
@@ -23303,6 +23476,7 @@ function fxPanelTargetForNode(node, current) {
   if (node.classList.contains('lyric-color-row') || node.classList.contains('cover-color-pop') || node.classList.contains('color-lab-pop') || node.classList.contains('cover-color-loupe')) return 'appearance';
   if (inputId === 'fx-bgopacity' || inputId === 'fx-glassaberration') return 'appearance';
   if (inputId === 'fx-lyricglow') return 'lyrics';
+  if (id === 'sonic-terrain-theme-seg' || /^fx-sonicterrain/.test(inputId)) return 'motion';
   if (/^fx-(intensity|depth|coverres|cineshake)$/.test(inputId)) return 'motion';
   return current || 'presets';
 }
@@ -23866,7 +24040,7 @@ function bindFxPanel() {
   renderUserFxArchives();
   buildLyricColorControls();
   var ids = [
-    ['fx-intensity','intensity'],['fx-depth','depth'],['fx-coverres','coverResolution'],['fx-cineshake','cinemaShake'],['fx-lyricglow','lyricGlowStrength'],['fx-bgopacity','backgroundOpacity'],['fx-glassaberration','controlGlassChromaticOffset'],
+    ['fx-intensity','intensity'],['fx-depth','depth'],['fx-coverres','coverResolution'],['fx-cineshake','cinemaShake'],['fx-lyricglow','lyricGlowStrength'],['fx-sonicterrainintensity','sonicTerrainIntensity'],['fx-sonicterrainresponse','sonicTerrainResponse'],['fx-bgopacity','backgroundOpacity'],['fx-glassaberration','controlGlassChromaticOffset'],
     ['fx-desktoplyricssize','desktopLyricsSize'],['fx-desktoplyricsopacity','desktopLyricsOpacity'],['fx-desktoplyricsy','desktopLyricsY'],['fx-wallpaperopacity','wallpaperOpacity'],
     ['fx-shelfsize','shelfSize'],['fx-shelfx','shelfOffsetX'],['fx-shelfy','shelfOffsetY'],['fx-shelfz','shelfOffsetZ'],['fx-shelfangle','shelfAngleY'],['fx-shelfopacity','shelfOpacity'],['fx-shelfbgalpha','shelfBgOpacity'],
     ['fx-lyricspacing','lyricLetterSpacing'],['fx-lyriclineheight','lyricLineHeight'],['fx-lyricweight','lyricWeight'],
@@ -23910,6 +24084,8 @@ function bindFxPanel() {
       if (pair[1] === 'desktopLyricsOpacity') fx.desktopLyricsOpacity = clampRange(fx.desktopLyricsOpacity, 0.28, 1);
       if (pair[1] === 'desktopLyricsY') fx.desktopLyricsY = clampRange(fx.desktopLyricsY, 0.08, 0.92);
       if (pair[1] === 'wallpaperOpacity') fx.wallpaperOpacity = clampRange(fx.wallpaperOpacity, 0.35, 1);
+      if (pair[1] === 'sonicTerrainIntensity') fx.sonicTerrainIntensity = clampRange(fx.sonicTerrainIntensity, 0.4, 2.5);
+      if (pair[1] === 'sonicTerrainResponse') fx.sonicTerrainResponse = clampRange(fx.sonicTerrainResponse, 0.35, 2.0);
       if (pair[1] === 'shelfSize') fx.shelfSize = clampRange(fx.shelfSize, 0.65, 1.45);
       if (pair[1] === 'shelfOffsetX') fx.shelfOffsetX = clampRange(fx.shelfOffsetX, -1.2, 1.2);
       if (pair[1] === 'shelfOffsetY') fx.shelfOffsetY = clampRange(fx.shelfOffsetY, -0.9, 0.9);
@@ -23930,10 +24106,14 @@ function bindFxPanel() {
       if (pair[1] === 'lyricLetterSpacing' || pair[1] === 'lyricLineHeight' || pair[1] === 'lyricWeight' || pair[1] === 'lyricScale' || pair[1] === 'lyricGlowStrength') pushDesktopLyricsState(true);
       if (/^(desktopLyricsSize|desktopLyricsOpacity|desktopLyricsY)$/.test(pair[1])) pushDesktopLyricsState(true);
       if (pair[1] === 'wallpaperOpacity') pushWallpaperState(true);
+      if (pair[1] === 'sonicTerrainIntensity' || pair[1] === 'sonicTerrainResponse') updateSonicTerrainControls();
       updateFxApplicabilityControls();
       syncAllFxTogglePressedStates();
       saveLyricLayout();
     });
+  });
+  document.querySelectorAll('#sonic-terrain-theme-seg [data-sonic-terrain-theme]').forEach(function(btn){
+    btn.addEventListener('click', function(){ setSonicTerrainTheme(btn.getAttribute('data-sonic-terrain-theme')); });
   });
   var lyricPicker = document.getElementById('lyric-color-picker');
   if (lyricPicker) {
@@ -29384,6 +29564,24 @@ function animate() {
   updateSkullParticleLayer(dt);
   updateStageLyrics3D(dt);
   syncDesktopOverlayState();
+  if (window.MineradioSonicTerrain) {
+    if (document.body.classList.contains('render-deep-sleep') || document.body.classList.contains('splash-active')) {
+      window.MineradioSonicTerrain.clear();
+    } else {
+      window.MineradioSonicTerrain.update(dt, {
+        fx: fx,
+        frequencyData: frequencyData,
+        bass: bass,
+        mid: mid,
+        treble: treble,
+        beat: beatPulse,
+        energy: audioEnergy,
+        playing: playing,
+        palette: stageLyrics && (stageLyrics.coverPalette || stageLyrics.palette),
+        coverColor: fx.visualTintColor
+      });
+    }
+  }
 
   // 缩略图脉动
   if (currentIdx >= 0) {
@@ -29397,5 +29595,6 @@ function animate() {
 }
 animate();
 </script>
+<script src="playback-recovery.js?v=20260730-v2"></script>
 </body>
 </html>

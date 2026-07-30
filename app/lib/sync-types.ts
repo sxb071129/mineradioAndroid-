@@ -35,6 +35,8 @@ export type RoomDeviceState = {
   driftMs: number;
   quality: PlaybackQuality | "";
   bufferState: RoomBufferState;
+  volumeTrimDb: number;
+  delayMs: number;
   updatedAt: number;
 };
 
@@ -79,6 +81,8 @@ export type RoomCommand =
       jitterMs?: number;
       driftMs?: number;
       quality?: PlaybackQuality;
+      volumeTrimDb?: number;
+      delayMs?: number;
     }
   | {
       action: "device-status";
@@ -90,8 +94,16 @@ export type RoomCommand =
       jitterMs?: number;
       driftMs?: number;
       quality?: PlaybackQuality;
+      volumeTrimDb?: number;
+      delayMs?: number;
     }
   | { action: "start-failed"; prepareId: string }
+  | {
+      action: "device-calibration";
+      targetClientId: string;
+      volumeTrimDb: number;
+      delayMs: number;
+    }
   | { action: "volume"; volume: number }
   | { action: "quality"; quality: PlaybackQuality }
   | { action: "track"; track: TrackDescriptor };

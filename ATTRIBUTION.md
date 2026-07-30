@@ -22,7 +22,13 @@ The Mineradio name, MR Logo, interface visual design, startup-animation directio
 
 - Web adaptation created on 2026-07-13.
 - The implementation replaces the Electron/Node monolith with a vinext/React website, a separate LAN relay, and a restricted local music adapter.
+- The 2026-07-30 web player update was a compatibility review of
+  `XxHuberrr/Mineradio` `v2.0.3` (`7974c52270c628d7ddb7427eaa0269e024cc0d3f`).
+  Its Sonic Terrain effect and bounded solo recovery are clean-room web
+  adaptations of functional behavior; no upstream visual asset, bundled
+  runtime, server, account-cookie flow, or provider/decryption code was copied.
 - The local adapter uses the open-source [NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) package and a restricted Kugou protocol adapter based on the upstream GPL implementation; it is not an official API or endorsement from either platform.
+- The locally bundled QR renderer is [node-qrcode](https://github.com/soldair/node-qrcode) 1.5.4, retained with its MIT notice in `public/classic/vendor/qrcode.min.js`.
 - Original visual resources required by the retained classic interface, together with the author support material already present in `sxb071129/mineradioweb`, remain bundled with their attribution. No upstream account Cookie, token, third-party album content, or platform authorization is bundled.
 - The target repository's historical notes record that the splash animation was inspired by and partially adapted from `ShipSwiftAnimatedLoop`, including its highlighted line-field, RGB channel offset, angular wobble, and warp-distance-field ideas. The target repository did not record a source URL or license for that reference; this provenance note is retained so downstream distributors can verify it before further reuse.
 - User-generated login credentials remain in the operating system's local application-state directory (for example `%LOCALAPPDATA%\Mineradio\accounts` on Windows), outside the project. Users are responsible for music-platform terms and for playing or sharing only audio they have the right to use.

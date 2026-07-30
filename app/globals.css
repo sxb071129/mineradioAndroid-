@@ -813,6 +813,91 @@ input:disabled {
   opacity: 0.42;
 }
 
+.queue-transition-settings {
+  display: grid;
+  gap: 13px;
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid rgba(132, 177, 255, 0.16);
+  border-radius: 16px;
+  background: linear-gradient(145deg, rgba(65, 108, 255, 0.07), rgba(0, 245, 212, 0.025));
+}
+
+.queue-transition-heading,
+.queue-crossfade-control > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.queue-transition-heading > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.queue-transition-heading span {
+  color: rgba(146, 184, 255, 0.8);
+  font: 700 8px/1 var(--font-mono);
+  letter-spacing: 0.14em;
+}
+
+.queue-transition-heading strong {
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 12px;
+}
+
+.queue-transition-heading button {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--dim);
+  background: rgba(255, 255, 255, 0.035);
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.queue-transition-heading button.is-active {
+  border-color: rgba(0, 245, 212, 0.25);
+  color: var(--mint);
+  background: rgba(0, 245, 212, 0.07);
+}
+
+.queue-crossfade-control {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.queue-crossfade-control strong {
+  color: rgba(255, 255, 255, 0.76);
+  font: 650 9px/1 var(--font-mono);
+}
+
+.queue-crossfade-control input {
+  width: 100%;
+  accent-color: var(--mint);
+}
+
+.queue-crossfade-control input:disabled {
+  opacity: 0.35;
+}
+
+.queue-transition-settings > p {
+  margin: 0;
+  color: var(--dim);
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.queue-transition-settings > p.is-ready {
+  color: rgba(133, 255, 230, 0.78);
+}
+
 .queue-list {
   display: flex;
   min-height: 0;
@@ -1032,6 +1117,59 @@ input:disabled {
   background: rgba(255, 255, 255, 0.04);
   cursor: pointer;
   font-size: 12px;
+}
+
+.room-join-qr {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: center;
+  gap: 13px;
+  margin-top: 6px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(0, 245, 212, 0.12);
+}
+
+.room-join-qr > img,
+.room-join-qr > div {
+  width: 112px;
+  height: 112px;
+  border-radius: 14px;
+}
+
+.room-join-qr > img {
+  padding: 6px;
+  background: #fff;
+  object-fit: contain;
+}
+
+.room-join-qr > div {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.24);
+  text-align: center;
+}
+
+.room-join-qr > div span {
+  font-size: 10px;
+}
+
+.room-join-qr > div small {
+  max-width: 12ch;
+  color: var(--dim);
+  font-size: 8px;
+  line-height: 1.35;
+}
+
+.room-join-qr > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.6;
 }
 
 .room-stats {
@@ -1396,6 +1534,59 @@ input:disabled {
   font: 650 8.5px/1.25 var(--font-mono);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.device-calibration-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  color: var(--dim);
+  font-size: 9.5px;
+}
+
+.device-calibration-summary strong {
+  color: rgba(210, 238, 255, 0.75);
+  font: 650 9px/1 var(--font-mono);
+}
+
+.device-calibration-controls {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid rgba(132, 177, 255, 0.11);
+  border-radius: 11px;
+  background: rgba(69, 111, 255, 0.035);
+}
+
+.device-calibration-controls label {
+  display: grid;
+  grid-template-columns: 66px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  color: var(--dim);
+  font-size: 9px;
+}
+
+.device-calibration-controls input {
+  width: 100%;
+  accent-color: var(--mint);
+}
+
+.device-calibration-controls button {
+  justify-self: end;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  cursor: pointer;
+  font-size: 9px;
 }
 
 .relay-settings {
@@ -2372,6 +2563,7 @@ input:disabled {
   .join-room-row button { min-height: 46px; }
   .room-code-card { grid-template-columns: 1fr; }
   .room-code-card button { min-height: 40px; justify-content: center; }
+  .room-join-qr { grid-template-columns: 1fr; justify-items: center; text-align: center; }
   .dock-transport { gap: 3px; }
 }
 

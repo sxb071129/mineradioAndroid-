@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
 import type { PlaybackQuality, RoomDeviceState, RoomState, SyncStatus } from "../lib/sync-types";
 import type { ServiceHealthSnapshot } from "../hooks/use-service-health";
 
@@ -17,6 +18,7 @@ type Props = {
   roomIsLeader: boolean;
   roomState: RoomState | null;
   roomStatus: SyncStatus;
+  onCalibrateDevice: (clientId: string, calibration: { volumeTrimDb: number; delayMs: number }) => void;
   onRefresh: () => void;
 };
 
@@ -57,10 +59,44 @@ function formatMetric(value: number, suffix: string, digits = 0) {
   return `${Math.abs(value) < 0.05 ? 0 : value.toFixed(digits)}${suffix}`;
 }
 
-function DeviceRow({ clientId, device }: { clientId: string; device: RoomDeviceState }) {
+function DeviceRow({
+  clientId,
+  device,
+  onCalibrate,
+  roomIsLeader,
+}: {
+  clientId: string;
+  device: RoomDeviceState;
+  onCalibrate: Props["onCalibrateDevice"];
+  roomIsLeader: boolean;
+}) {
   const progress = Math.max(0, Math.min(1, Number(device.bufferProgress) || 0));
   const quality = device.quality ? QUALITY_LABELS[device.quality] : "跟随房间";
-  const ready = device.ready || device.bufferState === "ready";
+  const ready = device.ready || device.prepared || device.bufferState === "ready";
+  const [volumeTrimDb, setVolumeTrimDb] = useState(device.volumeTrimDb || 0);
+  const [delayMs, setDelayMs] = useState(device.delayMs || 0);
+  const calibrationRef = useRef({
+    volumeTrimDb: device.volumeTrimDb || 0,
+    delayMs: device.delayMs || 0,
+  });
+  const calibrationCommitTimerRef = useRef<number | null>(null);
+  const commitCalibration = () => {
+    if (calibrationCommitTimerRef.current != null) {
+      window.clearTimeout(calibrationCommitTimerRef.current);
+      calibrationCommitTimerRef.current = null;
+    }
+    onCalibrate(device.clientId, { ...calibrationRef.current });
+  };
+  const scheduleCalibration = () => {
+    if (calibrationCommitTimerRef.current != null) window.clearTimeout(calibrationCommitTimerRef.current);
+    calibrationCommitTimerRef.current = window.setTimeout(() => {
+      calibrationCommitTimerRef.current = null;
+      onCalibrate(device.clientId, { ...calibrationRef.current });
+    }, 90);
+  };
+  useEffect(() => () => {
+    if (calibrationCommitTimerRef.current != null) window.clearTimeout(calibrationCommitTimerRef.current);
+  }, []);
   return (
     <li className={`device-diagnostic ${ready ? "is-ready" : ""} ${device.blocked ? "is-blocked" : ""}`}>
       <div className="device-diagnostic-heading">
@@ -90,6 +126,63 @@ function DeviceRow({ clientId, device }: { clientId: string; device: RoomDeviceS
         <div><dt>漂移</dt><dd>{formatMetric(device.driftMs, " ms")}</dd></div>
         <div><dt>音质</dt><dd>{quality}</dd></div>
       </dl>
+      <div className="device-calibration-summary">
+        <span>输出校准</span>
+        <strong>{volumeTrimDb >= 0 ? "+" : ""}{volumeTrimDb.toFixed(1)} dB · {Math.round(delayMs)} ms</strong>
+      </div>
+      {roomIsLeader ? (
+        <div className="device-calibration-controls">
+          <label>
+            <span>音量微调</span>
+            <input
+              type="range"
+              min="-24"
+              max="12"
+              step="0.5"
+              value={volumeTrimDb}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                calibrationRef.current.volumeTrimDb = next;
+                setVolumeTrimDb(next);
+                scheduleCalibration();
+              }}
+              onPointerUp={commitCalibration}
+              onKeyUp={commitCalibration}
+              onBlur={commitCalibration}
+              aria-label={`${device.name}音量微调`}
+            />
+          </label>
+          <label>
+            <span>延迟补偿</span>
+            <input
+              type="range"
+              min="0"
+              max="500"
+              step="5"
+              value={delayMs}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                calibrationRef.current.delayMs = next;
+                setDelayMs(next);
+                scheduleCalibration();
+              }}
+              onPointerUp={commitCalibration}
+              onKeyUp={commitCalibration}
+              onBlur={commitCalibration}
+              aria-label={`${device.name}延迟补偿`}
+            />
+          </label>
+          <button
+            type="button"
+            onClick={() => {
+              calibrationRef.current = { volumeTrimDb: 0, delayMs: 0 };
+              setVolumeTrimDb(0);
+              setDelayMs(0);
+              onCalibrate(device.clientId, { volumeTrimDb: 0, delayMs: 0 });
+            }}
+          >重置</button>
+        </div>
+      ) : null}
     </li>
   );
 }
@@ -108,6 +201,7 @@ export function RoomServiceCenter({
   roomIsLeader,
   roomState,
   roomStatus,
+  onCalibrateDevice,
   onRefresh,
 }: Props) {
   const devices = roomState?.devices || [];
@@ -187,7 +281,15 @@ export function RoomServiceCenter({
       </div>
       {devices.length ? (
         <ul className="device-diagnostic-list">
-          {devices.map((device) => <DeviceRow clientId={clientId} device={device} key={device.clientId} />)}
+          {devices.map((device) => (
+            <DeviceRow
+              clientId={clientId}
+              device={device}
+              key={`${device.clientId}:${device.volumeTrimDb || 0}:${device.delayMs || 0}`}
+              onCalibrate={onCalibrateDevice}
+              roomIsLeader={roomIsLeader}
+            />
+          ))}
         </ul>
       ) : (
         <p className="device-diagnostic-empty">

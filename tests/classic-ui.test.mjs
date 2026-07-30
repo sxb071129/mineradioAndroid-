@@ -32,11 +32,14 @@ test("classic bundle carries its visual engine and Web bridge", async () => {
   const html = await readFile(path.join(classicRoot, "index.html"), "utf8");
   const bridge = await readFile(path.join(classicRoot, "classic-web-bridge.js"), "utf8");
 
-  assert.match(html, /<script src="room-sync-core\.js\?v=20260726-device-center-v1"><\/script>/);
-  assert.match(html, /<script src="classic-web-bridge\.js\?v=20260726-device-center-v1"><\/script>/);
+  assert.match(html, /<script src="vendor\/qrcode\.min\.js\?v=1\.5\.4"><\/script>/);
+  assert.match(html, /<script src="room-sync-core\.js\?v=20260726-calibration-v1"><\/script>/);
+  assert.match(html, /<script src="classic-web-bridge\.js\?v=20260730-sync-v2"><\/script>/);
   assert.ok(
-    html.indexOf('src="room-sync-core.js?v=20260726-device-center-v1"')
-      < html.indexOf('src="classic-web-bridge.js?v=20260726-device-center-v1"'),
+    html.indexOf('src="vendor/qrcode.min.js?v=1.5.4"')
+      < html.indexOf('src="room-sync-core.js?v=20260726-calibration-v1"')
+      && html.indexOf('src="room-sync-core.js?v=20260726-calibration-v1"')
+        < html.indexOf('src="classic-web-bridge.js?v=20260730-sync-v2"'),
     "shared room sync core must load before the Classic bridge",
   );
   assert.match(html, /<script src="vendor\/three\.r128\.min\.js"><\/script>/);
@@ -78,9 +81,69 @@ test("classic bundle carries its visual engine and Web bridge", async () => {
     access(path.join(classicRoot, "vendor", "three.r128.min.js")),
     access(path.join(classicRoot, "vendor", "gsap.min.js")),
     access(path.join(classicRoot, "vendor", "music-tempo.min.js")),
+    access(path.join(classicRoot, "vendor", "qrcode.min.js")),
     access(path.join(classicRoot, "assets", "skull-decimation-points.bin")),
   ]);
   assert.ok((await stat(path.join(classicRoot, "index.html"))).size > 1_000_000);
+});
+
+test("classic ports safe upstream visual and bounded recovery enhancements", async () => {
+  const classicRoot = path.join(root, "public", "classic");
+  const html = await readFile(path.join(classicRoot, "index.html"), "utf8");
+  const bridge = await readFile(path.join(classicRoot, "classic-web-bridge.js"), "utf8");
+  const terrain = await readFile(path.join(classicRoot, "sonic-terrain.js"), "utf8");
+  const recovery = await readFile(path.join(classicRoot, "playback-recovery.js"), "utf8");
+
+  assert.match(html, /<script src="sonic-terrain\.js\?v=20260730-v1"><\/script>/);
+  assert.match(html, /<script src="playback-recovery\.js\?v=20260730-v2"><\/script>/);
+  assert.ok(
+    html.indexOf('src="sonic-terrain.js?v=20260730-v1"')
+      < html.indexOf('src="playback-recovery.js?v=20260730-v2"'),
+    "the terrain runtime must be available before the Classic app begins its frame loop",
+  );
+  for (const id of ["fx-sonicterrainintensity", "fx-sonicterrainresponse", "sonic-terrain-theme-seg"]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(html, /sonicTerrainIntensity: 1\.15/);
+  assert.match(html, /sonicTerrainTheme: 'cover'/);
+  assert.match(html, /var SONIC_TERRAIN_PRESET_INDEX = 7/);
+  assert.match(html, /window\.MineradioSonicTerrain\.update\(dt,/);
+  assert.match(html, /uniforms\.uPreset\.value = fx\.preset === SONIC_TERRAIN_PRESET_INDEX \? 5 : fx\.preset/);
+  assert.doesNotMatch(html, /floorMirror/);
+  assert.match(html, /function shelfPointerSelectionForegroundActive\(\)/);
+  assert.match(html, /card\.selected && shelfPointerSelectionForegroundActive\(\)/);
+  assert.match(html, /group\.renderOrder = \(contentOpenForLayer \|\| shelfPinnedOpen \|\| liftedCardActive\) \? 300 : 30/);
+
+  assert.match(terrain, /window\.MineradioSonicTerrain/);
+  assert.match(terrain, /INDEX: INDEX/);
+  assert.match(terrain, /pointer-events:none/);
+  assert.doesNotMatch(terrain, /AudioContext|\.src\s*=|fetch\(/);
+  assert.match(recovery, /RECOVERY_TIMEOUT_MS = 20000/);
+  assert.match(recovery, /MAX_QUEUE_ADVANCES = 2/);
+  assert.match(recovery, /function isJoinedRoom\(\)/);
+  assert.match(recovery, /function isRoomAuthoritative\(\)[\s\S]*?participants > 1/);
+  assert.match(recovery, /Promise\.race\(\[originalResult, timeoutResult\]\)/);
+  assert.match(recovery, /window\.MineradioPlaybackRecovery/);
+  assert.doesNotMatch(recovery, /https?:\/\/|\/api\//);
+  assert.match(html, /function isRoomControlledPlayback\(opts\)/);
+  assert.match(html, /if \(isRoomControlledPlayback\(\)\) return;/);
+  assert.match(html, /token !== trackSwitchToken \|\| isRoomControlledPlayback\(opts\)/);
+  assert.match(bridge, /function roomPlaybackRequiresSharedAuthority\(\)/);
+  assert.match(bridge, /var callerRequestedRoomSync = Boolean\(args\[1\] && args\[1\]\.roomSync\)/);
+  assert.match(bridge, /var joinedPlayback = callerRequestedRoomSync \|\| \(joinedRoom && roomPlaybackRequiresSharedAuthority\(\)\)/);
+  assert.match(bridge, /Object\.assign\(\{\}, args\[1\] \|\| \{\}, \{ roomSync: true \}\)/);
+  assert.match(bridge, /Object\.assign\(\{\}, args\[1\] \|\| \{\}, \{ deferPlayback: true \}\)/);
+  assert.match(bridge, /function cancelTrackAnnouncement\(\)[\s\S]*?trackAnnouncementSerial \+= 1/);
+  assert.match(bridge, /announcementSerial !== trackAnnouncementSerial[\s\S]*?currentDescriptorId\(\) !== descriptorId/);
+  assert.match(bridge, /function shouldHoldPlaybackForRoomJoin\(\)[\s\S]*?!joinedRoom/);
+  assert.match(bridge, /\{ deferPlayback: true, roomJoinPending: true \}/);
+  assert.match(bridge, /function consumePendingRoomJoinPlayback\(\)[\s\S]*?intent\.descriptorId/);
+  assert.match(bridge, /announceCurrentTrack\(resumePendingJoinPlayback\)/);
+
+  await Promise.all([
+    access(path.join(classicRoot, "sonic-terrain.js")),
+    access(path.join(classicRoot, "playback-recovery.js")),
+  ]);
 });
 
 test("classic player exposes and wires the LAN room controls", async () => {
@@ -103,6 +166,8 @@ test("classic player exposes and wires the LAN room controls", async () => {
     "room-service-room-value",
     "room-sync-buffer-label",
     "room-sync-buffer-bar",
+    "room-sync-qr",
+    "room-sync-qr-status",
     "room-sync-device-list",
     "room-sync-protocol-error",
     "room-sync-input",
@@ -172,6 +237,104 @@ test("classic player exposes and wires the LAN room controls", async () => {
   assert.doesNotMatch(deviceRenderer, /\.innerHTML\s*=/);
 });
 
+test("classic room QR stays local and falls back when the Relay endpoint stalls", async () => {
+  const classicRoot = path.join(root, "public", "classic");
+  const html = await readFile(path.join(classicRoot, "index.html"), "utf8");
+  const bridge = await readFile(path.join(classicRoot, "classic-web-bridge.js"), "utf8");
+  const qrVendor = await readFile(path.join(classicRoot, "vendor", "qrcode.min.js"), "utf8");
+  const qrRenderer = sourceBetween(bridge, "function renderRoomQr", "function boundedMetric");
+
+  assert.match(html, /id="room-sync-qr-status" role="status" aria-live="polite"/);
+  assert.match(qrRenderer, /new URL\("\/api\/room\/qr", relayHttpOrigin \+ "\/"\)/);
+  assert.match(qrRenderer, /endpoint\.searchParams\.set\("text", value\)/);
+  assert.match(qrRenderer, /new window\.AbortController\(\)/);
+  assert.match(qrRenderer, /abortController\.abort\(\)/);
+  assert.match(qrRenderer, /2500/);
+  assert.match(qrRenderer, /window\.MineradioQRCode/);
+  assert.match(qrRenderer, /qr\.toDataURL\(value/);
+  assert.doesNotMatch(qrRenderer, /googleapis|quickchart|qrserver|chart\.google/);
+  assert.match(qrVendor, /qrcode 1\.5\.4 \| MIT/);
+});
+
+test("classic room calibration persists per device and compensates the audible timeline", async () => {
+  const html = await readFile(path.join(root, "public", "classic", "index.html"), "utf8");
+  const bridge = await readFile(path.join(root, "public", "classic", "classic-web-bridge.js"), "utf8");
+  const audioGraph = sourceBetween(html, "function initAudio()", "function resumeAudioAnalysis");
+  const command = sourceBetween(bridge, "function sendCommand", "function sendDeviceStatusCommand");
+  const calibrationSender = sourceBetween(
+    bridge,
+    "function sendDeviceCalibrationCommand",
+    "function sendVolumeCommand",
+  );
+
+  assert.match(html, /mineradio-room-device-calibration-v1/);
+  assert.match(html, /clampRange\(Number\(value\.volumeTrimDb\) \|\| 0, -24, 12\)/);
+  assert.match(html, /clampRange\(Number\(value\.delayMs\) \|\| 0, 0, 500\)/);
+  assert.match(html, /window\.applyRoomDeviceCalibration = applyRoomDeviceCalibration/);
+  assert.match(html, /window\.getRoomDeviceCalibration = getRoomDeviceCalibration/);
+  assert.match(audioGraph, /roomCalibrationGainNode = audioCtx\.createGain\(\)/);
+  assert.match(audioGraph, /roomCalibrationLimiterNode = audioCtx\.createDynamicsCompressor\(\)/);
+  assert.match(audioGraph, /roomCalibrationDelayNode = audioCtx\.createDelay\(0\.55\)/);
+  assert.match(audioGraph, /threshold\.value = -1/);
+  assert.match(audioGraph, /ratio\.value = 20/);
+  assert.match(
+    audioGraph,
+    /gainNode\.connect\(roomCalibrationGainNode\)[\s\S]*?roomCalibrationGainNode\.connect\(roomCalibrationLimiterNode\)[\s\S]*?roomCalibrationLimiterNode\.connect\(roomCalibrationDelayNode\)[\s\S]*?roomCalibrationDelayNode\.connect\(audioCtx\.destination\)/,
+  );
+  assert.match(bridge, /Math\.max\(-24, Math\.min\(12, Number\(input\.volumeTrimDb\) \|\| 0\)\)/);
+  assert.match(bridge, /minimum: -24[\s\S]*?maximum: 12[\s\S]*?step: 0\.5/);
+  assert.match(bridge, /if \(!bridge\.sync\.leader \|\| !device\.clientId\) return/);
+  assert.match(command, /action === "device-calibration"/);
+  assert.match(command, /message\.targetClientId/);
+  assert.match(command, /message\.volumeTrimDb = calibrationValue\.volumeTrimDb/);
+  assert.match(command, /message\.delayMs = calibrationValue\.delayMs/);
+  assert.match(calibrationSender, /pendingCalibration/);
+  assert.match(calibrationSender, /Math\.max\(0, 120 - elapsed\)/);
+  assert.match(bridge, /applyCalibrationFromRoomDevices\(bridge\.sync\.devices\)/);
+  assert.match(bridge, /reportLocalDeviceCalibration\(\);\s*if \(message\.state\) enqueueRoomState/);
+  assert.match(
+    bridge,
+    /Number\(activeState\.scheduledAt\) - \(Date\.now\(\) \+ serverOffset\) - localDeviceDelayMs\(\)/,
+  );
+  assert.match(
+    bridge,
+    /Number\(state\.scheduledAt\) - \(Date\.now\(\) \+ serverOffset\) - localDeviceDelayMs\(\)/,
+  );
+  assert.match(bridge, /message\.position = Math\.max\(0, message\.position - delayMs \/ 1000\)/);
+});
+
+test("classic exposes lock-screen metadata and guarded Media Session controls", async () => {
+  const bridge = await readFile(path.join(root, "public", "classic", "classic-web-bridge.js"), "utf8");
+  const metadata = sourceBetween(
+    bridge,
+    "function updateMediaSessionMetadata",
+    "function mediaSessionPosition",
+  );
+  const installer = sourceBetween(bridge, "function installMediaSession", "function descriptorForSong");
+
+  assert.match(metadata, /new window\.MediaMetadata\(metadata\)/);
+  assert.match(metadata, /metadata\.artwork = \[\{ src: cover \}\]/);
+  assert.match(bridge, /navigator\.mediaSession\.setPositionState/);
+  assert.match(bridge, /position - localDeviceDelayMs\(\) \/ 1000/);
+  for (const action of [
+    "play",
+    "pause",
+    "previoustrack",
+    "nexttrack",
+    "seekbackward",
+    "seekforward",
+    "seekto",
+    "stop",
+  ]) {
+    assert.match(installer, new RegExp(`${action}: function`), `${action} handler must be installed`);
+  }
+  assert.match(installer, /navigator\.mediaSession\.setActionHandler\(action, handlers\[action\]\)/);
+  assert.match(bridge, /function mediaSessionSeekTo[\s\S]*?blockFollowerControl\(\)/);
+  assert.match(bridge, /if \(joinedRoom && bridge\.sync\.leader\) sendSeekCommand\(target, true\)/);
+  assert.match(bridge, /media\.addEventListener\("timeupdate"[\s\S]*?updateMediaSessionPlaybackState\(false\)/);
+  assert.match(bridge, /installFollowerControlGuards\(\);[\s\S]*?installMediaSession\(\);/);
+});
+
 test("classic media URLs no longer depend on the removed upstream proxy", async () => {
   const html = await readFile(path.join(root, "public", "classic", "index.html"), "utf8");
   assert.match(html, /var proxyAudioUrl = window\.MineradioWebBridge/);
@@ -219,6 +382,11 @@ test("classic DIY primary switches have usable controls and survive the main set
   assert.match(html, /id="t-float"[^>]*onclick="toggleFx\('floatLayer'\)"/);
   assert.doesNotMatch(html, /#t-float[^{}]*\{[^}]*display\s*:\s*none(?:\s*!important)?/);
   assert.match(html, /id="t-aidepth"[^>]*onclick="toggleFx\('aiDepth'\)"/);
+  assert.match(
+    html,
+    /function updateUserCapsuleAutoHideFromPointer\(x, y\)[\s\S]*?getBoundingClientRect\(\)[\s\S]*?insideCapsule[\s\S]*?nearTopRight/,
+    "the hidden desktop capsule must stay reachable while moving onto its DIY control",
+  );
 
   for (const key of ["floatLayer", "aiDepth", "particleLyrics", "backCover"]) {
     assert.match(reader, new RegExp(`${key}:\\s*[^,\\n]*raw\\.${key}`), `${key} must be restored from the main settings store`);

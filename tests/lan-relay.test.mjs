@@ -46,7 +46,13 @@ function connect(url) {
 
 test("relay uploads ranged audio and synchronizes a room", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-relay-"));
-  const relay = await createLanRelay({ port: 0, host: "127.0.0.1", dataDir });
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+    roomBroadcastIntervalMs: 100,
+    playbackPrepareCompletionRetentionMs: 80,
+  });
   t.after(async () => {
     await relay.close();
     await rm(dataDir, { recursive: true, force: true });
@@ -55,6 +61,44 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
   const base = `http://127.0.0.1:${relay.port}`;
   const health = await fetch(`${base}/health`).then((response) => response.json());
   assert.equal(health.ok, true);
+
+  const roomLink = "http://192.168.1.23:3000/classic/index.html?room=ROOM42";
+  const roomQr = await fetch(
+    `${base}/api/room/qr?text=${encodeURIComponent(roomLink)}`,
+  );
+  assert.equal(roomQr.status, 200);
+  assert.equal(roomQr.headers.get("content-type"), "image/png");
+  assert.equal(roomQr.headers.get("cache-control"), "no-store");
+  assert.equal(roomQr.headers.get("x-content-type-options"), "nosniff");
+  const roomQrBytes = Buffer.from(await roomQr.arrayBuffer());
+  assert.deepEqual(
+    roomQrBytes.subarray(0, 8),
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  );
+  assert.ok(roomQrBytes.length > 500);
+  const secureRoomQr = await fetch(
+    `${base}/api/room/qr?text=${encodeURIComponent("https://example.test/room?room=ROOM42")}`,
+  );
+  assert.equal(secureRoomQr.status, 200);
+  assert.equal(secureRoomQr.headers.get("cache-control"), "no-store");
+  await secureRoomQr.arrayBuffer();
+
+  const invalidRoomQrUrls = [
+    `${base}/api/room/qr`,
+    `${base}/api/room/qr?text=${encodeURIComponent("/classic/index.html?room=ROOM42")}`,
+    `${base}/api/room/qr?text=${encodeURIComponent("ftp://example.test/room")}`,
+    `${base}/api/room/qr?text=${encodeURIComponent("javascript:alert(1)")}`,
+    `${base}/api/room/qr?text=${encodeURIComponent(" https://example.test/room")}`,
+    `${base}/api/room/qr?text=${encodeURIComponent("https://user:secret@example.test/room")}`,
+    `${base}/api/room/qr?text=${encodeURIComponent("https://example.test/room\n")}`,
+    `${base}/api/room/qr?text=${encodeURIComponent(`https://example.test/${"a".repeat(2050)}`)}`,
+    `${base}/api/room/qr?text=${encodeURIComponent(roomLink)}&text=${encodeURIComponent(roomLink)}`,
+  ];
+  for (const invalidUrl of invalidRoomQrUrls) {
+    const response = await fetch(invalidUrl);
+    assert.equal(response.status, 400, invalidUrl);
+    assert.deepEqual(await response.json(), { error: "invalid_qr_text" });
+  }
 
   const audioBytes = Buffer.from("RIFF-mineradio-test-audio");
   const upload = await fetch(
@@ -274,6 +318,15 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
   );
   assert.ok(projectedProgress.state.position < 21);
 
+  const clearedPreparation = await follower.next(
+    (message) => message.type === "state"
+      && message.state?.playing === true
+      && message.state?.prepareId === ""
+      && message.state?.scheduledAt === finalSchedule.state.scheduledAt,
+  );
+  assert.equal(relay.rooms.get("ROOM42").prepareParticipants.size, 0);
+  assert.equal(clearedPreparation.state.devices.every((device) => device.bufferState === ""), true);
+
   leader.ws.send(JSON.stringify({ type: "command", action: "volume", volume: 0.42 }));
   const volumeState = await follower.next(
     (message) => message.type === "state" && message.state?.volume === 0.42,
@@ -309,6 +362,226 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
   );
   assert.equal(controlledByNewLeader.state.playing, true);
   follower.ws.close();
+});
+
+test("leader controls bounded per-device calibration and disconnected devices are cleared", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-device-calibration-"));
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+  });
+  const leader = connect(`ws://127.0.0.1:${relay.port}/ws`);
+  const follower = connect(`ws://127.0.0.1:${relay.port}/ws`);
+  const outsider = connect(`ws://127.0.0.1:${relay.port}/ws`);
+  t.after(async () => {
+    leader.ws.close();
+    follower.ws.close();
+    outsider.ws.close();
+    await relay.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await Promise.all([leader.opened, follower.opened, outsider.opened]);
+  const [leaderWelcome, followerWelcome, outsiderWelcome] = await Promise.all([
+    leader.next((message) => message.type === "welcome"),
+    follower.next((message) => message.type === "welcome"),
+    outsider.next((message) => message.type === "welcome"),
+  ]);
+
+  leader.ws.send(JSON.stringify({ type: "join", room: "CAL42", name: "Controller" }));
+  await leader.next((message) => message.type === "joined" && message.room === "CAL42");
+  follower.ws.send(JSON.stringify({ type: "join", room: "CAL42", name: "Speaker" }));
+  const followerJoined = await follower.next(
+    (message) => message.type === "joined" && message.room === "CAL42",
+  );
+  outsider.ws.send(JSON.stringify({ type: "join", room: "AWAY42", name: "Other room" }));
+  await outsider.next((message) => message.type === "joined" && message.room === "AWAY42");
+
+  const defaultSpeaker = followerJoined.state.devices.find(
+    (device) => device.clientId === followerWelcome.clientId,
+  );
+  assert.equal(defaultSpeaker.volumeTrimDb, 0);
+  assert.equal(defaultSpeaker.delayMs, 0);
+  const room = relay.rooms.get("CAL42");
+  const revisionBeforeCalibration = room.state.revision;
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-status",
+    volumeTrimDb: -3,
+    delayMs: 40,
+  }));
+  const initializationBarrier = Date.now();
+  follower.ws.send(JSON.stringify({ type: "ping", clientTime: initializationBarrier }));
+  await follower.next(
+    (message) => message.type === "pong" && message.clientTime === initializationBarrier,
+  );
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).volumeTrimDb, -3);
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).delayMs, 40);
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).explicitCalibration, false);
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-calibration",
+    targetClientId: followerWelcome.clientId,
+    volumeTrimDb: -6,
+    delayMs: 80,
+  }));
+  const denied = await follower.next(
+    (message) => message.type === "error" && message.code === "leader_only",
+  );
+  assert.equal(denied.code, "leader_only");
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).volumeTrimDb, -3);
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-calibration",
+    targetClientId: outsiderWelcome.clientId,
+    volumeTrimDb: -6,
+    delayMs: 80,
+  }));
+  const missingTarget = await leader.next(
+    (message) => message.type === "error" && message.code === "device_not_found",
+  );
+  assert.equal(missingTarget.code, "device_not_found");
+
+  const invalidCalibrations = [
+    { volumeTrimDb: -24.01, delayMs: 0 },
+    { volumeTrimDb: 12.01, delayMs: 0 },
+    { volumeTrimDb: 0, delayMs: -0.01 },
+    { volumeTrimDb: 0, delayMs: 500.01 },
+    { volumeTrimDb: "0", delayMs: 0 },
+    { volumeTrimDb: 0, delayMs: "0" },
+    { volumeTrimDb: 0 },
+    { delayMs: 0 },
+  ];
+  for (const calibration of invalidCalibrations) {
+    leader.ws.send(JSON.stringify({
+      type: "command",
+      action: "device-calibration",
+      targetClientId: followerWelcome.clientId,
+      ...calibration,
+    }));
+    const invalid = await leader.next(
+      (message) => message.type === "error" && message.code === "invalid_calibration",
+    );
+    assert.equal(invalid.code, "invalid_calibration");
+  }
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-calibration",
+    targetClientId: followerWelcome.clientId,
+    volumeTrimDb: -24,
+    delayMs: 500,
+  }));
+  const calibrated = await follower.next(
+    (message) => message.type === "state"
+      && message.state?.devices?.some(
+        (device) => device.clientId === followerWelcome.clientId
+          && device.volumeTrimDb === -24
+          && device.delayMs === 500,
+      ),
+  );
+  assert.equal(room.state.revision, revisionBeforeCalibration);
+  const calibratedSpeaker = calibrated.state.devices.find(
+    (device) => device.clientId === followerWelcome.clientId,
+  );
+  assert.equal(calibratedSpeaker.volumeTrimDb, -24);
+  assert.equal(calibratedSpeaker.delayMs, 500);
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).calibrationRevision, 1);
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).explicitCalibration, true);
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-status",
+    volumeTrimDb: -3,
+    delayMs: 40,
+  }));
+  const staleStatusBarrier = Date.now();
+  follower.ws.send(JSON.stringify({ type: "ping", clientTime: staleStatusBarrier }));
+  await follower.next(
+    (message) => message.type === "pong" && message.clientTime === staleStatusBarrier,
+  );
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).volumeTrimDb, -24);
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).delayMs, 500);
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).calibrationRevision, 1);
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-calibration",
+    targetClientId: followerWelcome.clientId,
+    volumeTrimDb: -6.26,
+    delayMs: 83,
+  }));
+  const normalizedCalibration = await follower.next(
+    (message) => message.type === "state"
+      && message.state?.devices?.some(
+        (device) => device.clientId === followerWelcome.clientId
+          && device.volumeTrimDb === -6.5
+          && device.delayMs === 85,
+      ),
+  );
+  const normalizedSpeaker = normalizedCalibration.state.devices.find(
+    (device) => device.clientId === followerWelcome.clientId,
+  );
+  assert.equal(normalizedSpeaker.volumeTrimDb, -6.5);
+  assert.equal(normalizedSpeaker.delayMs, 85);
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).calibrationRevision, 2);
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-calibration",
+    targetClientId: followerWelcome.clientId,
+    volumeTrimDb: 12,
+    delayMs: 0,
+  }));
+  await leader.next(
+    (message) => message.type === "state"
+      && message.state?.devices?.some(
+        (device) => device.clientId === followerWelcome.clientId
+          && device.volumeTrimDb === 12
+          && device.delayMs === 0,
+      ),
+  );
+  assert.equal(room.deviceStatus.get(followerWelcome.clientId).calibrationRevision, 3);
+
+  follower.ws.send(JSON.stringify({ type: "join", room: "CAL42", name: "Renamed speaker" }));
+  const rejoined = await follower.next(
+    (message) => message.type === "joined"
+      && message.room === "CAL42"
+      && message.state?.devices?.some(
+        (device) => device.clientId === followerWelcome.clientId
+          && device.name === "Renamed speaker"
+          && device.volumeTrimDb === 12
+          && device.delayMs === 0,
+      ),
+  );
+  assert.equal(rejoined.clientId, followerWelcome.clientId);
+
+  follower.ws.close();
+  const removed = await leader.next(
+    (message) => message.type === "state"
+      && message.state?.serverTime > rejoined.state.serverTime
+      && message.state?.deviceCount === 1
+      && !message.state?.devices?.some(
+        (device) => device.clientId === followerWelcome.clientId,
+      ),
+  );
+  assert.equal(removed.state.leaderId, leaderWelcome.clientId);
+  assert.equal(room.deviceStatus.has(followerWelcome.clientId), false);
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "device-calibration",
+    targetClientId: followerWelcome.clientId,
+    volumeTrimDb: 0,
+    delayMs: 0,
+  }));
+  const removedTarget = await leader.next(
+    (message) => message.type === "error" && message.code === "device_not_found",
+  );
+  assert.equal(removedTarget.code, "device_not_found");
 });
 
 test("room preparation timeout stays paused instead of skipping an unready device", async (t) => {

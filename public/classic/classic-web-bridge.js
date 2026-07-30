@@ -2,6 +2,7 @@
   "use strict";
 
   var SETTINGS_KEY = "mineradio-lan-settings-v1";
+  var DEVICE_CALIBRATION_KEY = "mineradio-room-device-calibration-v1";
   var ROOM_RE = /^[A-Z0-9]{4,8}$/;
   var QUALITY_RE = /^(jymaster|hires|lossless|exhigh|standard)$/;
   var nativeFetch = window.fetch.bind(window);
@@ -348,10 +349,73 @@
   var serviceHealthTimer = 0;
   var serviceHealthInFlight = false;
   var roomDeviceRenderSignature = "";
+  var lastCalibrationSentAt = 0;
+  var pendingCalibration = null;
+  var calibrationTimer = 0;
+  var localCalibrationMinimumUpdatedAt = 0;
+  var lastAppliedCalibrationSignature = "";
+  var roomQrRenderedValue = "";
+  var roomQrPendingValue = "";
+  var roomQrRenderGeneration = 0;
+  var roomQrObjectUrl = "";
+  var mediaSessionInstalled = false;
+  var lastMediaSessionPositionAt = 0;
+  var trackAnnouncementTimer = 0;
+  var joinAnnouncementTimer = 0;
+  var trackAnnouncementSerial = 0;
+  var pendingRoomJoinPlayback = null;
 
   bridge.shouldDeferRoomPlayback = function () {
-    return joinedRoom && bridge.sync.leader;
+    return (joinedRoom && bridge.sync.leader) || shouldHoldPlaybackForRoomJoin();
   };
+
+  function roomPlaybackRequiresSharedAuthority() {
+    var participants = Math.max(
+      Number(bridge.sync.deviceCount) || 0,
+      Number(bridge.sync.requiredCount) || 0
+    );
+    return bridge.sync.preparing === true || participants > 1;
+  }
+
+  function shouldHoldPlaybackForRoomJoin() {
+    // The LAN launcher joins HOME immediately. Until the relay confirms the
+    // role, load the track but do not let this browser begin alone; the joined
+    // handler will promote the same intent through the ready/start barrier.
+    return !applyingRoomState
+      && !joinedRoom
+      && !bridge.sync.error
+      && typeof window.WebSocket === "function";
+  }
+
+  function beginPendingRoomJoinPlayback(index) {
+    pendingRoomJoinPlayback = {
+      index: Number.isFinite(Number(index)) ? Number(index) : -1,
+      descriptorId: "",
+      createdAt: Date.now()
+    };
+    return pendingRoomJoinPlayback;
+  }
+
+  function finalizePendingRoomJoinPlayback(intent) {
+    if (!intent || pendingRoomJoinPlayback !== intent) return false;
+    var descriptorId = currentDescriptorId();
+    if (!descriptorId || !window.audio || !window.audio.src) {
+      pendingRoomJoinPlayback = null;
+      return false;
+    }
+    intent.descriptorId = descriptorId;
+    return true;
+  }
+
+  function consumePendingRoomJoinPlayback() {
+    var intent = pendingRoomJoinPlayback;
+    // A very fast joined message can arrive before the deferred source has
+    // finished resolving. Keep that intent intact so the wrapper can promote
+    // it as soon as the same playQueueAt call completes.
+    if (!intent || !intent.descriptorId || !window.audio || !window.audio.src) return false;
+    pendingRoomJoinPlayback = null;
+    return intent.descriptorId === currentDescriptorId();
+  }
 
   function notify(message) {
     if (typeof window.showToast === "function") window.showToast(message);
@@ -395,8 +459,150 @@
     return url.toString();
   }
 
+  function setRoomQrImage(source, statusText, objectUrl, generation, shareUrl) {
+    if (generation !== roomQrRenderGeneration) {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      return;
+    }
+    var image = document.getElementById("room-sync-qr");
+    var status = document.getElementById("room-sync-qr-status");
+    roomQrPendingValue = "";
+    if (!image) {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      return;
+    }
+    if (roomQrObjectUrl) URL.revokeObjectURL(roomQrObjectUrl);
+    roomQrObjectUrl = objectUrl || "";
+    image.src = source;
+    image.alt = "扫码加入局域网房间 " + roomCode;
+    image.title = shareUrl;
+    if (status) status.textContent = statusText;
+    roomQrRenderedValue = shareUrl;
+  }
+
+  function renderRoomQr(shareUrl) {
+    var value = String(shareUrl || "");
+    if (!value || value === roomQrRenderedValue || value === roomQrPendingValue) return;
+    var image = document.getElementById("room-sync-qr");
+    var status = document.getElementById("room-sync-qr-status");
+    if (!image) return;
+    roomQrPendingValue = value;
+    var generation = ++roomQrRenderGeneration;
+    if (status) status.textContent = "正在本地生成";
+    var endpoint = new URL("/api/room/qr", relayHttpOrigin + "/");
+    endpoint.searchParams.set("text", value);
+    var abortController = typeof window.AbortController === "function"
+      ? new window.AbortController()
+      : null;
+    var qrTimeout = abortController
+      ? window.setTimeout(function () { abortController.abort(); }, 2500)
+      : 0;
+    var requestOptions = { cache: "no-store" };
+    if (abortController) requestOptions.signal = abortController.signal;
+    nativeFetch(endpoint.toString(), requestOptions).then(function (response) {
+      if (!response.ok || !/^image\/png\b/i.test(String(response.headers.get("content-type") || ""))) {
+        throw new Error("relay_qr_unavailable");
+      }
+      return response.blob();
+    }).then(function (blob) {
+      window.clearTimeout(qrTimeout);
+      if (!blob || !blob.size) throw new Error("empty_qr");
+      var objectUrl = URL.createObjectURL(blob);
+      setRoomQrImage(objectUrl, "由本机 Relay 生成", objectUrl, generation, value);
+    }).catch(function () {
+      window.clearTimeout(qrTimeout);
+      var qr = window.MineradioQRCode;
+      if (!qr || typeof qr.toDataURL !== "function") throw new Error("local_qr_unavailable");
+      return qr.toDataURL(value, {
+        errorCorrectionLevel: "M",
+        margin: 2,
+        width: 192,
+        color: { dark: "#080b10", light: "#ffffff" }
+      }).then(function (dataUrl) {
+        setRoomQrImage(dataUrl, "浏览器本地生成", "", generation, value);
+      });
+    }).catch(function () {
+      if (generation !== roomQrRenderGeneration) return;
+      roomQrPendingValue = "";
+      image.removeAttribute("src");
+      if (status) status.textContent = "二维码不可用，请复制下方房间链接";
+    });
+  }
+
   function boundedMetric(value, minimum, maximum) {
     return Math.max(minimum, Math.min(maximum, Number(value) || 0));
+  }
+
+  function normalizeDeviceCalibration(value) {
+    var input = value && typeof value === "object" ? value : {};
+    return {
+      volumeTrimDb: Math.round(Math.max(-24, Math.min(12, Number(input.volumeTrimDb) || 0)) * 2) / 2,
+      delayMs: Math.round(Math.max(0, Math.min(500, Number(input.delayMs) || 0)) / 5) * 5
+    };
+  }
+
+  function localDeviceCalibration() {
+    if (typeof window.getRoomDeviceCalibration === "function") {
+      try { return normalizeDeviceCalibration(window.getRoomDeviceCalibration()); } catch {}
+    }
+    try {
+      return normalizeDeviceCalibration(JSON.parse(window.localStorage.getItem(DEVICE_CALIBRATION_KEY) || "{}"));
+    } catch {
+      return { volumeTrimDb: 0, delayMs: 0 };
+    }
+  }
+
+  function applyLocalDeviceCalibration(value, immediate) {
+    var calibration = normalizeDeviceCalibration(value);
+    var signature = calibration.volumeTrimDb + ":" + calibration.delayMs;
+    if (signature === lastAppliedCalibrationSignature) return calibration;
+    lastAppliedCalibrationSignature = signature;
+    if (typeof window.applyRoomDeviceCalibration === "function") {
+      try {
+        return normalizeDeviceCalibration(window.applyRoomDeviceCalibration(
+          calibration.volumeTrimDb,
+          calibration.delayMs,
+          { persist: true, immediate: Boolean(immediate) }
+        ));
+      } catch {}
+    }
+    try { window.localStorage.setItem(DEVICE_CALIBRATION_KEY, JSON.stringify(calibration)); } catch {}
+    return calibration;
+  }
+
+  function localDeviceDelayMs() {
+    return localDeviceCalibration().delayMs;
+  }
+
+  function applyCalibrationFromRoomDevices(devices) {
+    if (!clientId || !Array.isArray(devices)) return;
+    var localDevice = devices.find(function (device) {
+      return String(device && device.clientId || "") === clientId;
+    });
+    if (!localDevice
+      || !Number.isFinite(Number(localDevice.volumeTrimDb))
+      || !Number.isFinite(Number(localDevice.delayMs))) return;
+    var updatedAt = Number(localDevice.updatedAt) || 0;
+    if (localCalibrationMinimumUpdatedAt && updatedAt + 5 < localCalibrationMinimumUpdatedAt) return;
+    localCalibrationMinimumUpdatedAt = 0;
+    applyLocalDeviceCalibration({
+      volumeTrimDb: localDevice.volumeTrimDb,
+      delayMs: localDevice.delayMs
+    }, false);
+  }
+
+  function reportLocalDeviceCalibration() {
+    var calibration = localDeviceCalibration();
+    localCalibrationMinimumUpdatedAt = Date.now() + serverOffset;
+    sendDeviceStatusCommand({
+      prepareId: "",
+      latencyMs: bridge.sync.latency,
+      jitterMs: bridge.sync.jitter,
+      driftMs: bridge.sync.drift,
+      quality: currentRoomPlaybackQuality(lastRoomState),
+      volumeTrimDb: calibration.volumeTrimDb,
+      delayMs: calibration.delayMs
+    }, true);
   }
 
   function serviceState(kind) {
@@ -499,9 +705,100 @@
     container.appendChild(item);
   }
 
+  function calibrationValueLabel(field, value) {
+    if (field === "volumeTrimDb") {
+      var rounded = Math.round(Number(value) * 2) / 2;
+      return (rounded > 0 ? "+" : "") + rounded.toFixed(rounded % 1 ? 1 : 0) + " dB";
+    }
+    return Math.round(Number(value) || 0) + " ms";
+  }
+
+  function appendCalibrationField(container, device, calibration, options) {
+    var field = document.createElement("label");
+    field.className = "room-device-calibration-field";
+    var caption = document.createElement("span");
+    caption.className = "room-device-calibration-label";
+    var label = document.createElement("span");
+    label.textContent = options.label;
+    var output = document.createElement("output");
+    output.textContent = calibrationValueLabel(options.name, calibration[options.name]);
+    caption.appendChild(label);
+    caption.appendChild(output);
+    var input = document.createElement("input");
+    input.type = "range";
+    input.min = String(options.minimum);
+    input.max = String(options.maximum);
+    input.step = String(options.step);
+    input.value = String(calibration[options.name]);
+    input.setAttribute("aria-label", String(device.name || "设备") + " " + options.label);
+    input.dataset.calibrationField = options.name;
+    input.addEventListener("input", function () {
+      calibration[options.name] = Number(input.value);
+      output.textContent = calibrationValueLabel(options.name, calibration[options.name]);
+      if (String(device.clientId || "") === clientId) applyLocalDeviceCalibration(calibration, false);
+      sendDeviceCalibrationCommand(device.clientId, calibration, false);
+    });
+    input.addEventListener("change", function () {
+      calibration[options.name] = Number(input.value);
+      sendDeviceCalibrationCommand(device.clientId, calibration, true);
+      input.blur();
+    });
+    field.appendChild(caption);
+    field.appendChild(input);
+    container.appendChild(field);
+  }
+
+  function appendDeviceCalibrationControls(row, device) {
+    if (!bridge.sync.leader || !device.clientId) return;
+    var calibration = normalizeDeviceCalibration({
+      volumeTrimDb: device.volumeTrimDb,
+      delayMs: device.delayMs
+    });
+    var controls = document.createElement("div");
+    controls.className = "room-device-calibration";
+    appendCalibrationField(controls, device, calibration, {
+      name: "volumeTrimDb",
+      label: "音量修正",
+      minimum: -24,
+      maximum: 12,
+      step: 0.5
+    });
+    appendCalibrationField(controls, device, calibration, {
+      name: "delayMs",
+      label: "发声延迟",
+      minimum: 0,
+      maximum: 500,
+      step: 5
+    });
+    var reset = document.createElement("button");
+    reset.type = "button";
+    reset.className = "room-device-calibration-reset";
+    reset.textContent = "归零";
+    reset.setAttribute("aria-label", "重置 " + String(device.name || "设备") + " 的音频校准");
+    reset.addEventListener("click", function () {
+      calibration.volumeTrimDb = 0;
+      calibration.delayMs = 0;
+      controls.querySelectorAll("input[data-calibration-field]").forEach(function (input) {
+        var fieldName = String(input.dataset.calibrationField || "");
+        input.value = String(calibration[fieldName] || 0);
+        var output = input.parentElement && input.parentElement.querySelector("output");
+        if (output) output.textContent = calibrationValueLabel(fieldName, calibration[fieldName]);
+      });
+      if (String(device.clientId || "") === clientId) applyLocalDeviceCalibration(calibration, false);
+      sendDeviceCalibrationCommand(device.clientId, calibration, true);
+    });
+    controls.appendChild(reset);
+    row.appendChild(controls);
+  }
+
   function renderRoomDevices() {
     var list = document.getElementById("room-sync-device-list");
     if (!list) return;
+    var activeControl = document.activeElement;
+    if (activeControl
+      && list.contains(activeControl)
+      && activeControl.matches
+      && activeControl.matches(".room-device-calibration input[type=range]")) return;
     var devices = Array.isArray(bridge.sync.devices) ? bridge.sync.devices : [];
     var signature;
     try { signature = clientId + ":" + JSON.stringify(devices); } catch { signature = String(Date.now()); }
@@ -558,7 +855,11 @@
       appendDeviceStat(stats, "漂移 " + (drift > 0 ? "+" : "") + Math.round(drift) + " ms");
       var quality = String(device.quality || "").toUpperCase();
       if (quality) appendDeviceStat(stats, "音质 " + quality);
+      var calibration = normalizeDeviceCalibration(device);
+      appendDeviceStat(stats, "修正 " + calibrationValueLabel("volumeTrimDb", calibration.volumeTrimDb));
+      appendDeviceStat(stats, "延迟 " + calibrationValueLabel("delayMs", calibration.delayMs));
       row.appendChild(stats);
+      appendDeviceCalibrationControls(row, device);
       fragment.appendChild(row);
     });
     list.appendChild(fragment);
@@ -570,6 +871,9 @@
       invalid_room: "房间码无效，请输入 4–8 位字母或数字",
       invalid_command: "中继无法识别此同步操作，请更新主机 LAN 服务",
       invalid_track: "这首歌曲无法通过局域网中继播放",
+      invalid_device: "目标设备已离开房间，请刷新设备列表",
+      device_not_found: "目标设备已离开房间，请刷新设备列表",
+      invalid_calibration: "设备校准参数无效，请重置后重试",
       leader_only: "只有房间主控可以执行此操作",
       not_joined: "设备尚未加入房间，正在尝试重新连接",
       quality_unavailable: "当前歌曲或账号暂不支持所选音质",
@@ -631,6 +935,7 @@
       var shareUrl = roomShareUrl(roomCode);
       link.textContent = shareUrl;
       link.title = shareUrl;
+      renderRoomQr(shareUrl);
     }
     var relayService = serviceState("relay");
     var musicService = serviceState("music");
@@ -827,6 +1132,17 @@
     if (/^(loading|buffering|ready|stalled|error|unlock_required)$/.test(bufferState)) {
       message.bufferState = bufferState;
     }
+    var fallbackCalibration = localDeviceCalibration();
+    var calibration = normalizeDeviceCalibration({
+      volumeTrimDb: Number.isFinite(Number(statusValue.volumeTrimDb))
+        ? statusValue.volumeTrimDb
+        : fallbackCalibration.volumeTrimDb,
+      delayMs: Number.isFinite(Number(statusValue.delayMs))
+        ? statusValue.delayMs
+        : fallbackCalibration.delayMs
+    });
+    message.volumeTrimDb = calibration.volumeTrimDb;
+    message.delayMs = calibration.delayMs;
   }
 
   function sendCommand(action, value) {
@@ -840,10 +1156,24 @@
       message.ready = readyValue.ready !== false;
     }
     else if (action === "device-status") appendDeviceStatusFields(message, value);
+    else if (action === "device-calibration") {
+      var calibrationValue = normalizeDeviceCalibration(value);
+      message.targetClientId = String(value && value.targetClientId || "").slice(0, 96);
+      message.volumeTrimDb = calibrationValue.volumeTrimDb;
+      message.delayMs = calibrationValue.delayMs;
+    }
     else if (action === "start-failed") message.prepareId = String(value || "");
     else if (action === "seek" || action === "progress") {
       message.position = Number(value) || 0;
       if (action === "progress") {
+        var delayMs = localDeviceDelayMs();
+        var delayCompensationActive = lastRoomState
+          && lastRoomState.playing
+          && !lastRoomState.preparing
+          && Date.now() + serverOffset + delayMs >= Number(lastRoomState.scheduledAt || 0);
+        if (delayCompensationActive) {
+          message.position = Math.max(0, message.position - delayMs / 1000);
+        }
         message.sampledServerTime = Date.now() + serverOffset;
         message.advancing = Boolean(window.audio && !window.audio.paused && !leaderBuffering);
       }
@@ -873,6 +1203,38 @@
       pendingDeviceStatus = null;
       if (sendCommand("device-status", trailing)) lastDeviceStatusSentAt = Date.now();
     }, Math.max(0, 320 - elapsed));
+  }
+
+  function sendDeviceCalibrationCommand(targetClientId, value, flush) {
+    if (!bridge.sync.leader || !targetClientId) return false;
+    var calibration = normalizeDeviceCalibration(value);
+    if (String(targetClientId) === clientId) applyLocalDeviceCalibration(calibration, false);
+    pendingCalibration = {
+      targetClientId: String(targetClientId),
+      volumeTrimDb: calibration.volumeTrimDb,
+      delayMs: calibration.delayMs
+    };
+    var elapsed = Date.now() - lastCalibrationSentAt;
+    if (flush || elapsed >= 120) {
+      window.clearTimeout(calibrationTimer);
+      calibrationTimer = 0;
+      var immediate = pendingCalibration;
+      pendingCalibration = null;
+      if (sendCommand("device-calibration", immediate)) {
+        lastCalibrationSentAt = Date.now();
+        return true;
+      }
+      return false;
+    }
+    window.clearTimeout(calibrationTimer);
+    calibrationTimer = window.setTimeout(function () {
+      calibrationTimer = 0;
+      if (!pendingCalibration) return;
+      var trailing = pendingCalibration;
+      pendingCalibration = null;
+      if (sendCommand("device-calibration", trailing)) lastCalibrationSentAt = Date.now();
+    }, Math.max(0, 120 - elapsed));
+    return true;
   }
 
   function sendVolumeCommand(value, flush) {
@@ -1004,6 +1366,140 @@
     return window.currentLocalSong || null;
   }
 
+  function mediaSessionArtist(song) {
+    if (!song) return "";
+    if (typeof song.artist === "string") return song.artist;
+    var values = Array.isArray(song.artists) ? song.artists : (Array.isArray(song.ar) ? song.ar : []);
+    return values.map(function (artist) {
+      return typeof artist === "string" ? artist : String(artist && artist.name || "");
+    }).filter(Boolean).join(" / ");
+  }
+
+  function mediaSessionAlbum(song) {
+    if (!song) return "";
+    if (typeof song.album === "string") return song.album;
+    return String(song.album && song.album.name || song.al && song.al.name || "");
+  }
+
+  function mediaSessionCover(song) {
+    if (!song) return "";
+    return directMediaUrl(
+      song.cover
+      || song.picUrl
+      || song.album && song.album.picUrl
+      || song.al && song.al.picUrl
+      || ""
+    );
+  }
+
+  function updateMediaSessionMetadata() {
+    if (!("mediaSession" in navigator) || typeof window.MediaMetadata !== "function") return;
+    var song = currentSongForBridge();
+    if (!song) {
+      navigator.mediaSession.metadata = null;
+      return;
+    }
+    var cover = mediaSessionCover(song);
+    var metadata = {
+      title: String(song.name || song.title || "Mineradio"),
+      artist: mediaSessionArtist(song),
+      album: mediaSessionAlbum(song)
+    };
+    if (cover) metadata.artwork = [{ src: cover }];
+    try { navigator.mediaSession.metadata = new window.MediaMetadata(metadata); } catch {}
+    updateMediaSessionPlaybackState(true);
+  }
+
+  function mediaSessionPosition(media) {
+    var position = Math.max(0, Number(media && media.currentTime) || 0);
+    if (lastRoomState && lastRoomState.playing && !lastRoomState.preparing) {
+      position = Math.max(0, position - localDeviceDelayMs() / 1000);
+    }
+    return position;
+  }
+
+  function updateMediaSessionPlaybackState(forcePosition) {
+    if (!("mediaSession" in navigator)) return;
+    var media = window.audio;
+    try {
+      navigator.mediaSession.playbackState = media && !media.paused ? "playing" : "paused";
+    } catch {}
+    if (!media || typeof navigator.mediaSession.setPositionState !== "function") return;
+    var now = Date.now();
+    if (!forcePosition && now - lastMediaSessionPositionAt < 1000) return;
+    var duration = Number(media.duration);
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    var position = Math.min(Math.max(0, duration - 0.001), mediaSessionPosition(media));
+    try {
+      navigator.mediaSession.setPositionState({
+        duration: duration,
+        playbackRate: Math.max(0.5, Math.min(4, Number(media.playbackRate) || 1)),
+        position: position
+      });
+      lastMediaSessionPositionAt = now;
+    } catch {}
+  }
+
+  function mediaSessionSeekTo(seconds, fastSeek) {
+    var media = window.audio;
+    if (!media || blockFollowerControl()) return;
+    var duration = Number(media.duration) || 0;
+    var target = Math.max(0, Number(seconds) || 0);
+    if (duration > 0) target = Math.min(target, Math.max(0, duration - 0.05));
+    if (fastSeek && typeof media.fastSeek === "function") {
+      suppressNextSeekCommand = true;
+      window.clearTimeout(suppressSeekResetTimer);
+      try {
+        media.fastSeek(target);
+        suppressSeekResetTimer = window.setTimeout(function () {
+          suppressNextSeekCommand = false;
+          suppressSeekResetTimer = 0;
+        }, 2000);
+      } catch {
+        seekForRoomSync(media, target);
+      }
+    } else {
+      seekForRoomSync(media, target);
+    }
+    if (joinedRoom && bridge.sync.leader) sendSeekCommand(target, true);
+    updateMediaSessionPlaybackState(true);
+  }
+
+  function installMediaSession() {
+    if (mediaSessionInstalled || !("mediaSession" in navigator)) return;
+    mediaSessionInstalled = true;
+    var handlers = {
+      play: function () {
+        if (window.audio && window.audio.paused && typeof window.togglePlay === "function") window.togglePlay();
+      },
+      pause: function () {
+        if (window.audio && !window.audio.paused && typeof window.togglePlay === "function") window.togglePlay();
+      },
+      previoustrack: function () {
+        if (typeof window.prevTrack === "function") window.prevTrack();
+      },
+      nexttrack: function () {
+        if (typeof window.nextTrack === "function") window.nextTrack();
+      },
+      seekbackward: function (detail) {
+        mediaSessionSeekTo(mediaSessionPosition(window.audio) - (Number(detail && detail.seekOffset) || 10), false);
+      },
+      seekforward: function (detail) {
+        mediaSessionSeekTo(mediaSessionPosition(window.audio) + (Number(detail && detail.seekOffset) || 10), false);
+      },
+      seekto: function (detail) {
+        mediaSessionSeekTo(detail && detail.seekTime, Boolean(detail && detail.fastSeek));
+      },
+      stop: function () {
+        if (window.audio && !window.audio.paused && typeof window.togglePlay === "function") window.togglePlay();
+      }
+    };
+    Object.keys(handlers).forEach(function (action) {
+      try { navigator.mediaSession.setActionHandler(action, handlers[action]); } catch {}
+    });
+    updateMediaSessionMetadata();
+  }
+
   function descriptorForSong(song) {
     if (song && (song.type === "local" || song.source === "local")) {
       return localRoomDescriptor(song);
@@ -1095,7 +1591,11 @@
   function targetPosition(state) {
     var position = Math.max(0, Number(state.position) || 0);
     if (!state.playing) return position;
-    return position + Math.max(0, (Date.now() + serverOffset - (Number(state.updatedAt) || Date.now())) / 1000);
+    var delayMs = localDeviceDelayMs();
+    return position + Math.max(
+      0,
+      (Date.now() + serverOffset - (Number(state.updatedAt) || Date.now()) + delayMs) / 1000
+    );
   }
 
   function classicPlaybackCorrection(target, current, playing, forceSeek) {
@@ -1259,6 +1759,14 @@
     scheduledPlayGeneration += 1;
   }
 
+  function cancelTrackAnnouncement() {
+    trackAnnouncementSerial += 1;
+    window.clearTimeout(trackAnnouncementTimer);
+    window.clearTimeout(joinAnnouncementTimer);
+    trackAnnouncementTimer = 0;
+    joinAnnouncementTimer = 0;
+  }
+
   function scheduledRoomPlaybackGuard(state) {
     return {
       timerGeneration: scheduledPlayGeneration,
@@ -1286,7 +1794,7 @@
       || String(activeState.prepareId || "") !== guard.prepareId
       || Number(activeState.scheduledAt || 0) !== guard.scheduledAt) return;
     var remaining = Number(activeState.scheduledAt) > 0
-      ? Number(activeState.scheduledAt) - (Date.now() + serverOffset)
+      ? Number(activeState.scheduledAt) - (Date.now() + serverOffset) - localDeviceDelayMs()
       : 0;
     if (remaining > 20) {
       scheduledPlayTimer = window.setTimeout(function () {
@@ -1475,7 +1983,7 @@
 
     if (state.playing) {
       var startDelay = Number(state.scheduledAt) > 0
-        ? Number(state.scheduledAt) - (Date.now() + serverOffset)
+        ? Number(state.scheduledAt) - (Date.now() + serverOffset) - localDeviceDelayMs()
         : 0;
       cancelScheduledRoomPlayback();
       var playbackGuard = scheduledRoomPlaybackGuard(state);
@@ -1506,6 +2014,7 @@
     bridge.sync.prepareDeadline = Math.max(0, Number(state.prepareDeadline) || 0);
     bridge.sync.prepareMaxDeadline = Math.max(0, Number(state.prepareMaxDeadline) || 0);
     bridge.sync.devices = Array.isArray(state.devices) ? state.devices.slice(0, 64) : [];
+    applyCalibrationFromRoomDevices(bridge.sync.devices);
     updateRoomSyncUi();
     if (!bridge.sync.clockReady && Number(state.serverTime)) {
       var bootstrapOffset = Number(state.serverTime) - Date.now();
@@ -1583,13 +2092,25 @@
 
   function announceCurrentTrack(forceResume) {
     cancelScheduledRoomPlayback();
+    cancelTrackAnnouncement();
     var song = currentSongForBridge();
     var descriptor = descriptorForSong(song);
     var shouldResume = forceResume === true || Boolean(window.audio && !window.audio.paused && !window.audio.ended);
+    var announcementSerial = trackAnnouncementSerial;
+    var connectionGeneration = roomConnectionGeneration;
+    var descriptorId = descriptor && String(descriptor.id || "");
     if (shouldResume) pauseForRoomSync(window.audio);
     if (!descriptor || !sendCommand("track", descriptor)) return;
-    window.setTimeout(function () {
-      if (!window.audio) return;
+    trackAnnouncementTimer = window.setTimeout(function () {
+      trackAnnouncementTimer = 0;
+      // A delayed start belongs to exactly one leader, connection, and track.
+      // Never let a fast song switch or reconnect send a stale seek/play pair.
+      if (announcementSerial !== trackAnnouncementSerial
+        || connectionGeneration !== roomConnectionGeneration
+        || !joinedRoom
+        || !bridge.sync.leader
+        || !window.audio
+        || currentDescriptorId() !== descriptorId) return;
       sendCommand("seek", Number(window.audio.currentTime) || 0);
       sendCommand(shouldResume ? "play" : "pause");
     }, 80);
@@ -1599,8 +2120,10 @@
     var media = window.audio;
     if (!media || media === attachedAudio) return;
     attachedAudio = media;
+    updateMediaSessionMetadata();
     media.addEventListener("play", function () {
       if (roomMediaPrimeActive === media) return;
+      updateMediaSessionPlaybackState(true);
       if (suppressNextPlayCommand) {
         suppressNextPlayCommand = false;
         return;
@@ -1615,6 +2138,7 @@
     });
     media.addEventListener("pause", function () {
       if (roomMediaPrimeActive === media) return;
+      updateMediaSessionPlaybackState(true);
       if (suppressNextPauseCommand) {
         suppressNextPauseCommand = false;
         return;
@@ -1625,6 +2149,7 @@
       }
     });
     media.addEventListener("seeked", function () {
+      updateMediaSessionPlaybackState(true);
       if (suppressNextSeekCommand) {
         suppressNextSeekCommand = false;
         window.clearTimeout(suppressSeekResetTimer);
@@ -1638,6 +2163,7 @@
       if (!applyingRoomState) sendSeekCommand(media.currentTime, false);
     });
     media.addEventListener("timeupdate", function () {
+      updateMediaSessionPlaybackState(false);
       if (roomMediaPrimeActive === media || applyingRoomState || Date.now() - lastPositionSentAt < 1000) return;
       lastPositionSentAt = Date.now();
       sendCommand("progress", media.currentTime);
@@ -1698,6 +2224,8 @@
     });
     ["loadedmetadata", "durationchange"].forEach(function (eventName) {
       media.addEventListener(eventName, function () {
+        updateMediaSessionMetadata();
+        updateMediaSessionPlaybackState(true);
         reportCurrentRoomDeviceStatus(true);
         if (!lastRoomState || !lastRoomState.preparing) return;
         applyingRoomState = true;
@@ -1714,6 +2242,9 @@
         ));
         lastReadyPrepareId = "";
       });
+    });
+    media.addEventListener("ended", function () {
+      updateMediaSessionPlaybackState(true);
     });
   }
 
@@ -1873,11 +2404,24 @@
       leaderBuffering = false;
       if (window.audio) setMediaPlaybackRate(window.audio, 1);
       var args = Array.prototype.slice.call(arguments);
+      var callerRequestedRoomSync = Boolean(args[1] && args[1].roomSync);
+      var holdForRoomJoin = !callerRequestedRoomSync && shouldHoldPlaybackForRoomJoin();
+      var pendingJoinIntent = holdForRoomJoin ? beginPendingRoomJoinPlayback(args[0]) : null;
+      var joinedPlayback = callerRequestedRoomSync || (joinedRoom && roomPlaybackRequiresSharedAuthority());
+      if (joinedPlayback) args[1] = Object.assign({}, args[1] || {}, { roomSync: true });
       var deferLeaderStart = !applyingRoomState && joinedRoom && bridge.sync.leader;
       if (deferLeaderStart) args[1] = Object.assign({}, args[1] || {}, { deferPlayback: true });
+      if (holdForRoomJoin) args[1] = Object.assign({}, args[1] || {}, { deferPlayback: true, roomJoinPending: true });
       var result = await originalPlayQueueAt.apply(this, args);
+      var pendingJoinReady = finalizePendingRoomJoinPlayback(pendingJoinIntent);
       attachAudioEvents();
-      if (!applyingRoomState && bridge.sync.leader) announceCurrentTrack(deferLeaderStart);
+      updateMediaSessionMetadata();
+      if (holdForRoomJoin && pendingJoinReady && !joinedRoom) {
+        notify("正在加入同步房间，歌曲会在全部设备缓冲就绪后统一播放");
+      }
+      if (!applyingRoomState && bridge.sync.leader) {
+        announceCurrentTrack(deferLeaderStart || (holdForRoomJoin && pendingJoinReady));
+      }
       return result;
     };
 
@@ -1893,6 +2437,11 @@
       var original = window[name];
       if (typeof original !== "function") return;
       window[name] = function classicRoomGuardedControl() {
+        if (name === "togglePlay" && pendingRoomJoinPlayback && shouldHoldPlaybackForRoomJoin()) {
+          notify("正在加入同步房间，等待所有设备缓冲后统一播放");
+          return Promise.resolve(false);
+        }
+        if (name === "clearQueue") pendingRoomJoinPlayback = null;
         if (name === "togglePlay" && canResumeFollowerFromGesture()) {
           return primeRoomMediaForSync(window.audio, true).then(function (unlocked) {
             if (!unlocked) return false;
@@ -1960,6 +2509,7 @@
       return;
     }
     var generation = ++roomConnectionGeneration;
+    cancelTrackAnnouncement();
     try {
       socket = new WebSocket(relayUrl);
     } catch {
@@ -2019,13 +2569,25 @@
         bridge.sync.protocolError = "";
         if (message.state) bridge.sync.deviceCount = Math.max(0, Number(message.state.deviceCount) || 0);
         updateRoomSyncUi();
+        reportLocalDeviceCalibration();
         if (message.state) enqueueRoomState(message.state, generation);
         if (bridge.sync.leader) {
+          var resumePendingJoinPlayback = consumePendingRoomJoinPlayback();
           var initialVolume = Number(window.targetVolume);
           if (!Number.isFinite(initialVolume)) initialVolume = window.audio ? Number(window.audio.volume) : 0.72;
           sendCommand("volume", Math.max(0, Math.min(1, initialVolume)));
           if (pendingLocalFile) uploadLocalFileToRoom(pendingLocalFile);
-          window.setTimeout(announceCurrentTrack, 160);
+          var joinAnnouncementSerial = trackAnnouncementSerial;
+          joinAnnouncementTimer = window.setTimeout(function () {
+            joinAnnouncementTimer = 0;
+            if (joinAnnouncementSerial !== trackAnnouncementSerial
+              || generation !== roomConnectionGeneration
+              || !joinedRoom
+              || !bridge.sync.leader) return;
+            announceCurrentTrack(resumePendingJoinPlayback);
+          }, 160);
+        } else {
+          pendingRoomJoinPlayback = null;
         }
         return;
       }
@@ -2071,6 +2633,7 @@
       window.clearInterval(clockPingTimer);
       clockPingTimer = 0;
       cancelScheduledRoomPlayback();
+      cancelTrackAnnouncement();
       if (window.audio) setMediaPlaybackRate(window.audio, 1);
       if (pendingSeekMedia && pendingSeekHandler) {
         pendingSeekMedia.removeEventListener("loadedmetadata", pendingSeekHandler);
@@ -2089,6 +2652,11 @@
       deviceStatusTimer = 0;
       pendingDeviceStatus = null;
       lastDeviceStatusSentAt = 0;
+      window.clearTimeout(calibrationTimer);
+      calibrationTimer = 0;
+      pendingCalibration = null;
+      lastCalibrationSentAt = 0;
+      localCalibrationMinimumUpdatedAt = 0;
       roomDeviceRenderSignature = "";
       leaderStartRequestPending = null;
       updateRoomSyncUi();
@@ -2109,6 +2677,7 @@
     installLocalFileSync();
     installFollowerControlGuards();
     installRoomSyncUi();
+    installMediaSession();
     startServiceHealthPolling();
     window.clearInterval(deviceStatusPulseTimer);
     deviceStatusPulseTimer = window.setInterval(function () {

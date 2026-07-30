@@ -56,3 +56,50 @@ web adaptation with a separate LAN synchronization relay and restricted local
 music adapter. The original copyright, GPL-3.0 license, attribution, design
 notice, and acknowledgements above remain unchanged. Additional details are in
 `ATTRIBUTION.md`.
+
+The LAN adaptation later added bounded per-device application-volume and output
+delay calibration, synchronized start barriers with adaptive buffering, local
+room QR generation, system Media Session controls, and an optional dual-audio
+prefetch/crossfade path in the separate `/modern` interface. These additions do
+not alter music-platform entitlements, bypass paid access, or remove any
+original author or copyright notice.
+
+## Compatible Mineradio 2.0.3 player enhancements
+
+On 2026-07-30 this web adaptation reviewed the player-side changes in
+`XxHuberrr/Mineradio` release `v2.0.3`
+(`7974c52270c628d7ddb7427eaa0269e024cc0d3f`) and incorporated compatible
+front-end behavior without replacing the LAN bridge:
+
+- A clean-room Canvas audio-reactive Sonic Terrain preset with DIY theme,
+  intensity, and spectrum-response controls.
+- Corrected 3D playlist-shelf foreground ordering and removal of the obsolete
+  floor-reflection allocation.
+- A bounded solo-playback recovery layer: 20 seconds per recovery transaction,
+  at most two automatic queue advances, stale-token invalidation, and a strict
+  room-mode bypass.
+
+The upstream desktop/server code, account-cookie workflows, non-official
+platform adapters, DRM/decryption routines, external visual assets, and
+cross-provider URL construction were deliberately not imported. This retains
+the project GPL-3.0 obligations and the original author, design, and copyright
+notices while keeping room synchronization authoritative.
+
+### LAN start and recovery hardening
+
+The same 2026-07-30 update also hardens the web-only relay integration:
+
+- A song selected while the local Relay is still joining is preloaded without
+  audible playback. Once the device becomes the room leader, it enters the
+  normal buffer/readiness barrier and starts at the shared server time.
+- Delayed leader announcements now carry a serial, room-connection generation,
+  and track descriptor guard. Rapid song changes or reconnects cannot send an
+  old seek/play pair into a newer preparation barrier.
+- Solo HOME playback retains the bounded fallback; when more than one device
+  participates (or a room barrier is active), automatic local replacement and
+  queue advance are disabled.
+- Relay calibration is normalized to the UI's 0.5 dB / 5 ms increments, and
+  completed preparation IDs and temporary buffer diagnostics are cleared after
+  their short post-start retention window.
+- Cache version parameters were advanced for the Classic bridge and recovery
+  layer so browsers cannot combine the new room rules with stale script files.

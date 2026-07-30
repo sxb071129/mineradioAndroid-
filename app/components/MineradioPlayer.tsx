@@ -40,6 +40,7 @@ import {
   useState,
 } from "react";
 import { RoomServiceCenter } from "./RoomServiceCenter";
+import { useMediaSession } from "../hooks/use-media-session";
 import { useRoomSync } from "../hooks/use-room-sync";
 import { useServiceHealth } from "../hooks/use-service-health";
 import {
@@ -68,6 +69,8 @@ type LocalTrack = TrackDescriptor & {
   url: string;
   sourceId?: string;
   cover?: string;
+  artist?: string;
+  album?: string;
 };
 type PlayerQueueAction = QueueAction<LocalTrack>
   | { type: "hydrate"; state: QueueState<LocalTrack> }
@@ -77,6 +80,20 @@ type RoomControlThrottle = {
   lastSentAt: number;
   pending: number | null;
   timer: ReturnType<typeof setTimeout> | null;
+};
+type DeviceCalibration = {
+  volumeTrimDb: number;
+  delayMs: number;
+};
+type PrefetchedQueueTrack = {
+  baseState: QueueState<LocalTrack>;
+  nextState: QueueState<LocalTrack>;
+  track: LocalTrack;
+  source: string;
+};
+type CrossfadeHandoff = {
+  source: string;
+  active: boolean;
 };
 type CloudPanel = "login" | "library" | "daily" | "recommend" | "search";
 type MusicProvider = "netease" | "kugou";
@@ -145,6 +162,11 @@ const PLAYER_QUEUE_STORAGE_KEY = "mineradio-player-queue-v2";
 const LIKED_TRACKS_STORAGE_KEY = "mineradio-liked-tracks-v1";
 const ROOM_CONTROL_THROTTLE_MS = 80;
 const ROOM_DEVICE_STATUS_THROTTLE_MS = 400;
+const DEVICE_CALIBRATION_STORAGE_KEY = "mineradio-device-calibration-v1";
+const PLAYBACK_TRANSITION_STORAGE_KEY = "mineradio-playback-transition-v1";
+const MIN_VOLUME_TRIM_DB = -24;
+const MAX_VOLUME_TRIM_DB = 12;
+const MAX_DEVICE_DELAY_MS = 500;
 const REPEAT_LABELS: Record<RepeatMode, string> = {
   off: "循环关闭",
   all: "列表循环",
@@ -220,6 +242,43 @@ function defaultMusicApiUrl() {
   }
   if (window.location.protocol === "https:") return window.location.origin;
   return `http://${window.location.hostname}:8790`;
+}
+
+function bounded(value: number, minimum: number, maximum: number) {
+  return Math.max(minimum, Math.min(maximum, Number.isFinite(value) ? value : minimum));
+}
+
+function dbToGain(value: number) {
+  return 10 ** (bounded(value, MIN_VOLUME_TRIM_DB, MAX_VOLUME_TRIM_DB) / 20);
+}
+
+function readDeviceCalibration(): DeviceCalibration {
+  if (typeof window === "undefined") return { volumeTrimDb: 0, delayMs: 0 };
+  try {
+    const value = JSON.parse(window.localStorage.getItem(DEVICE_CALIBRATION_STORAGE_KEY) || "{}") as Partial<DeviceCalibration>;
+    return {
+      volumeTrimDb: bounded(Number(value.volumeTrimDb) || 0, MIN_VOLUME_TRIM_DB, MAX_VOLUME_TRIM_DB),
+      delayMs: bounded(Number(value.delayMs) || 0, 0, MAX_DEVICE_DELAY_MS),
+    };
+  } catch {
+    return { volumeTrimDb: 0, delayMs: 0 };
+  }
+}
+
+function readPlaybackTransitionSettings() {
+  if (typeof window === "undefined") return { gapless: true, crossfadeSeconds: 3 };
+  try {
+    const value = JSON.parse(window.localStorage.getItem(PLAYBACK_TRANSITION_STORAGE_KEY) || "{}") as {
+      gapless?: boolean;
+      crossfadeSeconds?: number;
+    };
+    return {
+      gapless: value.gapless !== false,
+      crossfadeSeconds: bounded(Number(value.crossfadeSeconds) || 0, 0, 8),
+    };
+  } catch {
+    return { gapless: true, crossfadeSeconds: 3 };
+  }
 }
 
 async function requestCloud<T>(baseUrl: string, pathname: string, signal?: AbortSignal) {
@@ -401,6 +460,8 @@ function cloudSongToQueueTrack(song: CloudSong, quality: PlaybackQuality): Local
     quality,
     sourceId: identity.sourceId,
     cover: song.cover,
+    artist: song.artist,
+    album: song.album,
     url: "",
   };
 }
@@ -446,11 +507,21 @@ export function MineradioPlayer() {
   const [cloudRefresh, setCloudRefresh] = useState(0);
   const [playbackQuality, setPlaybackQualityState] = useState<PlaybackQuality>("hires");
   const [audioEffect, setAudioEffect] = useState<AudioEffectPreset>("original");
+  const [deviceCalibration, setDeviceCalibration] = useState<DeviceCalibration>({
+    volumeTrimDb: 0,
+    delayMs: 0,
+  });
+  const [gaplessEnabled, setGaplessEnabled] = useState(true);
+  const [crossfadeSeconds, setCrossfadeSeconds] = useState(3);
+  const [nextTrackPrefetched, setNextTrackPrefetched] = useState(false);
+  const [crossfadeHandoffActive, setCrossfadeHandoffActive] = useState(false);
+  const [failedRoomQrUrl, setFailedRoomQrUrl] = useState("");
   const [qualityOpen, setQualityOpen] = useState(false);
   const [audioEffectOpen, setAudioEffectOpen] = useState(false);
   const [queueState, dispatchQueue] = useReducer(playerQueueReducer, createQueueState<LocalTrack>());
   const queueStateRef = useRef(queueState);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const nextAudioRef = useRef<HTMLAudioElement>(null);
   const stageRef = useRef<HTMLElement>(null);
   const lyricsDialogRef = useRef<HTMLElement>(null);
   const legacyDialogRef = useRef<HTMLElement>(null);
@@ -459,7 +530,13 @@ export function MineradioPlayer() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const effectNodesRef = useRef<AudioEffectNodes | null>(null);
   const volumeGainRef = useRef<GainNode | null>(null);
+  const mainFadeGainRef = useRef<GainNode | null>(null);
+  const nextFadeGainRef = useRef<GainNode | null>(null);
+  const calibrationDelayRef = useRef<DelayNode | null>(null);
   const playbackVolumeRef = useRef(DEFAULT_VOLUME);
+  const deviceCalibrationRef = useRef<DeviceCalibration>({ volumeTrimDb: 0, delayMs: 0 });
+  const calibrationPendingEchoRef = useRef<(DeviceCalibration & { sentAt: number }) | null>(null);
+  const calibrationClientIdRef = useRef("");
   const audioEffectRef = useRef<AudioEffectPreset>(audioEffect);
   const resumeAfterSourceChangeRef = useRef<{ position: number; playing: boolean; source: string } | null>(null);
   const prepareSequenceRef = useRef(0);
@@ -477,6 +554,9 @@ export function MineradioPlayer() {
   });
   const roomDeviceStatusRef = useRef({ lastSentAt: 0, signature: "" });
   const queueTransitionRef = useRef<{ autoplay: boolean; position: number } | null>(null);
+  const prefetchedQueueTrackRef = useRef<PrefetchedQueueTrack | null>(null);
+  const crossfadeHandoffRef = useRef<CrossfadeHandoff | null>(null);
+  const crossfadeStartedTrackRef = useRef("");
   const cloudSourceCacheRef = useRef(new Map<string, string>());
   const settingsHydratedRef = useRef(false);
   const sourceCreatedRef = useRef(false);
@@ -583,7 +663,10 @@ export function MineradioPlayer() {
     }
   }, [musicApiUrl]);
 
-  const resolveQueueTrack = useCallback(async (track: LocalTrack) => {
+  const resolveQueueTrack = useCallback(async (
+    track: LocalTrack,
+    options: { silent?: boolean; controller?: AbortController } = {},
+  ) => {
     if (track.url) return track;
     const cached = cloudSourceCacheRef.current.get(track.id);
     if (cached) return { ...track, url: cached };
@@ -595,33 +678,42 @@ export function MineradioPlayer() {
 
     let source = "";
     if (provider === "kugou") {
-      const { controller, sequence } = beginPrepareRequest();
-      setNotice("正在确认酷狗播放权限与音源…");
+      const request = options.silent
+        ? { controller: options.controller || new AbortController(), sequence: 0 }
+        : beginPrepareRequest();
+      const { controller, sequence } = request;
+      if (!options.silent) setNotice("正在确认酷狗播放权限与音源…");
       let outcome: KugouPrepareOutcome;
       try {
         outcome = await prepareKugouPlayback(sourceId, quality, controller);
       } catch {
         return null;
       }
-      if (!isCurrentPrepareRequest(sequence, controller)) return null;
-      prepareControllerRef.current = null;
+      if (controller.signal.aborted) return null;
+      if (!options.silent) {
+        if (!isCurrentPrepareRequest(sequence, controller)) return null;
+        prepareControllerRef.current = null;
+      }
       if (outcome.kind === "failed") {
-        setNotice(kugouRecoveryMessage(outcome.code));
+        if (!options.silent) setNotice(kugouRecoveryMessage(outcome.code));
         return null;
       }
       source = outcome.kind === "legacy"
         ? `${musicApiUrl.replace(/\/+$/, "")}${cloudStreamPath(provider, sourceId, quality)}`
         : outcome.source;
-      if (outcome.kind === "legacy") setNotice(KUGOU_COMPATIBILITY_NOTICE);
-      else if (outcome.resolvedQuality !== quality) {
+      if (outcome.kind === "legacy" && !options.silent) setNotice(KUGOU_COMPATIBILITY_NOTICE);
+      else if (outcome.kind === "prepared" && outcome.resolvedQuality !== quality && !options.silent) {
         setNotice(`该歌曲当前可用的酷狗音源为 ${qualityShortLabel(outcome.resolvedQuality, "kugou")}。`);
       }
-    } else {
+    } else if (!options.silent) {
       prepareSequenceRef.current += 1;
       prepareControllerRef.current?.abort();
       prepareControllerRef.current = null;
       source = `${musicApiUrl.replace(/\/+$/, "")}${cloudStreamPath(provider, sourceId, quality)}`;
+    } else {
+      source = `${musicApiUrl.replace(/\/+$/, "")}${cloudStreamPath(provider, sourceId, quality)}`;
     }
+    if (options.controller?.signal.aborted) return null;
     cloudSourceCacheRef.current.set(track.id, source);
     return { ...track, sourceId, url: source };
   }, [
@@ -643,6 +735,12 @@ export function MineradioPlayer() {
       setDeviceName(defaultDeviceName());
       setPlaybackQualityState(readPlaybackQuality());
       setAudioEffect(readAudioEffect());
+      const calibration = readDeviceCalibration();
+      deviceCalibrationRef.current = calibration;
+      setDeviceCalibration(calibration);
+      const transitionSettings = readPlaybackTransitionSettings();
+      setGaplessEnabled(transitionSettings.gapless);
+      setCrossfadeSeconds(transitionSettings.crossfadeSeconds);
       try {
         const stored = JSON.parse(window.localStorage.getItem(LIKED_TRACKS_STORAGE_KEY) || "[]");
         if (Array.isArray(stored)) {
@@ -708,9 +806,70 @@ export function MineradioPlayer() {
   }, [musicApiUrl, relayUrl]);
 
   useEffect(() => {
+    deviceCalibrationRef.current = deviceCalibration;
+    if (!settingsHydratedRef.current) return;
+    window.localStorage.setItem(DEVICE_CALIBRATION_STORAGE_KEY, JSON.stringify(deviceCalibration));
+  }, [deviceCalibration]);
+
+  useEffect(() => {
+    if (!settingsHydratedRef.current) return;
+    window.localStorage.setItem(
+      PLAYBACK_TRANSITION_STORAGE_KEY,
+      JSON.stringify({ gapless: gaplessEnabled, crossfadeSeconds }),
+    );
+  }, [crossfadeSeconds, gaplessEnabled]);
+
+  useEffect(() => {
     if (!queuePersistenceReady) return;
     window.localStorage.setItem(PLAYER_QUEUE_STORAGE_KEY, serializeQueueState(queueState));
   }, [queuePersistenceReady, queueState]);
+
+  useEffect(() => {
+    if (mode !== "room" || !roomConnected || !room.clientId) {
+      calibrationClientIdRef.current = "";
+      calibrationPendingEchoRef.current = null;
+      return;
+    }
+    if (calibrationClientIdRef.current === room.clientId) return;
+    calibrationClientIdRef.current = room.clientId;
+    const calibration = deviceCalibrationRef.current;
+    calibrationPendingEchoRef.current = { ...calibration, sentAt: Date.now() };
+    sendRoomCommand({
+      action: "device-status",
+      volumeTrimDb: calibration.volumeTrimDb,
+      delayMs: calibration.delayMs,
+      quality: effectiveQuality,
+    });
+  }, [effectiveQuality, mode, room.clientId, roomConnected, sendRoomCommand]);
+
+  useEffect(() => {
+    if (mode !== "room" || !room.clientId) return;
+    const ownDevice = (roomState?.devices || []).find((device) => device.clientId === room.clientId);
+    if (!ownDevice
+      || !Number.isFinite(Number(ownDevice.volumeTrimDb))
+      || !Number.isFinite(Number(ownDevice.delayMs))) return;
+    const remote = {
+      volumeTrimDb: bounded(Number(ownDevice.volumeTrimDb), MIN_VOLUME_TRIM_DB, MAX_VOLUME_TRIM_DB),
+      delayMs: bounded(Number(ownDevice.delayMs), 0, MAX_DEVICE_DELAY_MS),
+    };
+    const pending = calibrationPendingEchoRef.current;
+    if (pending) {
+      if (Math.abs(remote.volumeTrimDb - pending.volumeTrimDb) < 0.01
+        && Math.abs(remote.delayMs - pending.delayMs) < 0.5) {
+        calibrationPendingEchoRef.current = null;
+      } else if (Date.now() - pending.sentAt < 2500) {
+        return;
+      } else {
+        calibrationPendingEchoRef.current = null;
+      }
+    }
+    const current = deviceCalibrationRef.current;
+    if (Math.abs(remote.volumeTrimDb - current.volumeTrimDb) < 0.01
+      && Math.abs(remote.delayMs - current.delayMs) < 0.5) return;
+    deviceCalibrationRef.current = remote;
+    setDeviceCalibration(remote);
+    setNotice(`主控已更新本机校准：${remote.volumeTrimDb >= 0 ? "+" : ""}${remote.volumeTrimDb.toFixed(1)} dB · ${Math.round(remote.delayMs)} ms`);
+  }, [mode, room.clientId, roomState?.devices]);
 
   useEffect(() => {
     queueStateRef.current = queueState;
@@ -869,6 +1028,107 @@ export function MineradioPlayer() {
   }, [cloudQrKey, cloudUser?.loggedIn, legacyPanel, loginProvider, musicApiUrl]);
 
   useEffect(() => {
+    let cancelled = false;
+    const clearPrefetch = () => {
+      prefetchedQueueTrackRef.current = null;
+      queueMicrotask(() => {
+        if (!cancelled) setNextTrackPrefetched(false);
+      });
+    };
+    const nextAudio = nextAudioRef.current;
+    const activeQueueTrack = getCurrentTrack(queueState);
+    const currentTrackReady = Boolean(
+      activeQueueTrack
+      && localTrack?.id === activeQueueTrack.id
+      && audioSource,
+    );
+    if (!nextAudio
+      || !queuePersistenceReady
+      || mode !== "solo"
+      || !gaplessEnabled
+      || !currentTrackReady
+      || crossfadeHandoffActive) {
+      if (!crossfadeHandoffActive) clearPrefetch();
+      return () => {
+        cancelled = true;
+      };
+    }
+    const current = queueState;
+    if (current.repeat === "one" || current.currentIndex < 0) {
+      clearPrefetch();
+      return () => {
+        cancelled = true;
+      };
+    }
+    const nextState = queueReducer(current, { type: "next" });
+    if (nextState.currentIndex === current.currentIndex || nextState.currentIndex < 0) {
+      clearPrefetch();
+      return () => {
+        cancelled = true;
+      };
+    }
+    const candidate = nextState.queue[nextState.currentIndex];
+    if (!candidate) {
+      clearPrefetch();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const onReady = () => {
+      if (!cancelled) setNextTrackPrefetched(nextAudio.readyState >= 3);
+    };
+    const prefetchController = new AbortController();
+    clearPrefetch();
+    queueMicrotask(() => {
+      if (cancelled) return;
+      void resolveQueueTrack(candidate, {
+        silent: true,
+        controller: prefetchController,
+      }).then((resolved) => {
+        if (cancelled || !resolved || crossfadeHandoffRef.current?.active) return;
+        const resolvedNextState = createQueueState<LocalTrack>({
+          ...nextState,
+          queue: nextState.queue.map((track, index) => (
+            index === nextState.currentIndex ? resolved : track
+          )),
+        });
+        prefetchedQueueTrackRef.current = {
+          baseState: current,
+          nextState: resolvedNextState,
+          track: resolved,
+          source: resolved.url,
+        };
+        if (nextAudio.src !== resolved.url) {
+          nextAudio.pause();
+          nextAudio.src = resolved.url;
+          nextAudio.load();
+        }
+        if (nextAudio.readyState >= 3) setNextTrackPrefetched(true);
+        else {
+          nextAudio.addEventListener("canplay", onReady, { once: true });
+          nextAudio.addEventListener("canplaythrough", onReady, { once: true });
+        }
+      });
+    });
+    return () => {
+      cancelled = true;
+      prefetchController.abort();
+      nextAudio.removeEventListener("canplay", onReady);
+      nextAudio.removeEventListener("canplaythrough", onReady);
+    };
+  }, [
+    crossfadeHandoffActive,
+    gaplessEnabled,
+    audioSource,
+    localTrack?.id,
+    mode,
+    queuePersistenceReady,
+    queueState,
+    resolveQueueTrack,
+  ]);
+
+  useEffect(() => {
     if (!queuePersistenceReady || mode !== "solo") return;
     const transition = queueTransitionRef.current;
     queueTransitionRef.current = null;
@@ -916,13 +1176,19 @@ export function MineradioPlayer() {
 
   const ensureAudioGraph = useCallback(async () => {
     const audio = audioRef.current;
-    if (!audio) return false;
+    const nextAudio = nextAudioRef.current;
+    if (!audio || !nextAudio) return false;
     const Context = window.AudioContext || (window as AudioWindow).webkitAudioContext;
     if (!Context) return false;
     if (!audioContextRef.current) audioContextRef.current = new Context();
     const context = audioContextRef.current;
     if (!sourceCreatedRef.current) {
       const source = context.createMediaElementSource(audio);
+      const nextSource = context.createMediaElementSource(nextAudio);
+      const mainFade = context.createGain();
+      const nextFade = context.createGain();
+      mainFade.gain.value = 1;
+      nextFade.gain.value = 0;
       const low = context.createBiquadFilter();
       low.type = "lowshelf";
       low.frequency.value = 120;
@@ -938,29 +1204,79 @@ export function MineradioPlayer() {
       compressor.release.value = 0.24;
       const output = context.createGain();
       const volume = context.createGain();
+      const limiter = context.createDynamicsCompressor();
+      limiter.threshold.value = -1;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.08;
+      const calibrationDelay = context.createDelay(1);
       const analyser = context.createAnalyser();
       analyser.fftSize = 256;
       analyser.smoothingTimeConstant = 0.78;
-      source.connect(low);
+      source.connect(mainFade);
+      nextSource.connect(nextFade);
+      mainFade.connect(low);
+      nextFade.connect(low);
       low.connect(presence);
       presence.connect(high);
       high.connect(compressor);
       compressor.connect(output);
       output.connect(volume);
-      volume.connect(analyser);
+      volume.connect(limiter);
+      limiter.connect(calibrationDelay);
+      calibrationDelay.connect(analyser);
       analyser.connect(context.destination);
       const nodes = { low, presence, high, compressor, output };
       applyAudioEffect(nodes, audioEffectRef.current, context.currentTime);
-      volume.gain.value = playbackVolumeRef.current;
+      volume.gain.value = playbackVolumeRef.current * dbToGain(deviceCalibrationRef.current.volumeTrimDb);
+      calibrationDelay.delayTime.value = deviceCalibrationRef.current.delayMs / 1000;
       audio.volume = 1;
+      nextAudio.volume = 1;
       effectNodesRef.current = nodes;
       volumeGainRef.current = volume;
+      mainFadeGainRef.current = mainFade;
+      nextFadeGainRef.current = nextFade;
+      calibrationDelayRef.current = calibrationDelay;
       analyserRef.current = analyser;
       sourceCreatedRef.current = true;
     }
     if (context.state === "suspended") await context.resume();
     return true;
   }, []);
+
+  const stopSecondaryPlayback = useCallback((clearPrefetch = false) => {
+    const nextAudio = nextAudioRef.current;
+    if (nextAudio) {
+      nextAudio.pause();
+      try { nextAudio.currentTime = 0; } catch {}
+      if (clearPrefetch) {
+        nextAudio.removeAttribute("src");
+        nextAudio.load();
+      }
+    }
+    const context = audioContextRef.current;
+    const mainFade = mainFadeGainRef.current;
+    const nextFade = nextFadeGainRef.current;
+    if (context && mainFade && nextFade) {
+      mainFade.gain.cancelScheduledValues(context.currentTime);
+      nextFade.gain.cancelScheduledValues(context.currentTime);
+      mainFade.gain.setValueAtTime(1, context.currentTime);
+      nextFade.gain.setValueAtTime(0, context.currentTime);
+    }
+    crossfadeHandoffRef.current = null;
+    crossfadeStartedTrackRef.current = "";
+    if (clearPrefetch) {
+      prefetchedQueueTrackRef.current = null;
+      setNextTrackPrefetched(false);
+    }
+    setCrossfadeHandoffActive(false);
+  }, []);
+
+  useEffect(() => {
+    const handoff = crossfadeHandoffRef.current;
+    if (!handoff?.active || handoff.source !== audioSource) stopSecondaryPlayback(true);
+  }, [audioSource, stopSecondaryPlayback]);
 
   const primeRoomPlayback = useCallback((fromUserGesture = false) => {
     const audio = audioRef.current;
@@ -1032,17 +1348,26 @@ export function MineradioPlayer() {
   useEffect(() => {
     const value = Math.max(0, Math.min(effectiveVolume, 1));
     playbackVolumeRef.current = value;
+    const calibratedValue = value * dbToGain(deviceCalibration.volumeTrimDb);
     const audio = audioRef.current;
     const context = audioContextRef.current;
     const volume = volumeGainRef.current;
     if (context && volume) {
       if (audio) audio.volume = 1;
       volume.gain.cancelScheduledValues(context.currentTime);
-      volume.gain.setTargetAtTime(value, context.currentTime, 0.025);
+      volume.gain.setTargetAtTime(calibratedValue, context.currentTime, 0.025);
     } else if (audio) {
-      audio.volume = value;
+      audio.volume = Math.min(1, calibratedValue);
     }
-  }, [effectiveVolume]);
+  }, [deviceCalibration.volumeTrimDb, effectiveVolume]);
+
+  useEffect(() => {
+    const context = audioContextRef.current;
+    const delay = calibrationDelayRef.current;
+    if (!context || !delay) return;
+    delay.delayTime.cancelScheduledValues(context.currentTime);
+    delay.delayTime.setTargetAtTime(deviceCalibration.delayMs / 1000, context.currentTime, 0.035);
+  }, [deviceCalibration.delayMs]);
 
   useEffect(() => {
     let frame = 0;
@@ -1089,10 +1414,17 @@ export function MineradioPlayer() {
     audio.preservesPitch = true;
     audio.preload = "auto";
 
-    const targetPosition = () => Math.min(
-      getRoomTargetPosition(state),
-      audio.duration || Infinity,
-    );
+    const targetPosition = () => {
+      const serverNow = getRoomServerNow();
+      const delayCompensation = state.playing
+        && (!state.scheduledAt || state.scheduledAt <= serverNow)
+        ? deviceCalibration.delayMs / 1000
+        : 0;
+      return Math.min(
+        getRoomTargetPosition(state) + delayCompensation,
+        audio.duration || Infinity,
+      );
+    };
     const deviceMetrics = (bufferStateOverride?: RoomBufferState) => {
       const target = targetPosition();
       const buffer = measureBufferedWindow(audio, target, {
@@ -1117,6 +1449,8 @@ export function MineradioPlayer() {
           ? Math.round((target - (audio.currentTime || 0)) * 1000)
           : 0,
         quality: effectiveQuality,
+        volumeTrimDb: deviceCalibration.volumeTrimDb,
+        delayMs: deviceCalibration.delayMs,
         bufferReady,
       };
     };
@@ -1129,6 +1463,8 @@ export function MineradioPlayer() {
         metrics.bufferState,
         Math.round(metrics.driftMs / 10),
         metrics.quality,
+        metrics.volumeTrimDb,
+        metrics.delayMs,
       ].join(":");
       const now = Date.now();
       const previous = roomDeviceStatusRef.current;
@@ -1144,6 +1480,8 @@ export function MineradioPlayer() {
         jitterMs: metrics.jitterMs,
         driftMs: metrics.driftMs,
         quality: metrics.quality,
+        volumeTrimDb: metrics.volumeTrimDb,
+        delayMs: metrics.delayMs,
       })) {
         roomDeviceStatusRef.current = { lastSentAt: now, signature };
       }
@@ -1176,6 +1514,8 @@ export function MineradioPlayer() {
         jitterMs: metrics.jitterMs,
         driftMs: metrics.driftMs,
         quality: metrics.quality,
+        volumeTrimDb: metrics.volumeTrimDb,
+        delayMs: metrics.delayMs,
       })) {
         roomReadyPrepareRef.current = state.prepareId;
       }
@@ -1224,7 +1564,7 @@ export function MineradioPlayer() {
       }
 
       const startDelay = state.scheduledAt > 0
-        ? state.scheduledAt - getRoomServerNow()
+        ? state.scheduledAt - deviceCalibration.delayMs - getRoomServerNow()
         : 0;
       if (startDelay > 20) {
         if (!audio.paused) audio.pause();
@@ -1261,6 +1601,8 @@ export function MineradioPlayer() {
         jitterMs: metrics.jitterMs,
         driftMs: metrics.driftMs,
         quality: metrics.quality,
+        volumeTrimDb: metrics.volumeTrimDb,
+        delayMs: metrics.delayMs,
       });
       roomReadyPrepareRef.current = "";
     };
@@ -1300,6 +1642,8 @@ export function MineradioPlayer() {
     };
   }, [
     audioSource,
+    deviceCalibration.delayMs,
+    deviceCalibration.volumeTrimDb,
     effectiveQuality,
     getRoomServerNow,
     getRoomTargetPosition,
@@ -1319,10 +1663,75 @@ export function MineradioPlayer() {
     let lastLeaderPositionSentAt = 0;
     let leaderBuffering = false;
     let frame = 0;
+    const beginSecondaryPlayback = async (fadeSeconds: number) => {
+      const nextAudio = nextAudioRef.current;
+      const prefetched = prefetchedQueueTrackRef.current;
+      if (mode !== "solo"
+        || !gaplessEnabled
+        || !nextAudio
+        || !prefetched
+        || prefetched.baseState !== queueStateRef.current
+        || nextAudio.readyState < 3
+        || crossfadeHandoffRef.current?.active
+        || crossfadeStartedTrackRef.current === audio.currentSrc) return false;
+      crossfadeStartedTrackRef.current = audio.currentSrc;
+      if (!await ensureAudioGraph()) {
+        crossfadeStartedTrackRef.current = "";
+        return false;
+      }
+      const context = audioContextRef.current;
+      const mainFade = mainFadeGainRef.current;
+      const nextFade = nextFadeGainRef.current;
+      if (!context || !mainFade || !nextFade) {
+        crossfadeStartedTrackRef.current = "";
+        return false;
+      }
+      try {
+        nextAudio.currentTime = 0;
+        nextFade.gain.cancelScheduledValues(context.currentTime);
+        nextFade.gain.setValueAtTime(0, context.currentTime);
+        await nextAudio.play();
+        crossfadeHandoffRef.current = { source: prefetched.source, active: true };
+        setCrossfadeHandoffActive(true);
+        const nextAvailableSeconds = Number.isFinite(nextAudio.duration)
+          ? Math.max(0, nextAudio.duration - 0.25)
+          : fadeSeconds;
+        const duration = Math.max(0, Math.min(fadeSeconds, nextAvailableSeconds));
+        mainFade.gain.cancelScheduledValues(context.currentTime);
+        nextFade.gain.cancelScheduledValues(context.currentTime);
+        mainFade.gain.setValueAtTime(mainFade.gain.value, context.currentTime);
+        nextFade.gain.setValueAtTime(0, context.currentTime);
+        if (duration > 0.03) {
+          mainFade.gain.linearRampToValueAtTime(0, context.currentTime + duration);
+          nextFade.gain.linearRampToValueAtTime(1, context.currentTime + duration);
+        } else {
+          mainFade.gain.setValueAtTime(0, context.currentTime);
+          nextFade.gain.setValueAtTime(1, context.currentTime);
+        }
+        return true;
+      } catch {
+        stopSecondaryPlayback(false);
+        return false;
+      }
+    };
     const update = (timestamp = 0) => {
       if (timestamp - lastPaint > 180) {
         setProgress(audio.currentTime || 0);
         if (Number.isFinite(audio.duration)) setDuration(audio.duration || 0);
+        const remaining = audio.duration - audio.currentTime;
+        const nextAudio = nextAudioRef.current;
+        const nextAvailableSeconds = nextAudio && Number.isFinite(nextAudio.duration)
+          ? Math.max(0, nextAudio.duration - 0.25)
+          : crossfadeSeconds;
+        const fadeWindow = Math.min(crossfadeSeconds, nextAvailableSeconds);
+        if (mode === "solo"
+          && fadeWindow > 0.03
+          && !audio.paused
+          && Number.isFinite(remaining)
+          && remaining > 0.05
+          && remaining <= fadeWindow + 0.12) {
+          void beginSecondaryPlayback(Math.min(fadeWindow, remaining));
+        }
         lastPaint = timestamp;
       }
       frame = requestAnimationFrame(update);
@@ -1336,10 +1745,56 @@ export function MineradioPlayer() {
       if (!resume || !Number.isFinite(audio.duration)) return;
       resumeAfterSourceChangeRef.current = null;
       if (audio.currentSrc !== resume.source) return;
-      audio.currentTime = Math.min(resume.position, Math.max(0, audio.duration - 0.05));
+      const nextAudio = nextAudioRef.current;
+      const handoff = crossfadeHandoffRef.current;
+      const takingOver = Boolean(
+        handoff?.active
+        && handoff.source === resume.source
+        && nextAudio
+        && !nextAudio.paused,
+      );
+      const resumePosition = takingOver && nextAudio
+        ? nextAudio.currentTime
+        : resume.position;
+      audio.currentTime = Math.min(resumePosition, Math.max(0, audio.duration - 0.05));
       setProgress(audio.currentTime);
       if (resume.playing) {
-        void audio.play().then(() => setSoloPlaying(true)).catch(() => {
+        void audio.play().then(() => {
+          setSoloPlaying(true);
+          if (!takingOver || !nextAudio) return;
+          const context = audioContextRef.current;
+          const mainFade = mainFadeGainRef.current;
+          const nextFade = nextFadeGainRef.current;
+          if (!context || !mainFade || !nextFade) {
+            stopSecondaryPlayback(true);
+            return;
+          }
+          const liveHandoffPosition = Math.min(
+            nextAudio.currentTime,
+            Math.max(0, audio.duration - 0.05),
+          );
+          if (Math.abs(audio.currentTime - liveHandoffPosition) > 0.025) {
+            audio.currentTime = liveHandoffPosition;
+            setProgress(liveHandoffPosition);
+          }
+          mainFade.gain.cancelScheduledValues(context.currentTime);
+          nextFade.gain.cancelScheduledValues(context.currentTime);
+          mainFade.gain.setValueAtTime(0, context.currentTime);
+          nextFade.gain.setValueAtTime(nextFade.gain.value, context.currentTime);
+          mainFade.gain.linearRampToValueAtTime(1, context.currentTime + 0.12);
+          nextFade.gain.linearRampToValueAtTime(0, context.currentTime + 0.12);
+          window.setTimeout(() => {
+            nextAudio.pause();
+            nextAudio.removeAttribute("src");
+            nextAudio.load();
+            prefetchedQueueTrackRef.current = null;
+            crossfadeHandoffRef.current = null;
+            crossfadeStartedTrackRef.current = "";
+            setNextTrackPrefetched(false);
+            setCrossfadeHandoffActive(false);
+          }, 160);
+        }).catch(() => {
+          stopSecondaryPlayback(true);
           setSoloPlaying(false);
           setNotice("歌曲已加载；浏览器需要你点击播放后继续。");
         });
@@ -1348,18 +1803,48 @@ export function MineradioPlayer() {
     const onEnded = () => {
       if (mode === "solo") {
         const current = queueStateRef.current;
-        if (current.repeat === "one" && current.currentIndex >= 0) {
+        if ((current.repeat === "one" || (current.repeat === "all" && current.queue.length === 1))
+          && current.currentIndex >= 0) {
           audio.currentTime = 0;
           void audio.play().then(() => setSoloPlaying(true)).catch(() => setSoloPlaying(false));
           return;
         }
-        const next = queueReducer(current, { type: "ended" });
-        if (next.currentIndex !== current.currentIndex) {
-          queueTransitionRef.current = { autoplay: true, position: 0 };
-          dispatchQueue({ type: "ended" });
-          setQueueActivationVersion((value) => value + 1);
+        const advanceQueue = () => {
+          const latest = queueStateRef.current;
+          const prefetched = prefetchedQueueTrackRef.current;
+          const canCommitPrefetch = Boolean(
+            prefetched
+            && prefetched.baseState === latest
+            && getCurrentTrack(prefetched.nextState)?.id === prefetched.track.id,
+          );
+          const next = canCommitPrefetch && prefetched
+            ? prefetched.nextState
+            : queueReducer(latest, { type: "ended" });
+          if (next.currentIndex !== latest.currentIndex) {
+            queueTransitionRef.current = {
+              autoplay: true,
+              position: crossfadeHandoffRef.current?.active
+                ? nextAudioRef.current?.currentTime || 0
+                : 0,
+            };
+            if (canCommitPrefetch) {
+              queueStateRef.current = next;
+              dispatchQueue({ type: "hydrate", state: next });
+            } else {
+              dispatchQueue({ type: "ended" });
+            }
+            setQueueActivationVersion((value) => value + 1);
+          } else {
+            stopSecondaryPlayback(true);
+            setSoloPlaying(false);
+          }
+        };
+        if (crossfadeHandoffRef.current?.active) {
+          advanceQueue();
+        } else if (gaplessEnabled && nextTrackPrefetched) {
+          void beginSecondaryPlayback(0).then(() => advanceQueue());
         } else {
-          setSoloPlaying(false);
+          advanceQueue();
         }
       } else if (roomIsLeader) sendRoomCommand({ action: "pause" });
     };
@@ -1367,7 +1852,7 @@ export function MineradioPlayer() {
       if (mode !== "room" || !roomIsLeader) return;
       sendRoomCommand({
         action: "progress",
-        position: Math.max(0, audio.currentTime || 0),
+        position: Math.max(0, (audio.currentTime || 0) - deviceCalibration.delayMs / 1000),
         advancing: !audio.paused && !leaderBuffering,
       });
       lastLeaderPositionSentAt = Date.now();
@@ -1389,6 +1874,10 @@ export function MineradioPlayer() {
       sendLeaderProgress();
       sendRoomCommand({ action: "play" });
     };
+    const onSecondaryUnavailable = () => {
+      if (crossfadeHandoffRef.current?.active) stopSecondaryPlayback(true);
+    };
+    const nextAudio = nextAudioRef.current;
     audio.addEventListener("loadedmetadata", onLoadedMetadata);
     audio.addEventListener("durationchange", updateDuration);
     audio.addEventListener("ended", onEnded);
@@ -1396,6 +1885,8 @@ export function MineradioPlayer() {
     audio.addEventListener("waiting", onWaiting);
     audio.addEventListener("stalled", onWaiting);
     audio.addEventListener("canplay", onCanPlay);
+    nextAudio?.addEventListener("ended", onSecondaryUnavailable);
+    nextAudio?.addEventListener("error", onSecondaryUnavailable);
     frame = requestAnimationFrame(update);
     return () => {
       cancelAnimationFrame(frame);
@@ -1406,8 +1897,20 @@ export function MineradioPlayer() {
       audio.removeEventListener("waiting", onWaiting);
       audio.removeEventListener("stalled", onWaiting);
       audio.removeEventListener("canplay", onCanPlay);
+      nextAudio?.removeEventListener("ended", onSecondaryUnavailable);
+      nextAudio?.removeEventListener("error", onSecondaryUnavailable);
     };
-  }, [mode, roomIsLeader, sendRoomCommand]);
+  }, [
+    crossfadeSeconds,
+    deviceCalibration.delayMs,
+    ensureAudioGraph,
+    gaplessEnabled,
+    mode,
+    nextTrackPrefetched,
+    roomIsLeader,
+    sendRoomCommand,
+    stopSecondaryPlayback,
+  ]);
 
   useEffect(
     () => () => {
@@ -1425,6 +1928,15 @@ export function MineradioPlayer() {
       analyserRef.current = null;
       effectNodesRef.current = null;
       volumeGainRef.current = null;
+      mainFadeGainRef.current = null;
+      nextFadeGainRef.current = null;
+      calibrationDelayRef.current = null;
+      const nextAudio = nextAudioRef.current;
+      if (nextAudio) {
+        nextAudio.pause();
+        nextAudio.removeAttribute("src");
+        nextAudio.load();
+      }
       if (context && context.state !== "closed") void context.close().catch(() => {});
     },
     [],
@@ -1459,18 +1971,20 @@ export function MineradioPlayer() {
         return;
       }
       await ensureAudioGraph();
-      if (audio.paused) {
+      const nextAudio = nextAudioRef.current;
+      if (!audio.paused || (nextAudio && !nextAudio.paused)) {
+        audio.pause();
+        stopSecondaryPlayback(false);
+        setSoloPlaying(false);
+      } else {
         await audio.play();
         setSoloPlaying(true);
-      } else {
-        audio.pause();
-        setSoloPlaying(false);
       }
     } catch {
       setSoloPlaying(false);
       setNotice("浏览器无法开始播放，请检查媒体权限，或尝试另一首歌曲。");
     }
-  }, [canControl, effectiveTrack, ensureAudioGraph, mode, primeRoomPlayback, room]);
+  }, [canControl, effectiveTrack, ensureAudioGraph, mode, primeRoomPlayback, room, stopSecondaryPlayback]);
 
   const unlockAudio = useCallback(async () => {
     const audio = audioRef.current;
@@ -1514,6 +2028,7 @@ export function MineradioPlayer() {
       resumeAfterSourceChangeRef.current = null;
       await ensureAudioGraph().catch(() => false);
       if (mode === "solo") {
+        stopSecondaryPlayback(true);
         for (const url of objectUrlsRef.current.values()) URL.revokeObjectURL(url);
         objectUrlsRef.current.clear();
         const tracks = supported.map((file, index) => {
@@ -1561,7 +2076,7 @@ export function MineradioPlayer() {
         setUploading(false);
       }
     },
-    [ensureAudioGraph, mode, room, roomConnected],
+    [ensureAudioGraph, mode, room, roomConnected, stopSecondaryPlayback],
   );
 
   const sendThrottledRoomControl = useCallback((
@@ -1604,11 +2119,12 @@ export function MineradioPlayer() {
     (value: number, flush = false) => {
       const audio = audioRef.current;
       if (!audio || !canControl) return;
+      if (mode === "solo" && crossfadeHandoffRef.current?.active) stopSecondaryPlayback(false);
       audio.currentTime = value;
       setProgress(value);
       if (mode === "room") sendThrottledRoomControl("seek", value, flush);
     },
-    [canControl, mode, sendThrottledRoomControl],
+    [canControl, mode, sendThrottledRoomControl, stopSecondaryPlayback],
   );
 
   const setVolume = useCallback(
@@ -1619,6 +2135,25 @@ export function MineradioPlayer() {
     },
     [canControl, mode, sendThrottledRoomControl],
   );
+
+  const calibrateRoomDevice = useCallback((
+    targetClientId: string,
+    calibration: DeviceCalibration,
+  ) => {
+    if (mode !== "room" || !roomIsLeader || !targetClientId) return;
+    const next = {
+      volumeTrimDb: bounded(calibration.volumeTrimDb, MIN_VOLUME_TRIM_DB, MAX_VOLUME_TRIM_DB),
+      delayMs: bounded(calibration.delayMs, 0, MAX_DEVICE_DELAY_MS),
+    };
+    if (!sendRoomCommand({
+      action: "device-calibration",
+      targetClientId,
+      volumeTrimDb: next.volumeTrimDb,
+      delayMs: next.delayMs,
+    })) {
+      setNotice("设备校准发送失败，请等待中继恢复连接后重试。");
+    }
+  }, [mode, roomIsLeader, sendRoomCommand]);
 
   const moveQueue = useCallback((action: "previous" | "next") => {
     if (mode !== "solo") {
@@ -1634,13 +2169,14 @@ export function MineradioPlayer() {
       }
       return;
     }
+    stopSecondaryPlayback(true);
     queueTransitionRef.current = {
       autoplay: Boolean(audioRef.current && !audioRef.current.paused),
       position: 0,
     };
     dispatchQueue({ type: action });
     setQueueActivationVersion((value) => value + 1);
-  }, [mode]);
+  }, [mode, stopSecondaryPlayback]);
 
   const selectQueueTrack = useCallback((index: number) => {
     if (mode !== "solo") {
@@ -1658,10 +2194,11 @@ export function MineradioPlayer() {
       });
       return;
     }
+    stopSecondaryPlayback(true);
     queueTransitionRef.current = { autoplay: true, position: 0 };
     dispatchQueue({ type: "select", index });
     setQueueActivationVersion((value) => value + 1);
-  }, [ensureAudioGraph, mode]);
+  }, [ensureAudioGraph, mode, stopSecondaryPlayback]);
 
   const removeQueueTrack = useCallback((index: number) => {
     if (mode !== "solo") {
@@ -1679,6 +2216,7 @@ export function MineradioPlayer() {
       URL.revokeObjectURL(track.url);
       objectUrlsRef.current.delete(track.id);
     }
+    stopSecondaryPlayback(true);
     if (wasCurrent) {
       queueTransitionRef.current = {
         autoplay: Boolean(audioRef.current && !audioRef.current.paused),
@@ -1687,7 +2225,7 @@ export function MineradioPlayer() {
     }
     dispatchQueue({ type: "remove", index });
     if (wasCurrent) setQueueActivationVersion((value) => value + 1);
-  }, [mode]);
+  }, [mode, stopSecondaryPlayback]);
 
   const playQueueTrackNext = useCallback((index: number) => {
     if (mode !== "solo") {
@@ -1696,9 +2234,10 @@ export function MineradioPlayer() {
     }
     const track = queueStateRef.current.queue[index];
     if (!track) return;
+    stopSecondaryPlayback(true);
     dispatchQueue({ type: "play-next", track });
     setNotice(`“${track.name}”已添加为下一首。`);
-  }, [mode]);
+  }, [mode, stopSecondaryPlayback]);
 
   const clearQueue = useCallback(() => {
     if (mode !== "solo") {
@@ -1706,28 +2245,93 @@ export function MineradioPlayer() {
       return;
     }
     audioRef.current?.pause();
+    stopSecondaryPlayback(true);
     for (const url of objectUrlsRef.current.values()) URL.revokeObjectURL(url);
     objectUrlsRef.current.clear();
     queueTransitionRef.current = null;
     dispatchQueue({ type: "clear" });
     setNotice("播放队列已清空。");
-  }, [mode]);
+  }, [mode, stopSecondaryPlayback]);
 
   const cycleRepeat = useCallback(() => {
     if (mode !== "solo") {
       setNotice("房间模式暂不共享循环设置。");
       return;
     }
+    stopSecondaryPlayback(true);
     dispatchQueue({ type: "set-repeat", repeat: nextRepeatMode(queueStateRef.current.repeat) });
-  }, [mode]);
+  }, [mode, stopSecondaryPlayback]);
 
   const toggleShuffle = useCallback(() => {
     if (mode !== "solo") {
       setNotice("房间模式暂不共享随机播放顺序。");
       return;
     }
+    stopSecondaryPlayback(true);
     dispatchQueue({ type: "set-shuffle", shuffle: !queueStateRef.current.shuffle });
-  }, [mode]);
+  }, [mode, stopSecondaryPlayback]);
+
+  const mediaSessionPlay = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio || !effectiveTrack) return;
+    if (mode === "room") {
+      if (room.state?.playing || room.state?.preparing) void unlockAudio();
+      else if (roomIsLeader) void togglePlayback();
+      return;
+    }
+    if (audio.paused && nextAudioRef.current?.paused !== false) void togglePlayback();
+  }, [effectiveTrack, mode, room.state?.playing, room.state?.preparing, roomIsLeader, togglePlayback, unlockAudio]);
+
+  const mediaSessionPause = useCallback(() => {
+    const audio = audioRef.current;
+    const secondaryPlaying = nextAudioRef.current?.paused === false;
+    if (mode === "room") {
+      if (roomIsLeader && (room.state?.playing || room.state?.preparing)) void togglePlayback();
+      return;
+    }
+    if (audio && (!audio.paused || secondaryPlaying)) void togglePlayback();
+  }, [mode, room.state?.playing, room.state?.preparing, roomIsLeader, togglePlayback]);
+  const mediaSessionNext = useCallback(() => {
+    if (!canControl) return;
+    moveQueue("next");
+  }, [canControl, moveQueue]);
+  const mediaSessionPrevious = useCallback(() => {
+    if (!canControl) return;
+    moveQueue("previous");
+  }, [canControl, moveQueue]);
+  const mediaSessionSeek = useCallback((position: number) => {
+    if (!canControl) return;
+    seek(position, true);
+  }, [canControl, seek]);
+
+  const mediaSessionTrack = useMemo(() => {
+    if (!effectiveTrack) return null;
+    const separator = effectiveTrack.name.lastIndexOf(" · ");
+    return {
+      title: separator > 0 ? effectiveTrack.name.slice(0, separator) : effectiveTrack.name,
+      artist: mode === "solo" && localTrack?.artist
+        ? localTrack.artist
+        : separator > 0 ? effectiveTrack.name.slice(separator + 3) : "Mineradio",
+      album: mode === "solo" ? localTrack?.album || "Mineradio" : `MR//ROOM ${roomCode}`,
+      artwork: mode === "solo" && localTrack?.cover ? localTrack.cover : "/mineradio-card-art.png",
+    };
+  }, [effectiveTrack, localTrack, mode, roomCode]);
+  const mediaSessionPosition = mode === "room"
+    ? Math.max(0, progress - deviceCalibration.delayMs / 1000)
+    : progress;
+
+  useMediaSession({
+    duration,
+    onNext: mediaSessionNext,
+    onPause: mediaSessionPause,
+    onPlay: mediaSessionPlay,
+    onPrevious: mediaSessionPrevious,
+    onSeek: mediaSessionSeek,
+    playbackRate: 1,
+    playing: effectivePlaying,
+    position: Math.floor(mediaSessionPosition * 2) / 2,
+    track: mediaSessionTrack,
+  });
 
   const createRoom = useCallback(() => {
     prepareSequenceRef.current += 1;
@@ -1780,6 +2384,12 @@ export function MineradioPlayer() {
     }
     return url.toString();
   }, [room.addresses, roomCode]);
+  const roomQrUrl = useMemo(() => {
+    if (!shareUrl || !room.httpBase) return "";
+    const url = new URL("/api/room/qr", room.httpBase);
+    url.searchParams.set("text", shareUrl);
+    return url.toString();
+  }, [room.httpBase, shareUrl]);
 
   const copyShareLink = useCallback(async () => {
     if (!shareUrl) return;
@@ -1835,6 +2445,7 @@ export function MineradioPlayer() {
     const sourceId = selectedTrack.sourceId || "";
     if (mode === "solo") {
       await ensureAudioGraph().catch(() => false);
+      stopSecondaryPlayback(true);
       const queue = cloudSongs.map((candidate) => cloudSongToQueueTrack(candidate, quality)).filter((track): track is LocalTrack => Boolean(track));
       const selectedIndex = queue.findIndex((track) => track.id === selectedTrack.id);
       for (const url of objectUrlsRef.current.values()) URL.revokeObjectURL(url);
@@ -1912,6 +2523,7 @@ export function MineradioPlayer() {
     roomConnected,
     roomIsLeader,
     sendRoomCommand,
+    stopSecondaryPlayback,
   ]);
 
   const changePlaybackQuality = useCallback(async (quality: PlaybackQuality) => {
@@ -1928,6 +2540,7 @@ export function MineradioPlayer() {
       setNotice("音质由房间主控设备统一切换。");
       return;
     }
+    if (mode === "solo") stopSecondaryPlayback(true);
 
     let source = "";
     let resolvedQuality = quality;
@@ -2024,6 +2637,7 @@ export function MineradioPlayer() {
     prepareKugouPlayback,
     roomIsLeader,
     sendRoomCommand,
+    stopSecondaryPlayback,
   ]);
 
   const logoutCloud = useCallback(async () => {
@@ -2167,6 +2781,12 @@ export function MineradioPlayer() {
             if (!handled) setNotice("音源加载失败，歌曲可能受版权、会员或网络限制。请尝试另一首。");
           });
         }}
+      />
+      <audio
+        ref={nextAudioRef}
+        crossOrigin="anonymous"
+        preload="auto"
+        aria-hidden="true"
       />
       <input
         ref={fileInputRef}
@@ -2476,6 +3096,24 @@ export function MineradioPlayer() {
                 {copied ? <Check size={17} aria-hidden="true" /> : <Copy size={17} aria-hidden="true" />}
                 {copied ? "已复制" : "复制局域网链接"}
               </button>
+              <div className="room-join-qr">
+                {roomQrUrl && failedRoomQrUrl !== roomQrUrl ? (
+                  <img
+                    src={roomQrUrl}
+                    width="148"
+                    height="148"
+                    alt={`扫描二维码加入房间 ${roomCode}`}
+                    onError={() => setFailedRoomQrUrl(roomQrUrl)}
+                  />
+                ) : (
+                  <div>
+                    <WifiHigh size={25} aria-hidden="true" />
+                    <span>二维码暂不可用</span>
+                    <small>仍可复制上方局域网链接加入</small>
+                  </div>
+                )}
+                <p>同一局域网设备扫码加入；二维码由本机中继生成。</p>
+              </div>
             </div>
             <dl className="room-stats">
               <div><dt>角色</dt><dd>{room.isLeader ? "主控设备" : "同步跟随"}</dd></div>
@@ -2505,6 +3143,7 @@ export function MineradioPlayer() {
           roomIsLeader={mode === "room" && room.isLeader}
           roomState={mode === "room" ? roomState : null}
           roomStatus={mode === "room" ? room.status : "idle"}
+          onCalibrateDevice={calibrateRoomDevice}
           onRefresh={serviceHealth.refresh}
         />
 
@@ -2561,6 +3200,54 @@ export function MineradioPlayer() {
             <span>{queueState.shuffle ? "随机已开" : "顺序播放"}</span>
           </button>
         </div>
+
+        {mode === "solo" ? (
+          <section className="queue-transition-settings" aria-labelledby="transition-settings-title">
+            <div className="queue-transition-heading">
+              <div>
+                <span>PLAYBACK TRANSITION</span>
+                <strong id="transition-settings-title">连续播放</strong>
+              </div>
+              <button
+                className={gaplessEnabled ? "is-active" : ""}
+                type="button"
+                role="switch"
+                aria-checked={gaplessEnabled}
+                onClick={() => {
+                  if (gaplessEnabled) stopSecondaryPlayback(true);
+                  setGaplessEnabled(!gaplessEnabled);
+                }}
+              >
+                {gaplessEnabled ? "已启用" : "已关闭"}
+              </button>
+            </div>
+            <label className="queue-crossfade-control">
+              <span>
+                双音源交叠淡化
+                <strong>{crossfadeSeconds > 0 ? `${crossfadeSeconds.toFixed(1)} 秒` : "无交叠"}</strong>
+              </span>
+              <input
+                type="range"
+                min="0"
+                max="8"
+                step="0.5"
+                value={crossfadeSeconds}
+                disabled={!gaplessEnabled}
+                onChange={(event) => setCrossfadeSeconds(Number(event.target.value))}
+                aria-label="下一首双音源交叠淡化时长"
+              />
+            </label>
+            <p className={nextTrackPrefetched ? "is-ready" : ""} aria-live="polite">
+              {crossfadeHandoffActive
+                ? "正在用双音源平滑交接"
+                : nextTrackPrefetched
+                  ? "下一首音频已预取并缓冲"
+                  : gaplessEnabled
+                    ? "将在播放期间自动准备下一首"
+                    : "启用后会提前缓冲下一首"}
+            </p>
+          </section>
+        ) : null}
 
         {queueState.queue.length ? (
           <ol className="queue-list">

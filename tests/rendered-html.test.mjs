@@ -52,7 +52,7 @@ test("room playback waits for buffered devices and uses the calibrated server st
   assert.match(player, /action: "device-status"[\s\S]*?bufferedSeconds:[\s\S]*?bufferGoalSeconds:[\s\S]*?driftMs:/);
   assert.match(player, /action: "ready"[\s\S]*?bufferedSeconds: metrics\.bufferedSeconds[\s\S]*?jitterMs: metrics\.jitterMs/);
   assert.match(player, /ready: false[\s\S]*?bufferState,[\s\S]*?driftMs: metrics\.driftMs/);
-  assert.match(player, /state\.scheduledAt - getRoomServerNow\(\)/);
+  assert.match(player, /state\.scheduledAt - deviceCalibration\.delayMs - getRoomServerNow\(\)/);
   assert.match(player, /action: "start-failed"/);
   assert.match(player, /setInterval\(reconcile, 250\)/);
   assert.match(hook, /sampledServerTime: Date\.now\(\) \+ offsetRef\.current/);
@@ -101,6 +101,78 @@ test("modern room drawer exposes service health and per-device diagnostics", asy
   assert.match(syncTypes, /devices: RoomDeviceState\[\]/);
   assert.match(syncTypes, /prepareDeadline: number/);
   assert.match(syncTypes, /action: "device-status"/);
+});
+
+test("modern room calibration is persisted, bounded, applied, and leader-addressable", async () => {
+  const player = await readFile(new URL("../app/components/MineradioPlayer.tsx", import.meta.url), "utf8");
+  const serviceCenter = await readFile(new URL("../app/components/RoomServiceCenter.tsx", import.meta.url), "utf8");
+  const syncHook = await readFile(new URL("../app/hooks/use-room-sync.ts", import.meta.url), "utf8");
+  const syncTypes = await readFile(new URL("../app/lib/sync-types.ts", import.meta.url), "utf8");
+
+  assert.match(player, /DEVICE_CALIBRATION_STORAGE_KEY = "mineradio-device-calibration-v1"/);
+  assert.match(player, /MIN_VOLUME_TRIM_DB = -24/);
+  assert.match(player, /MAX_VOLUME_TRIM_DB = 12/);
+  assert.match(player, /MAX_DEVICE_DELAY_MS = 500/);
+  assert.match(player, /action: "device-calibration",[\s\S]*?targetClientId,[\s\S]*?volumeTrimDb:[\s\S]*?delayMs:/);
+  assert.match(player, /volume\.gain\.value = playbackVolumeRef\.current \* dbToGain/);
+  assert.match(player, /volume\.connect\(limiter\);[\s\S]*?limiter\.connect\(calibrationDelay\);/);
+  assert.match(player, /context\.createDelay\(1\)/);
+  assert.match(player, /getRoomTargetPosition\(state\) \+ delayCompensation/);
+  assert.match(player, /state\.scheduledAt - deviceCalibration\.delayMs - getRoomServerNow\(\)/);
+  assert.match(player, /action: "progress",[\s\S]*?position: Math\.max\(0, \(audio\.currentTime \|\| 0\) - deviceCalibration\.delayMs \/ 1000\)/);
+  assert.match(player, /const mediaSessionPosition = mode === "room"[\s\S]*?progress - deviceCalibration\.delayMs \/ 1000/);
+  assert.match(serviceCenter, /min="-24"[\s\S]*?max="12"/);
+  assert.match(serviceCenter, /const calibrationRef = useRef\(/);
+  assert.match(serviceCenter, /const calibrationCommitTimerRef = useRef<number \| null>\(null\)/);
+  assert.match(serviceCenter, /calibrationRef\.current\.volumeTrimDb = next[\s\S]*?setVolumeTrimDb\(next\)/);
+  assert.match(serviceCenter, /calibrationRef\.current\.delayMs = next[\s\S]*?setDelayMs\(next\)/);
+  assert.match(serviceCenter, /scheduleCalibration\(\)/);
+  assert.match(serviceCenter, /onCalibrate\(device\.clientId, \{ \.\.\.calibrationRef\.current \}\)/);
+  assert.match(serviceCenter, /key=\{`\$\{device\.clientId\}:\$\{device\.volumeTrimDb \|\| 0\}:\$\{device\.delayMs \|\| 0\}`\}/);
+  assert.match(syncTypes, /action: "device-calibration";[\s\S]*?targetClientId: string;[\s\S]*?volumeTrimDb: number;[\s\S]*?delayMs: number;/);
+  assert.match(syncHook, /device_not_found:/);
+  assert.match(syncHook, /invalid_calibration:/);
+});
+
+test("modern player prefetches and commits one deterministic dual-audio transition", async () => {
+  const player = await readFile(new URL("../app/components/MineradioPlayer.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+
+  assert.match(player, /type PrefetchedQueueTrack = \{[\s\S]*?baseState: QueueState<LocalTrack>;[\s\S]*?nextState: QueueState<LocalTrack>;/);
+  assert.match(player, /const currentTrackReady = Boolean\([\s\S]*?localTrack\?\.id === activeQueueTrack\.id[\s\S]*?&& audioSource/);
+  assert.match(player, /const request = options\.silent[\s\S]*?options\.controller \|\| new AbortController\(\)[\s\S]*?: beginPrepareRequest\(\)/);
+  assert.match(player, /const prefetchController = new AbortController\(\)[\s\S]*?silent: true,[\s\S]*?controller: prefetchController/);
+  assert.match(player, /prefetchController\.abort\(\)/);
+  assert.match(player, /prefetched\.baseState === latest[\s\S]*?prefetched\.nextState/);
+  assert.match(player, /dispatchQueue\(\{ type: "hydrate", state: next \}\)/);
+  assert.match(player, /ref=\{nextAudioRef\}[\s\S]*?preload="auto"/);
+  assert.match(player, /createMediaElementSource\(nextAudio\)/);
+  assert.match(player, /mainFade\.gain\.linearRampToValueAtTime\(0,[\s\S]*?nextFade\.gain\.linearRampToValueAtTime\(1,/);
+  assert.match(player, /current\.repeat === "all" && current\.queue\.length === 1/);
+  assert.match(player, /const liveHandoffPosition = Math\.min\([\s\S]*?nextAudio\.currentTime/);
+  assert.match(player, /\.catch\(\(\) => \{[\s\S]*?stopSecondaryPlayback\(true\);[\s\S]*?setSoloPlaying\(false\)/);
+  assert.match(player, /双音源交叠淡化/);
+  assert.match(player, /PLAYBACK_TRANSITION_STORAGE_KEY/);
+  assert.match(css, /\.queue-transition-settings\s*\{/);
+});
+
+test("modern player uses local room QR generation and throttled Media Session controls", async () => {
+  const player = await readFile(new URL("../app/components/MineradioPlayer.tsx", import.meta.url), "utf8");
+  const mediaSession = await readFile(new URL("../app/hooks/use-media-session.ts", import.meta.url), "utf8");
+
+  assert.match(player, /new URL\("\/api\/room\/qr", room\.httpBase\)/);
+  assert.match(player, /url\.searchParams\.set\("text", shareUrl\)/);
+  assert.doesNotMatch(player, /api\.qrserver|quickchart|chart\.googleapis/);
+  assert.match(mediaSession, /new MediaMetadata/);
+  assert.match(mediaSession, /try \{[\s\S]*?session\.metadata = new MediaMetadata/);
+  assert.match(mediaSession, /artwork: track\.artwork \? \[\{ src: track\.artwork \}\]/);
+  assert.match(mediaSession, /session\.setPositionState\(\)/);
+  assert.match(mediaSession, /now - previous\.updatedAt < 1000/);
+  assert.match(mediaSession, /setActionHandler/);
+  assert.match(mediaSession, /"seekto"/);
+  assert.match(player, /const mediaSessionNext = useCallback\(\(\) => \{[\s\S]*?if \(!canControl\) return;/);
+  assert.match(player, /const mediaSessionPrevious = useCallback\(\(\) => \{[\s\S]*?if \(!canControl\) return;/);
+  assert.match(player, /const mediaSessionSeek = useCallback\(\(position: number\) => \{[\s\S]*?if \(!canControl\) return;/);
 });
 
 test("Kugou player uses the versioned prepare boundary", async () => {

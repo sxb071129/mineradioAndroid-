@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import QRCode from "qrcode";
 import { WebSocketServer, WebSocket } from "ws";
 
 const DEFAULT_PORT = Number(process.env.MINERADIO_SYNC_PORT || 8787);
@@ -24,9 +25,11 @@ const ROOM_BROADCAST_INTERVAL_MS = 1000;
 const PLAYBACK_PREPARE_TIMEOUT_MS = 30_000;
 const PLAYBACK_PREPARE_PROGRESS_GRACE_MS = 10_000;
 const PLAYBACK_START_LEAD_MS = 1_200;
+const PLAYBACK_PREPARE_COMPLETION_RETENTION_MS = 5_000;
 const MAX_ROOM_CLIENTS = 64;
 const JOIN_WINDOW_MS = 10_000;
 const MAX_JOINS_PER_WINDOW = 12;
+const MAX_ROOM_QR_TEXT_BYTES = 2048;
 const ROOM_RE = /^[A-Z0-9]{4,8}$/;
 const TRACK_ID_RE = /^[a-f0-9]{24}$/;
 const CLOUD_TRACK_RE = /^cloud-([1-9]\d{0,19})$/;
@@ -73,6 +76,51 @@ function cleanMime(value) {
 function normalizeRoom(value) {
   const room = String(value || "").trim().toUpperCase();
   return ROOM_RE.test(room) ? room : "";
+}
+
+function validRoomQrText(value) {
+  if (typeof value !== "string"
+    || !value
+    || value !== value.trim()
+    || Buffer.byteLength(value, "utf8") > MAX_ROOM_QR_TEXT_BYTES
+    || /[\u0000-\u001f\u007f]/.test(value)) {
+    return "";
+  }
+  try {
+    const target = new URL(value);
+    if (!/^(?:http|https):$/.test(target.protocol)
+      || !target.hostname
+      || target.username
+      || target.password) {
+      return "";
+    }
+    return value;
+  } catch {
+    return "";
+  }
+}
+
+async function serveRoomQr(res, text) {
+  try {
+    const body = await QRCode.toBuffer(text, {
+      type: "png",
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 320,
+    });
+    res.writeHead(
+      200,
+      corsHeaders({
+        "Content-Type": "image/png",
+        "Content-Length": body.length,
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      }),
+    );
+    res.end(body);
+  } catch {
+    json(res, 500, { error: "qr_generation_failed" });
+  }
 }
 
 function parseCloudTrackId(value) {
@@ -146,6 +194,26 @@ function clampNumber(value, minimum, maximum, fallback = 0) {
   return Math.max(minimum, Math.min(finiteNumber(value, fallback), maximum));
 }
 
+function validDeviceCalibration(volumeTrimDb, delayMs) {
+  if (typeof volumeTrimDb !== "number"
+    || !Number.isFinite(volumeTrimDb)
+    || volumeTrimDb < -24
+    || volumeTrimDb > 12
+    || typeof delayMs !== "number"
+    || !Number.isFinite(delayMs)
+    || delayMs < 0
+    || delayMs > 500) {
+    return null;
+  }
+  // The UI applies and displays 0.5 dB / 5 ms steps. Normalize the wire
+  // protocol to the same discrete values so a hand-crafted frame cannot make
+  // Relay diagnostics disagree with what a browser actually applies.
+  return {
+    volumeTrimDb: Math.round(volumeTrimDb * 2) / 2,
+    delayMs: Math.round(delayMs / 5) * 5,
+  };
+}
+
 function emptyDeviceStatus(now = Date.now()) {
   return {
     prepareId: "",
@@ -157,6 +225,10 @@ function emptyDeviceStatus(now = Date.now()) {
     driftMs: 0,
     quality: "",
     bufferState: "",
+    volumeTrimDb: 0,
+    delayMs: 0,
+    calibrationRevision: 0,
+    explicitCalibration: false,
     updatedAt: now,
     extensionBufferedSeconds: 0,
     extensionProgress: 0,
@@ -219,6 +291,8 @@ function publicDevices(room) {
         driftMs: status.driftMs,
         quality: status.quality,
         bufferState: status.bufferState,
+        volumeTrimDb: status.volumeTrimDb,
+        delayMs: status.delayMs,
         updatedAt: status.updatedAt,
       };
     })
@@ -342,7 +416,13 @@ function schedulePreparedPlayback(room, now = Date.now()) {
   return true;
 }
 
-function updateDeviceStatus(room, clientId, message, now = Date.now()) {
+function updateDeviceStatus(
+  room,
+  clientId,
+  message,
+  now = Date.now(),
+  allowCalibrationInitialization = false,
+) {
   const previous = ensureDeviceStatus(room, clientId, now);
   const bufferedSeconds = clampNumber(message.bufferedSeconds, 0, 86400, previous.bufferedSeconds);
   const bufferGoalSeconds = clampNumber(message.bufferGoalSeconds, 0, 120, previous.bufferGoalSeconds);
@@ -355,6 +435,10 @@ function updateDeviceStatus(room, clientId, message, now = Date.now()) {
   const bufferState = /^(loading|buffering|ready|stalled|error|unlock_required)$/.test(requestedBufferState)
     ? requestedBufferState
     : previous.bufferState;
+  const reportedCalibration = validDeviceCalibration(message.volumeTrimDb, message.delayMs);
+  const initializeCalibration = allowCalibrationInitialization
+    && !previous.explicitCalibration
+    && reportedCalibration;
   const prepareId = String(message.prepareId || "");
   const activePreparation = room.state.preparing
     && prepareId
@@ -380,6 +464,8 @@ function updateDeviceStatus(room, clientId, message, now = Date.now()) {
     driftMs,
     quality,
     bufferState,
+    volumeTrimDb: initializeCalibration ? reportedCalibration.volumeTrimDb : previous.volumeTrimDb,
+    delayMs: initializeCalibration ? reportedCalibration.delayMs : previous.delayMs,
     updatedAt: now,
     extensionBufferedSeconds: meaningfulAdvance ? bufferedSeconds : previous.extensionBufferedSeconds,
     extensionProgress: meaningfulAdvance ? nextProgress : previous.extensionProgress,
@@ -593,6 +679,7 @@ export async function createLanRelay({
     ),
   ),
   playbackStartLeadMs = PLAYBACK_START_LEAD_MS,
+  playbackPrepareCompletionRetentionMs = PLAYBACK_PREPARE_COMPLETION_RETENTION_MS,
   roomBroadcastIntervalMs = ROOM_BROADCAST_INTERVAL_MS,
 } = {}) {
   await mkdir(dataDir, { recursive: true });
@@ -671,6 +758,16 @@ export async function createLanRelay({
         addresses: networkAddresses(),
         port: server.address()?.port || port,
       });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/api/room/qr") {
+      const values = url.searchParams.getAll("text");
+      const text = values.length === 1 ? validRoomQrText(values[0]) : "";
+      if (!text) {
+        json(res, 400, { error: "invalid_qr_text" });
+        return;
+      }
+      await serveRoomQr(res, text);
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/tracks") {
@@ -808,6 +905,10 @@ export async function createLanRelay({
               Number(playbackPrepareProgressGraceMs) || PLAYBACK_PREPARE_PROGRESS_GRACE_MS,
             ),
             playbackStartLeadMs: Math.max(0, Number(playbackStartLeadMs) || PLAYBACK_START_LEAD_MS),
+            playbackPrepareCompletionRetentionMs: Math.max(
+              20,
+              Number(playbackPrepareCompletionRetentionMs) || PLAYBACK_PREPARE_COMPLETION_RETENTION_MS,
+            ),
             state: {
               revision: 0,
               track: null,
@@ -907,7 +1008,7 @@ export async function createLanRelay({
         const prepareId = String(message.prepareId || "");
         if (prepareId && prepareId !== state.prepareId) return;
         if (state.preparing && (!prepareId || !room.prepareParticipants.has(ws.clientId))) return;
-        updateDeviceStatus(room, ws.clientId, message, now);
+        updateDeviceStatus(room, ws.clientId, message, now, true);
         return;
       }
       if (action === "ready") {
@@ -1015,6 +1116,33 @@ export async function createLanRelay({
         return;
       }
 
+      if (action === "device-calibration") {
+        const targetClientId = typeof message.targetClientId === "string"
+          ? message.targetClientId
+          : "";
+        const target = [...room.clients].find((client) => client.clientId === targetClientId);
+        if (!target) {
+          send(ws, { type: "error", code: "device_not_found" });
+          return;
+        }
+        const calibration = validDeviceCalibration(message.volumeTrimDb, message.delayMs);
+        if (!calibration) {
+          send(ws, { type: "error", code: "invalid_calibration" });
+          return;
+        }
+        const targetStatus = ensureDeviceStatus(room, targetClientId, now);
+        room.deviceStatus.set(targetClientId, {
+          ...targetStatus,
+          volumeTrimDb: calibration.volumeTrimDb,
+          delayMs: calibration.delayMs,
+          calibrationRevision: targetStatus.calibrationRevision + 1,
+          explicitCalibration: true,
+          updatedAt: now,
+        });
+        broadcastRoom(room);
+        return;
+      }
+
       if (action === "play") {
         state.position = currentPosition(state, now);
         beginPlaybackPreparation(room, now);
@@ -1102,7 +1230,7 @@ export async function createLanRelay({
       } else if (!room.state.preparing
         && room.state.playing
         && room.state.scheduledAt
-        && now > room.state.scheduledAt + 5000
+        && now > room.state.scheduledAt + room.playbackPrepareCompletionRetentionMs
         && room.prepareMaxDeadline) {
         room.readyClients.clear();
         room.readyTiming.clear();
@@ -1110,6 +1238,8 @@ export async function createLanRelay({
         room.prepareDeadline = 0;
         room.prepareMaxDeadline = 0;
         room.prepareStartedAt = 0;
+        room.state.prepareId = "";
+        resetDeviceTrackStatus(room, now);
       }
       broadcastRoom(room);
     }

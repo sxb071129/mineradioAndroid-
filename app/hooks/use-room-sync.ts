@@ -47,6 +47,8 @@ type Options = {
 function syncErrorMessage(code: string) {
   const messages: Record<string, string> = {
     command_failed: "同步命令执行失败，请稍后重试",
+    device_not_found: "目标设备已离开房间，请刷新设备列表后重试",
+    invalid_calibration: "设备校准参数无效，请将音量微调设为 -24 至 +12 dB、延迟设为 0 至 500 ms",
     invalid_command: "中继无法识别此同步操作，请更新主机 LAN 服务",
     invalid_json: "同步数据格式错误，请刷新页面后重试",
     invalid_room: "房间码无效，请使用 4–8 位字母或数字",
