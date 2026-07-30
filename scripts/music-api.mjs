@@ -31,6 +31,7 @@ const MAX_PREPARE_BODY_BYTES = 8 * 1024;
 const MAX_KUGOU_COOKIE_BODY_BYTES = 36 * 1024;
 const MAX_LYRIC_BYTES = 512 * 1024;
 const MAX_LYRIC_LINES = 5_000;
+const MAX_COVER_BYTES = 8 * 1024 * 1024;
 const MAX_USER_PLAYLISTS = 100;
 const MAX_PLAYLIST_TRACKS = 500;
 const MAX_LIKE_CHECK_IDS = 500;
@@ -153,7 +154,7 @@ function mapSong(song) {
     artists,
     artistId: artists[0]?.id || "",
     album: String(album?.name || ""),
-    cover: String(album?.picUrl || album?.coverUrl || ""),
+    cover: safeHttpsImage(album?.picUrl || album?.coverUrl),
     duration: Math.max(0, Number(song?.dt || song?.duration) || 0),
     fee: Number(song?.fee) || 0,
   };
@@ -163,7 +164,7 @@ function mapPlaylist(playlist) {
   return {
     id: String(playlist?.id || ""),
     name: String(playlist?.name || ""),
-    cover: String(playlist?.picUrl || playlist?.coverImgUrl || ""),
+    cover: safeHttpsImage(playlist?.picUrl || playlist?.coverImgUrl),
     trackCount: Math.max(0, Number(playlist?.trackCount) || 0),
   };
 }
@@ -929,7 +930,7 @@ function safeAccountInfo(value, provider) {
     loggedIn: Boolean(info.loggedIn),
     userId: numericUserId,
     nickname: String(info.nickname || (provider === "kugou" ? "酷狗音乐" : "网易云音乐")).slice(0, 80),
-    avatar: /^https:\/\//i.test(String(info.avatar || "")) ? String(info.avatar) : "",
+    avatar: safeHttpsImage(info.avatar),
     vipType: Math.max(0, Number(info.vipType) || 0),
     svipLevel: Math.max(0, Number(info.svipLevel) || 0),
     vipLevel: String(info.vipLevel || "none").slice(0, 16),
@@ -999,7 +1000,7 @@ function normalizeKugouTrack(raw) {
       name: String(raw?.name || "未命名歌曲").slice(0, 160),
       artist: String(raw?.artist || "").slice(0, 160),
       album: String(raw?.album || "").slice(0, 160),
-      cover: /^https:\/\//i.test(String(raw?.cover || "")) ? String(raw.cover) : "",
+      cover: safeHttpsImage(raw?.cover),
       duration: Math.max(0, Number(raw?.duration) || 0),
       qualities: QUALITY_LEVELS.filter((quality) => Boolean(qualityHashes[quality])),
     },
@@ -1684,6 +1685,77 @@ export async function createMusicApi({
     }
   }
 
+  async function serveProviderCover(req, res, origin, value) {
+    const target = safeHttpsImage(value);
+    if (!target) {
+      sendJson(req, res, 400, { error: "invalid_cover_url" });
+      return;
+    }
+    const upstream = await fetchProviderStream(
+      fetchImpl,
+      validateStreamUrl,
+      target,
+      {
+        headers: {
+          Accept: "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8",
+          "User-Agent": "MR-ROOM/1.0",
+        },
+      },
+      0,
+      streamConnectTimeoutMs,
+    );
+    if (!upstream.ok || !upstream.body) {
+      await discardUpstream(upstream);
+      throw Object.assign(new Error("provider_cover_failed"), { statusCode: 502 });
+    }
+    const contentType = String(upstream.headers.get("content-type") || "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+    if (!new Set([
+      "image/avif",
+      "image/gif",
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+    ]).has(contentType)) {
+      await discardUpstream(upstream);
+      throw Object.assign(new Error("provider_cover_type_rejected"), { statusCode: 415 });
+    }
+    const announcedLength = Number(upstream.headers.get("content-length"));
+    if (Number.isFinite(announcedLength) && announcedLength > MAX_COVER_BYTES) {
+      await discardUpstream(upstream);
+      throw Object.assign(new Error("provider_cover_too_large"), { statusCode: 413 });
+    }
+
+    const reader = upstream.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value: chunk } = await reader.read();
+        if (done) break;
+        size += chunk.byteLength;
+        if (size > MAX_COVER_BYTES) {
+          await reader.cancel();
+          throw Object.assign(new Error("provider_cover_too_large"), { statusCode: 413 });
+        }
+        chunks.push(Buffer.from(chunk));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const body = Buffer.concat(chunks, size);
+    res.writeHead(200, corsHeaders(origin, {
+      "Content-Type": contentType,
+      "Content-Length": body.length,
+      "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+      "Cross-Origin-Resource-Policy": "cross-origin",
+      "X-Content-Type-Options": "nosniff",
+    }));
+    res.end(body);
+  }
+
   const server = http.createServer(async (req, res) => {
     const requestUrl = new URL(req.url || "/", "http://music.local");
     const origin = req.headers.origin;
@@ -1715,6 +1787,10 @@ export async function createMusicApi({
     }
 
     try {
+      if (requestUrl.pathname === "/api/cover") {
+        await serveProviderCover(req, res, origin, requestUrl.searchParams.get("url"));
+        return;
+      }
       if (requestUrl.pathname === "/api/v2/playback/prepare") {
         if (req.method !== "POST") {
           rejectRequest(req, res, 405, "method_not_allowed");
@@ -2181,7 +2257,7 @@ export async function createMusicApi({
             provider: "kugou",
             id: String(item?.id || "").slice(0, 64),
             name: String(item?.name || "酷狗歌单").slice(0, 160),
-            cover: /^https:\/\//i.test(String(item?.cover || "")) ? String(item.cover) : "",
+            cover: safeHttpsImage(item?.cover),
             trackCount: Math.max(0, Number(item?.trackCount) || 0),
           }))
           .filter((item) => PLAYLIST_ID_RE.test(item.id));

@@ -6,6 +6,9 @@ export type TrackDescriptor = {
   path: string;
   provider?: "netease" | "kugou";
   quality?: PlaybackQuality;
+  artist?: string;
+  album?: string;
+  cover?: string;
 };
 
 export type PlaybackQuality = "jymaster" | "hires" | "lossless" | "exhigh" | "standard";

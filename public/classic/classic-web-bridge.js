@@ -228,7 +228,10 @@
         release: null
       }));
     }
-    if (url.pathname === "/api/audio" || url.pathname === "/api/cover") {
+    if (url.pathname === "/api/cover") {
+      return fetchAt(new URL(url.pathname + url.search, apiOrigin + "/").toString(), input, init);
+    }
+    if (url.pathname === "/api/audio") {
       var target = String(url.searchParams.get("url") || "");
       try {
         var targetUrl = new URL(target, apiOrigin + "/");
@@ -266,12 +269,39 @@
     }
   }
 
+  function safeArtworkUrl(value) {
+    var raw = String(value || "").trim();
+    if (!raw) return "";
+    if (/^data:image\/(?:avif|gif|jpeg|png|webp);base64,/i.test(raw)) {
+      return raw.length <= 4 * 1024 * 1024 ? raw : "";
+    }
+    if (raw.length > 2048) return "";
+    try {
+      var url = new URL(raw);
+      if (url.protocol !== "https:" || url.username || url.password) return "";
+      return url.toString();
+    } catch {
+      return "";
+    }
+  }
+
+  function coverMediaUrl(value) {
+    var raw = String(value || "").trim();
+    if (/^blob:/i.test(raw)) return directMediaUrl(raw);
+    if (/^data:image\/(?:avif|gif|jpeg|png|webp);base64,/i.test(raw)) return safeArtworkUrl(raw);
+    var target = safeArtworkUrl(raw);
+    if (!target) return "";
+    var proxy = new URL("/api/cover", apiOrigin + "/");
+    proxy.searchParams.set("url", target);
+    return proxy.toString();
+  }
+
   var bridge = {
     apiOrigin: apiOrigin,
     relayUrl: relayUrl,
     roomCode: roomCode,
     audioUrl: directMediaUrl,
-    coverUrl: directMediaUrl,
+    coverUrl: coverMediaUrl,
     sync: {
       connected: false,
       leader: false,
@@ -1344,8 +1374,18 @@
       name: String(value.name || song.name || "Mineradio").slice(0, 160),
       type: /^audio\/[a-z0-9.+-]+$/i.test(String(value.type || "")) ? String(value.type) : "audio/mpeg",
       size: Math.max(0, Number(value.size) || 0),
-      path: "/api/tracks/" + id
+      path: "/api/tracks/" + id,
+      artist: cleanRoomText(value.artist || song.artist, 160),
+      album: cleanRoomText(value.album || song.album, 160),
+      cover: safeArtworkUrl(value.cover || song.cover)
     };
+  }
+
+  function cleanRoomText(value, maxLength) {
+    return String(value || "")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim()
+      .slice(0, maxLength);
   }
 
   function audioMimeForFile(file) {
@@ -1383,8 +1423,14 @@
 
   function mediaSessionCover(song) {
     if (!song) return "";
-    return directMediaUrl(
-      song.cover
+    var custom = "";
+    if (typeof window.getCustomCoverForSong === "function") {
+      try { custom = window.getCustomCoverForSong(song); } catch {}
+    }
+    return coverMediaUrl(
+      custom
+      || song.customCover
+      || song.cover
       || song.picUrl
       || song.album && song.album.picUrl
       || song.al && song.al.picUrl
@@ -1497,6 +1543,7 @@
     Object.keys(handlers).forEach(function (action) {
       try { navigator.mediaSession.setActionHandler(action, handlers[action]); } catch {}
     });
+    window.addEventListener("mineradio:coverchange", updateMediaSessionMetadata);
     updateMediaSessionMetadata();
   }
 
@@ -1519,12 +1566,15 @@
     var id = "cloud-v2-" + provider + "-" + sourceId + "-" + quality;
     return {
       id: id,
-      name: String(song.name || song.title || "Mineradio").slice(0, 160),
+      name: cleanRoomText(song.name || song.title || "Mineradio", 160),
       type: "audio/mpeg",
       size: 0,
       path: "/api/cloud/v2/" + provider + "/" + sourceId + "/" + quality,
       provider: provider,
-      quality: quality
+      quality: quality,
+      artist: cleanRoomText(mediaSessionArtist(song), 160),
+      album: cleanRoomText(mediaSessionAlbum(song), 160),
+      cover: safeArtworkUrl(song.cover || song.picUrl || song.album && song.album.picUrl || song.al && song.al.picUrl)
     };
   }
 
@@ -1539,7 +1589,10 @@
         name: String(track.name || "Mineradio").slice(0, 160),
         type: /^audio\/[a-z0-9.+-]+$/i.test(String(track.type || "")) ? String(track.type) : "audio/mpeg",
         size: Math.max(0, Number(track.size) || 0),
-        path: "/api/tracks/" + rawId
+        path: "/api/tracks/" + rawId,
+        artist: cleanRoomText(track.artist, 160),
+        album: cleanRoomText(track.album, 160),
+        cover: safeArtworkUrl(track.cover)
       };
       return {
         provider: "local",
@@ -1554,9 +1607,9 @@
           localUrl: localUrl,
           roomTrackDescriptor: localDescriptor,
           name: localDescriptor.name,
-          artist: "局域网文件",
-          album: "",
-          cover: ""
+          artist: localDescriptor.artist || "局域网文件",
+          album: localDescriptor.album,
+          cover: localDescriptor.cover
         }
       };
     }
@@ -1575,9 +1628,9 @@
         id: sourceId,
         playKey: provider === "kugou" ? sourceId : undefined,
         name: String(track.name || "Mineradio"),
-        artist: "",
-        album: "",
-        cover: ""
+        artist: cleanRoomText(track.artist, 160),
+        album: cleanRoomText(track.album, 160),
+        cover: safeArtworkUrl(track.cover)
       }
     };
   }

@@ -68,6 +68,25 @@ function cleanName(value) {
   return normalized.slice(0, 160) || "未命名音频";
 }
 
+function cleanDisplayText(value, maxLength = 160) {
+  return String(value || "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function cleanCover(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw.length > 2_048) return "";
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.username || url.password) return "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
 function cleanMime(value) {
   const mime = String(value || "audio/mpeg").toLowerCase();
   return /^audio\/[a-z0-9.+-]+$/.test(mime) ? mime : "application/octet-stream";
@@ -138,6 +157,9 @@ function parseCloudTrackId(value) {
 }
 
 function cloudTrackDescriptor(value, cloud) {
+  const artist = cleanDisplayText(value.artist);
+  const album = cleanDisplayText(value.album);
+  const cover = cleanCover(value.cover);
   return {
     id: cloud.id,
     name: cleanName(value.name),
@@ -148,6 +170,9 @@ function cloudTrackDescriptor(value, cloud) {
       : `/api/cloud/v2/${cloud.provider}/${cloud.sourceId}/${cloud.quality}`,
     provider: cloud.provider,
     quality: cloud.quality,
+    ...(artist ? { artist } : {}),
+    ...(album ? { album } : {}),
+    ...(cover ? { cover } : {}),
   };
 }
 
@@ -157,12 +182,18 @@ function normalizeTrack(value) {
   const cloud = parseCloudTrackId(id);
   if (cloud) return cloudTrackDescriptor(value, cloud);
   if (!TRACK_ID_RE.test(id)) return null;
+  const artist = cleanDisplayText(value.artist);
+  const album = cleanDisplayText(value.album);
+  const cover = cleanCover(value.cover);
   return {
     id,
     name: cleanName(value.name),
     type: cleanMime(value.type),
     size: Math.max(0, Number(value.size) || 0),
     path: `/api/tracks/${value.id}`,
+    ...(artist ? { artist } : {}),
+    ...(album ? { album } : {}),
+    ...(cover ? { cover } : {}),
   };
 }
 

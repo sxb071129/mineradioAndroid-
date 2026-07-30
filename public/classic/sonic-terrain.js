@@ -26,6 +26,9 @@
   var energy = 0.12;
   var beatPulse = 0;
   var activeFx = null;
+  var renderedFrameElapsed = 0;
+  var hasRenderedFrame = false;
+  var activeProfileKey = "";
 
   function finite(value, fallback) {
     var number = Number(value);
@@ -36,10 +39,14 @@
     return Math.max(min, Math.min(max, value));
   }
 
-  function clampUnit(value) {
+  function clampNormalizedUnit(value) {
     value = finite(value, 0);
-    if (value > 1 && value <= 100) value /= 100;
-    else if (value > 1) value /= 255;
+    return clamp(value, 0, 1);
+  }
+
+  function clampByteUnit(value) {
+    value = finite(value, 0);
+    if (value > 1) value /= 255;
     return clamp(value, 0, 1);
   }
 
@@ -85,7 +92,7 @@
       total += sample;
       count += 1;
     }
-    return count ? clampUnit(total / count) : 0;
+    return count ? clampByteUnit(total / count) : 0;
   }
 
   function readSignal(frame) {
@@ -99,11 +106,11 @@
     var overall = findFrameValue(frame, ["energy", "level", "volume", "loudness"]);
     var beat = findFrameValue(frame, ["beat", "pulse", "kick", "onset"]);
 
-    low = low === undefined ? lowFromBins : clampUnit(low);
-    middle = middle === undefined ? middleFromBins : clampUnit(middle);
-    high = high === undefined ? highFromBins : clampUnit(high);
-    overall = overall === undefined ? (low * 0.48 + middle * 0.34 + high * 0.18) : clampUnit(overall);
-    beat = beat === true ? 1 : clampUnit(beat);
+    low = low === undefined ? lowFromBins : clampNormalizedUnit(low);
+    middle = middle === undefined ? middleFromBins : clampNormalizedUnit(middle);
+    high = high === undefined ? highFromBins : clampNormalizedUnit(high);
+    overall = overall === undefined ? (low * 0.48 + middle * 0.34 + high * 0.18) : clampNormalizedUnit(overall);
+    beat = beat === true ? 1 : clampNormalizedUnit(beat);
 
     return {
       low: clamp(low, 0, 1),
@@ -141,6 +148,63 @@
 
   function readResponse(fx) {
     return clamp(finite(fx && fx.sonicTerrainResponse, 1), 0.15, 3);
+  }
+
+  function reducedMotionPreferred() {
+    try {
+      return typeof window.matchMedia === "function"
+        && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    } catch {
+      return false;
+    }
+  }
+
+  function isMobileSurface() {
+    try {
+      var body = typeof document !== "undefined" && document.body;
+      var classList = body && body.classList;
+      if (classList && (classList.contains("mobile-optimized") || classList.contains("android-shell"))) return true;
+    } catch { }
+    if (finite(window.innerWidth, 1024) <= 720) return true;
+    try {
+      return typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
+    } catch {
+      return false;
+    }
+  }
+
+  function readPerformanceQuality(fx) {
+    var quality = String((fx && fx.performanceQuality) || "high").toLowerCase();
+    return /^(eco|balanced|high|ultra)$/.test(quality) ? quality : "high";
+  }
+
+  function performanceProfile(fx) {
+    var quality = readPerformanceQuality(fx);
+    var profiles = {
+      eco: { fps: 30, dprCap: 1, density: 0.66 },
+      balanced: { fps: 45, dprCap: 1.25, density: 0.82 },
+      high: { fps: 60, dprCap: 1.75, density: 1 },
+      ultra: { fps: 0, dprCap: 2, density: 1.15 }
+    };
+    var profile = profiles[quality];
+    var mobile = isMobileSurface();
+
+    // Ultra is an explicit opt-in: preserve its full desktop profile even on phones.
+    if (mobile && quality !== "ultra") {
+      var mobileFps = quality === "eco" ? 24 : (quality === "balanced" ? 36 : 45);
+      profile = {
+        fps: Math.min(profile.fps, mobileFps),
+        dprCap: Math.min(profile.dprCap, quality === "eco" ? 1 : (quality === "balanced" ? 1.1 : 1.35)),
+        density: profile.density * 0.84
+      };
+    }
+
+    return {
+      key: quality + (mobile && quality !== "ultra" ? "-mobile" : "-full"),
+      fps: profile.fps,
+      dprCap: profile.dprCap,
+      density: profile.density
+    };
   }
 
   function readRgb(value, fallback) {
@@ -185,11 +249,12 @@
     return "rgba(" + Math.round(color[0]) + "," + Math.round(color[1]) + "," + Math.round(color[2]) + "," + clamp(alpha, 0, 1).toFixed(3) + ")";
   }
 
-  function resize() {
+  function resize(profile) {
     if (!canvas || !context || typeof window === "undefined") return;
+    if (!profile || !Number.isFinite(profile.dprCap)) profile = performanceProfile(activeFx);
     var nextWidth = Math.max(1, Math.round(window.innerWidth || document.documentElement.clientWidth || 1));
     var nextHeight = Math.max(1, Math.round(window.innerHeight || document.documentElement.clientHeight || 1));
-    var nextRatio = clamp(finite(window.devicePixelRatio, 1), 1, 2);
+    var nextRatio = clamp(finite(window.devicePixelRatio, 1), 1, profile.dprCap);
     if (nextWidth === width && nextHeight === height && nextRatio === pixelRatio) return;
 
     width = nextWidth;
@@ -202,7 +267,7 @@
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
   }
 
-  function ensureCanvas() {
+  function ensureCanvas(profile) {
     if (typeof document === "undefined" || !document.body) return false;
     var connected = !!(canvas && (canvas.isConnected !== undefined
       ? canvas.isConnected
@@ -235,7 +300,7 @@
       window.addEventListener("resize", resize, { passive: true });
       resizeAttached = true;
     }
-    resize();
+    resize(profile);
     return true;
   }
 
@@ -249,7 +314,7 @@
     return (primary + detail + shimmer) * amplitude;
   }
 
-  function drawTerrain(frame, fx, signal) {
+  function drawTerrain(frame, fx, signal, profile) {
     if (!context || !canvas || !width || !height) return;
 
     var intensity = readIntensity(fx);
@@ -258,9 +323,10 @@
     var horizon = height * (0.43 + Math.min(0.06, signal.middle * 0.06));
     var bottom = height * 1.06;
     var phase = clock * (0.65 + signal.overall * response * 1.45);
-    var rows = Math.round(15 + intensity * 13);
-    var columns = Math.round(13 + intensity * 10);
-    var segments = Math.max(38, Math.round(width / 18));
+    var density = clamp(finite(profile && profile.density, 1), 0.4, 1.35);
+    var rows = Math.max(8, Math.round((15 + intensity * 13) * density));
+    var columns = Math.max(7, Math.round((13 + intensity * 10) * density));
+    var segments = Math.max(24, Math.round((width / 18) * density));
 
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     context.clearRect(0, 0, width, height);
@@ -331,8 +397,18 @@
       if (canvas) clear();
       return false;
     }
+    if (reducedMotionPreferred()) {
+      if (canvas) clear();
+      return false;
+    }
     activeFx = fx;
-    if (!ensureCanvas()) return false;
+    var profile = performanceProfile(fx);
+    if (profile.key !== activeProfileKey) {
+      activeProfileKey = profile.key;
+      renderedFrameElapsed = 0;
+      hasRenderedFrame = false;
+    }
+    if (!ensureCanvas(profile)) return false;
 
     var seconds = finite(dt, 1 / 60);
     if (seconds > 1) seconds /= 1000;
@@ -343,7 +419,16 @@
     energy += (targetEnergy - energy) * Math.min(1, seconds * 7.2);
     beatPulse = Math.max(signal.beat, beatPulse * Math.exp(-seconds * 5.6));
     clock += seconds * (0.75 + energy * 1.45);
-    drawTerrain(frame, fx, signal);
+    if (hasRenderedFrame && profile.fps > 0) {
+      var frameInterval = 1 / profile.fps;
+      renderedFrameElapsed += seconds;
+      if (renderedFrameElapsed + 1e-7 < frameInterval) return true;
+      renderedFrameElapsed %= frameInterval;
+    } else {
+      renderedFrameElapsed = 0;
+    }
+    drawTerrain(frame, fx, signal, profile);
+    hasRenderedFrame = true;
     return true;
   }
 
@@ -354,13 +439,20 @@
       clear();
       return false;
     }
+    if (reducedMotionPreferred()) {
+      clear();
+      return false;
+    }
     if (nextFx) activeFx = nextFx;
     else if (isObject(window.fx)) activeFx = Object.assign({}, window.fx, { preset: INDEX });
     else activeFx = { preset: INDEX };
     clock = 0;
     energy = 0.12;
     beatPulse = 0;
-    return ensureCanvas();
+    renderedFrameElapsed = 0;
+    hasRenderedFrame = false;
+    activeProfileKey = "";
+    return ensureCanvas(performanceProfile(activeFx));
   }
 
   function clear() {
@@ -375,6 +467,9 @@
     height = 0;
     pixelRatio = 1;
     activeFx = null;
+    renderedFrameElapsed = 0;
+    hasRenderedFrame = false;
+    activeProfileKey = "";
   }
 
   window.MineradioSonicTerrain = {

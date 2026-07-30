@@ -171,6 +171,9 @@ test("room canonicalizes cloud tracks and ignores client transport fields", asyn
       type: "text/html",
       size: 999999,
       path: "http://evil.example/audio",
+      artist: "  Relay\u0000 Artist  ",
+      album: "Shared Album",
+      cover: "https://images.example.test/cover.jpg",
     },
   }));
   const stateMessage = await follower.next(
@@ -184,6 +187,9 @@ test("room canonicalizes cloud tracks and ignores client transport fields", asyn
     path: "/api/cloud/123456",
     provider: "netease",
     quality: "standard",
+    artist: "Relay Artist",
+    album: "Shared Album",
+    cover: "https://images.example.test/cover.jpg",
   });
   assert.equal(stateMessage.state.position, 0);
   assert.equal(stateMessage.state.playing, false);
@@ -226,6 +232,9 @@ test("room canonicalizes cloud tracks and ignores client transport fields", asyn
   );
   assert.equal(qualityState.state.track.id, "cloud-v2-netease-123456-lossless");
   assert.equal(qualityState.state.track.path, "/api/cloud/v2/netease/123456/lossless");
+  assert.equal(qualityState.state.track.artist, "Relay Artist");
+  assert.equal(qualityState.state.track.album, "Shared Album");
+  assert.equal(qualityState.state.track.cover, "https://images.example.test/cover.jpg");
   assert.equal(qualityState.state.playing, false);
   assert.equal(qualityState.state.preparing, true);
   assert.ok(qualityState.state.position >= 42);

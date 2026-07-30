@@ -2309,13 +2309,12 @@ export function MineradioPlayer() {
     const separator = effectiveTrack.name.lastIndexOf(" · ");
     return {
       title: separator > 0 ? effectiveTrack.name.slice(0, separator) : effectiveTrack.name,
-      artist: mode === "solo" && localTrack?.artist
-        ? localTrack.artist
-        : separator > 0 ? effectiveTrack.name.slice(separator + 3) : "Mineradio",
-      album: mode === "solo" ? localTrack?.album || "Mineradio" : `MR//ROOM ${roomCode}`,
-      artwork: mode === "solo" && localTrack?.cover ? localTrack.cover : "/mineradio-card-art.png",
+      artist: effectiveTrack.artist
+        || (separator > 0 ? effectiveTrack.name.slice(separator + 3) : "Mineradio"),
+      album: effectiveTrack.album || (mode === "room" ? `MR//ROOM ${roomCode}` : "Mineradio"),
+      artwork: effectiveTrack.cover || "/mineradio-card-art.png",
     };
-  }, [effectiveTrack, localTrack, mode, roomCode]);
+  }, [effectiveTrack, mode, roomCode]);
   const mediaSessionPosition = mode === "room"
     ? Math.max(0, progress - deviceCalibration.delayMs / 1000)
     : progress;
@@ -2505,6 +2504,9 @@ export function MineradioPlayer() {
       path: cloudTrackPath(provider, sourceId, quality),
       provider,
       quality,
+      artist: song.artist,
+      album: song.album,
+      cover: song.cover,
     };
     sendRoomCommand({ action: "track", track });
     setNotice(compatibilityMode
@@ -3299,7 +3301,7 @@ export function MineradioPlayer() {
         />
         <div className="dock-controls">
           <div className="dock-cluster dock-track">
-            <img src={mode === "solo" && localTrack?.cover ? localTrack.cover : "/mineradio-card-art.png"} width="52" height="52" alt="" />
+            <img src={effectiveTrack?.cover || "/mineradio-card-art.png"} width="52" height="52" alt="" />
             <div className="dock-meta">
               <strong>{effectiveTrack?.name || "还没有播放歌曲"}</strong>
               <span>{mode === "room" ? `同步房间 ${roomCode}` : "Mineradio · 本地音乐"}</span>

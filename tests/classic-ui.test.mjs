@@ -700,7 +700,53 @@ test("classic queue can play LAN-relayed local tracks without treating them as N
   assert.match(html, /var isLocalPlayback = !!\(song/);
   assert.match(html, /playbackProvider = isLocalPlayback \? 'local'/);
   assert.match(html, /\{ url: song\.localUrl, provider: 'local', level: 'standard', trial: false \}/);
-  assert.match(html, /currentLocalSong = song && \(song\.type === 'local'/);
+  assert.match(html, /var nextLocalSong = song && \(song\.type === 'local'/);
+  assert.match(html, /releaseLocalSongObjectUrl\(currentLocalSong, nextLocalSong && nextLocalSong\.localUrl\)/);
+});
+
+test("classic Kugou lyrics and playback use the opaque play key and bound lyric expansion", async () => {
+  const html = await readFile(path.join(root, "public", "classic", "index.html"), "utf8");
+
+  assert.match(html, /var playKey = song\.playKey \|\| song\.id \|\| ''/);
+  assert.match(html, /\/api\/kugou\/lyric\?id=/);
+  assert.doesNotMatch(html, /\/api\/kugou\/lyric\?hash=/);
+  assert.match(html, /song\.playKey \|\| song\.id \|\| ''/);
+  assert.match(html, /CLIENT_LYRIC_MAX_LINES = 5000/);
+  assert.match(html, /CLIENT_LYRIC_MAX_TIMESTAMPS = 8/);
+  assert.match(html, /CLIENT_YRC_MAX_WORDS_PER_LINE = 256/);
+  assert.match(html, /parseServerLyricLines\(r\.lines\)/);
+  assert.match(html, /while \(low <= high\)/);
+});
+
+test("classic cover inputs are bounded, proxied, and refresh lock-screen artwork", async () => {
+  const [html, bridge] = await Promise.all([
+    readFile(path.join(root, "public", "classic", "index.html"), "utf8"),
+    readFile(path.join(root, "public", "classic", "classic-web-bridge.js"), "utf8"),
+  ]);
+
+  assert.match(html, /file\.size > 12 \* 1024 \* 1024/);
+  assert.match(html, /iw \* ih > 40000000/);
+  assert.match(html, /img\.onerror = function\(\)/);
+  assert.match(html, /mineradio:coverchange/);
+  assert.match(html, /function isProxyableCoverUrl[\s\S]*?parsed\.protocol === 'https:'/);
+  assert.match(bridge, /function coverMediaUrl/);
+  assert.match(bridge, /new URL\("\/api\/cover", apiOrigin/);
+  assert.match(bridge, /window\.addEventListener\("mineradio:coverchange", updateMediaSessionMetadata\)/);
+});
+
+test("classic DIY exposes the backed cover layer and keyboard-native preset cards", async () => {
+  const html = await readFile(path.join(root, "public", "classic", "index.html"), "utf8");
+  const packaged = JSON.parse(
+    await readFile(path.join(root, "public", "classic", "default-user-fx-archive.json"), "utf8"),
+  );
+
+  assert.match(html, /id="t-backCover"[^>]*toggleFx\('backCover'\)/);
+  assert.match(html, /if \(key === 'backCover'\) \{ if \(fx\.backCover\) createBackCoverLayer\(\); else destroyBackCoverLayer\(\); \}/);
+  assert.match(html, /<button type="button" class="preset-card"/);
+  assert.match(html, /\.preset-card:focus-visible/);
+  assert.equal(packaged.schema, 2);
+  assert.equal(packaged.name, "MR//ROOM 默认视觉");
+  assert.equal(packaged.snapshot.sonicTerrainTheme, "cover");
 });
 
 test("classic quality controls never apply the Netease SVIP gate to Kugou", async () => {

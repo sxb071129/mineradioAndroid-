@@ -133,6 +133,69 @@ function rawRequest(urlValue, { method = "GET", headers = {}, body } = {}) {
   });
 }
 
+test("cover proxy accepts only bounded HTTPS raster images", async (t) => {
+  const requests = [];
+  const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+  const { base } = await fixture(t, {
+    validateStreamUrl: async (value) => new URL(value),
+    fetchImpl: async (url, init) => {
+      requests.push({ url: String(url), accept: init?.headers?.Accept });
+      return new Response(imageBytes, {
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "content-length": String(imageBytes.length),
+        },
+      });
+    },
+  });
+
+  const target = "https://images.example.test/artwork.png";
+  const response = await fetch(`${base}/api/cover?url=${encodeURIComponent(target)}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "image/png");
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(response.headers.get("cross-origin-resource-policy"), "cross-origin");
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), imageBytes);
+  assert.deepEqual(requests, [{
+    url: target,
+    accept: "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8",
+  }]);
+
+  for (const value of [
+    "http://images.example.test/artwork.png",
+    "https://user:secret@images.example.test/artwork.png",
+    "javascript:alert(1)",
+    `https://images.example.test/${"a".repeat(2050)}`,
+  ]) {
+    const rejected = await fetch(`${base}/api/cover?url=${encodeURIComponent(value)}`);
+    assert.equal(rejected.status, 400, value);
+  }
+  assert.equal(requests.length, 1);
+});
+
+test("public song and playlist payloads never expose unsafe cover strings", async (t) => {
+  const provider = providerStub({
+    cloudsearch: async () => ({
+      body: {
+        result: {
+          songs: [{
+            id: 1,
+            name: "Unsafe artwork",
+            ar: [{ id: 2, name: "Artist" }],
+            al: { name: "Album", picUrl: "javascript:alert(1)" },
+          }],
+        },
+      },
+    }),
+  });
+  const { base } = await fixture(t, { provider });
+  const response = await fetch(`${base}/api/search?keywords=artwork`);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.songs[0].cover, "");
+});
+
 async function registerKugouTrack(base, overrides = {}) {
   const hash = overrides.hash || "A".repeat(32);
   const accountId = overrides.accountId || "7";
