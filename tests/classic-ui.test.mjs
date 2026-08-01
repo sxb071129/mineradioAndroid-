@@ -33,13 +33,13 @@ test("classic bundle carries its visual engine and Web bridge", async () => {
   const bridge = await readFile(path.join(classicRoot, "classic-web-bridge.js"), "utf8");
 
   assert.match(html, /<script src="vendor\/qrcode\.min\.js\?v=1\.5\.4"><\/script>/);
-  assert.match(html, /<script src="room-sync-core\.js\?v=20260726-calibration-v1"><\/script>/);
-  assert.match(html, /<script src="classic-web-bridge\.js\?v=20260730-sync-v2"><\/script>/);
+  assert.match(html, /<script src="room-sync-core\.js\?v=20260801-adaptive-v2"><\/script>/);
+  assert.match(html, /<script src="classic-web-bridge\.js\?v=20260801-sync-v6"><\/script>/);
   assert.ok(
     html.indexOf('src="vendor/qrcode.min.js?v=1.5.4"')
-      < html.indexOf('src="room-sync-core.js?v=20260726-calibration-v1"')
-      && html.indexOf('src="room-sync-core.js?v=20260726-calibration-v1"')
-        < html.indexOf('src="classic-web-bridge.js?v=20260730-sync-v2"'),
+      < html.indexOf('src="room-sync-core.js?v=20260801-adaptive-v2"')
+      && html.indexOf('src="room-sync-core.js?v=20260801-adaptive-v2"')
+        < html.indexOf('src="classic-web-bridge.js?v=20260801-sync-v6"'),
     "shared room sync core must load before the Classic bridge",
   );
   assert.match(html, /<script src="vendor\/three\.r128\.min\.js"><\/script>/);
@@ -58,6 +58,8 @@ test("classic bundle carries its visual engine and Web bridge", async () => {
   assert.match(bridge, /cloud-v2-.*kugou/);
   assert.match(bridge, /type:\s*"join"/);
   assert.match(bridge, /room:\s*roomCode/);
+  assert.match(bridge, /protocolVersion:\s*ROOM_SYNC_PROTOCOL_VERSION/);
+  assert.match(bridge, /bufferContract:\s*true,[\s\S]*?armedPlayback:\s*true/);
   assert.match(bridge, /canResumeFollowerFromGesture/);
   assert.match(bridge, /sendCommand\("volume", Math\.max/);
   assert.match(bridge, /pendingSeekMedia\.removeEventListener/);
@@ -94,10 +96,10 @@ test("classic ports safe upstream visual and bounded recovery enhancements", asy
   const terrain = await readFile(path.join(classicRoot, "sonic-terrain.js"), "utf8");
   const recovery = await readFile(path.join(classicRoot, "playback-recovery.js"), "utf8");
 
-  assert.match(html, /<script src="sonic-terrain\.js\?v=20260730-v1"><\/script>/);
+  assert.match(html, /<script src="sonic-terrain\.js\?v=20260801-voxel-v5"><\/script>/);
   assert.match(html, /<script src="playback-recovery\.js\?v=20260730-v2"><\/script>/);
   assert.ok(
-    html.indexOf('src="sonic-terrain.js?v=20260730-v1"')
+    html.indexOf('src="sonic-terrain.js?v=20260801-voxel-v5"')
       < html.indexOf('src="playback-recovery.js?v=20260730-v2"'),
     "the terrain runtime must be available before the Classic app begins its frame loop",
   );
@@ -114,10 +116,16 @@ test("classic ports safe upstream visual and bounded recovery enhancements", asy
   assert.match(html, /card\.selected && shelfPointerSelectionForegroundActive\(\)/);
   assert.match(html, /group\.renderOrder = \(contentOpenForLayer \|\| shelfPinnedOpen \|\| liftedCardActive\) \? 300 : 30/);
 
-  assert.match(terrain, /window\.MineradioSonicTerrain/);
+  assert.match(terrain, /global\.MineradioSonicTerrain = api/);
+  assert.match(terrain, /global\.MineradioSonicTopography = api/);
   assert.match(terrain, /INDEX: INDEX/);
-  assert.match(terrain, /pointer-events:none/);
+  assert.match(terrain, /new THREE\.BoxGeometry/);
+  assert.match(terrain, /new THREE\.InstancedMesh/);
+  assert.match(terrain, /uCoolCore|uWarmCore|uRippleColor/);
   assert.doesNotMatch(terrain, /AudioContext|\.src\s*=|fetch\(/);
+  assert.match(html, /particles\.visible = !skullLayerReady && !sonicTerrainActive/);
+  assert.match(html, /function updateLyricStarRiver\(dt\)[\s\S]{0,300}fx\.preset === SKULL_PRESET_INDEX \|\| fx\.preset === SONIC_TERRAIN_PRESET_INDEX/);
+  assert.match(html, /html\.control-glass-svg-ok #bottom-bar\.visible\{[\s\S]*?var\(--saved-panel-glass-svg-filter\)/);
   assert.match(recovery, /RECOVERY_TIMEOUT_MS = 20000/);
   assert.match(recovery, /MAX_QUEUE_ADVANCES = 2/);
   assert.match(recovery, /function isJoinedRoom\(\)/);
@@ -184,12 +192,17 @@ test("classic player exposes and wires the LAN room controls", async () => {
   assert.match(html, /\.room-sync-link\{[^}]*user-select:text/);
   assert.match(html, /id="room-sync-panel"[^>]*\sinert>/);
   assert.match(html, /class="room-sync-meta" aria-live="polite"/);
-  assert.match(html, /class="room-service-grid" aria-label="服务状态"/);
+  assert.match(html, /<details class="room-sync-diagnostics">[\s\S]*?<summary>连接诊断（自动处理）<\/summary>[\s\S]*?class="room-service-grid" aria-label="服务状态"/);
+  assert.match(html, /class="room-sync-device-heading"><span>房间设备<\/span><span>自动校准<\/span>/);
+  assert.doesNotMatch(bridge, /function appendDeviceStat\(|function appendDeviceCalibrationControls\(/);
   assert.match(html, /id="room-sync-device-list"[^>]*role="list"/);
   assert.match(html, /id="room-sync-protocol-error"[^>]*role="alert"[^>]*hidden/);
   assert.match(bridge, /function installRoomSyncUi\(\)/);
   assert.match(bridge, /function updateRoomSyncUi\(\)/);
   assert.match(bridge, /bridge\.sync\.addresses = Array\.isArray\(message\.addresses\)/);
+  assert.match(bridge, /ROOM_SYNC_BUILD_ID = "20260801-sync-v6"/);
+  assert.match(bridge, /protocolCode === "strict_sync_required" \|\| protocolCode === "buffer_contract_required"/);
+  assert.match(bridge, /target\.searchParams\.set\("syncBuild", ROOM_SYNC_BUILD_ID\)/);
   assert.match(bridge, /url\.hostname = preferredRoomHost\(\)/);
   assert.match(bridge, /navigator\.clipboard && window\.isSecureContext/);
   assert.match(bridge, /navigator\.clipboard\.writeText\(value\)\.catch/);
@@ -221,10 +234,13 @@ test("classic player exposes and wires the LAN room controls", async () => {
   assert.match(bridge, /\["loadedmetadata", "durationchange"\]\.forEach[\s\S]*?media\.addEventListener\(eventName/);
   assert.match(bridge, /checkServiceHealth\("relay", relayHttpOrigin\)/);
   assert.match(bridge, /checkServiceHealth\("music", apiOrigin\)/);
-  assert.match(bridge, /new URL\("\/health", origin \+ "\/"\)/);
+  assert.match(bridge, /\/\.well-known\/mr-room\/health\//);
+  assert.match(bridge, /sameSecureGateway/);
+  assert.match(bridge, /wss:\/\/" \+ window\.location\.host \+ "\/sync"/);
+  assert.match(bridge, /withoutMixedContent/);
   assert.match(bridge, /document\.visibilityState === "visible"/);
   assert.match(bridge, /message\.type === "error"/);
-  assert.match(bridge, /protocolErrorMessage\(message\.code\)/);
+  assert.match(bridge, /protocolErrorMessage\(protocolCode\)/);
   assert.match(bridge, /deferPlayback: true/);
   assert.match(html, /opts\.deferPlayback/);
   assert.match(html, /等待全部设备缓冲就绪，再按统一时刻起播/);
@@ -256,17 +272,58 @@ test("classic room QR stays local and falls back when the Relay endpoint stalls"
   assert.match(qrVendor, /qrcode 1\.5\.4 \| MIT/);
 });
 
+test("classic negotiates protocol v3 and preserves one uninterrupted prepare-to-commit pipeline", async () => {
+  const bridge = await readFile(path.join(root, "public", "classic", "classic-web-bridge.js"), "utf8");
+  const connect = sourceBetween(bridge, "function connectRoom", "function startBridgeRuntime");
+  const readiness = sourceBetween(bridge, "function roomDeviceStatus", "function seekWhenReady");
+  const stateApply = sourceBetween(bridge, "async function applyRoomState", "function refreshRoomTimelineAfterClockSample");
+  const deviceRenderer = sourceBetween(bridge, "function renderRoomDevices", "function protocolErrorMessage");
+
+  assert.match(connect, /protocolVersion:\s*ROOM_SYNC_PROTOCOL_VERSION/);
+  assert.match(connect, /capabilities:\s*ROOM_SYNC_CAPABILITIES/);
+  assert.match(connect, /joinedCapabilities\.bufferContract === true/);
+  assert.match(connect, /joinedCapabilities\.armedPlayback === true/);
+  assert.match(readiness, /sendCommand\("armed", payload\)/);
+  assert.match(readiness, /String\(state\.commitState \|\| ""\) !== "tentative"/);
+  assert.match(bridge, /String\(state\.commitState \|\| ""\) === "committed"/);
+  assert.match(bridge, /measureRoomLaunchWindow/);
+  assert.match(stateApply, /await window\.playQueueAt/);
+  assert.doesNotMatch(bridge, /roomStateApplyToken/);
+  assert.match(bridge, /refreshRoomTimelineAfterClockSample\(generation\)/);
+  assert.doesNotMatch(deviceRenderer, /appendDeviceStat\(/);
+  assert.doesNotMatch(deviceRenderer, /appendDeviceCalibrationControls\(/);
+});
+
+test("classic original controls call the V3 bridge wrappers instead of stale global bindings", async () => {
+  const [html, bridge] = await Promise.all([
+    readFile(path.join(root, "public", "classic", "index.html"), "utf8"),
+    readFile(path.join(root, "public", "classic", "classic-web-bridge.js"), "utf8"),
+  ]);
+  const searchPlayback = sourceBetween(html, "function playSearchResult", "var firstPlayDone");
+  const wrappedPlayback = sourceBetween(
+    bridge,
+    "window.playQueueAt = async function classicRoomPlayQueueAt",
+    "var originalSetVolume",
+  );
+
+  assert.match(html, /id="play-btn"[^>]+onclick="window\.togglePlay\(\)"/);
+  assert.match(html, /id="prev-btn"[^>]+onclick="window\.prevTrack\(\)"/);
+  assert.match(html, /id="next-btn"[^>]+onclick="window\.nextTrack\(\)"/);
+  assert.doesNotMatch(
+    html,
+    /onclick="(?:togglePlay|prevTrack|nextTrack|shuffleQueue|clearQueue|playQueueAt)\(/,
+  );
+  assert.match(searchPlayback, /window\.playQueueAt\(currentIdx\)/);
+  assert.match(html, /onclick="window\.playQueueAt\('/);
+  assert.match(wrappedPlayback, /navigator\.userActivation/);
+  assert.match(wrappedPlayback, /invokedFromUserGesture[\s\S]*?primeRoomMediaForSync\(window\.audio, true\)/);
+});
+
 test("classic room calibration persists per device and compensates the audible timeline", async () => {
   const html = await readFile(path.join(root, "public", "classic", "index.html"), "utf8");
   const bridge = await readFile(path.join(root, "public", "classic", "classic-web-bridge.js"), "utf8");
   const audioGraph = sourceBetween(html, "function initAudio()", "function resumeAudioAnalysis");
   const command = sourceBetween(bridge, "function sendCommand", "function sendDeviceStatusCommand");
-  const calibrationSender = sourceBetween(
-    bridge,
-    "function sendDeviceCalibrationCommand",
-    "function sendVolumeCommand",
-  );
-
   assert.match(html, /mineradio-room-device-calibration-v1/);
   assert.match(html, /clampRange\(Number\(value\.volumeTrimDb\) \|\| 0, -24, 12\)/);
   assert.match(html, /clampRange\(Number\(value\.delayMs\) \|\| 0, 0, 500\)/);
@@ -282,14 +339,12 @@ test("classic room calibration persists per device and compensates the audible t
     /gainNode\.connect\(roomCalibrationGainNode\)[\s\S]*?roomCalibrationGainNode\.connect\(roomCalibrationLimiterNode\)[\s\S]*?roomCalibrationLimiterNode\.connect\(roomCalibrationDelayNode\)[\s\S]*?roomCalibrationDelayNode\.connect\(audioCtx\.destination\)/,
   );
   assert.match(bridge, /Math\.max\(-24, Math\.min\(12, Number\(input\.volumeTrimDb\) \|\| 0\)\)/);
-  assert.match(bridge, /minimum: -24[\s\S]*?maximum: 12[\s\S]*?step: 0\.5/);
-  assert.match(bridge, /if \(!bridge\.sync\.leader \|\| !device\.clientId\) return/);
+  assert.doesNotMatch(bridge, /room-device-calibration-field|function appendDeviceCalibrationControls\(/);
   assert.match(command, /action === "device-calibration"/);
   assert.match(command, /message\.targetClientId/);
   assert.match(command, /message\.volumeTrimDb = calibrationValue\.volumeTrimDb/);
   assert.match(command, /message\.delayMs = calibrationValue\.delayMs/);
-  assert.match(calibrationSender, /pendingCalibration/);
-  assert.match(calibrationSender, /Math\.max\(0, 120 - elapsed\)/);
+  assert.doesNotMatch(bridge, /function sendDeviceCalibrationCommand\(/);
   assert.match(bridge, /applyCalibrationFromRoomDevices\(bridge\.sync\.devices\)/);
   assert.match(bridge, /reportLocalDeviceCalibration\(\);\s*if \(message\.state\) enqueueRoomState/);
   assert.match(
@@ -728,7 +783,14 @@ test("classic cover inputs are bounded, proxied, and refresh lock-screen artwork
   assert.match(html, /iw \* ih > 40000000/);
   assert.match(html, /img\.onerror = function\(\)/);
   assert.match(html, /mineradio:coverchange/);
-  assert.match(html, /function isProxyableCoverUrl[\s\S]*?parsed\.protocol === 'https:'/);
+  assert.match(
+    html,
+    /function normalizeProviderImageUrl[\s\S]*?trustedProviderImageHostname\(parsed\.hostname\)[\s\S]*?parsed\.protocol = 'https:'[\s\S]*?parsed\.protocol === 'https:'/,
+  );
+  assert.match(
+    html,
+    /function isProxyableCoverUrl\(url\) \{\s*return !!normalizeProviderImageUrl\(url\);\s*\}/,
+  );
   assert.match(bridge, /function coverMediaUrl/);
   assert.match(bridge, /new URL\("\/api\/cover", apiOrigin/);
   assert.match(bridge, /window\.addEventListener\("mineradio:coverchange", updateMediaSessionMetadata\)/);
@@ -853,6 +915,7 @@ test("classic room start is gesture-gated, catches up late timers, and preserves
   const modern = await readFile(path.join(root, "app", "components", "MineradioPlayer.tsx"), "utf8");
   const prime = sourceBetween(bridge, "function primeRoomMediaForSync", "function seekForRoomSync");
   const scheduledStart = sourceBetween(bridge, "function launchScheduledRoomPlayback", "function hasBufferedPlaybackWindow");
+  const scheduledIdentity = sourceBetween(bridge, "function scheduledPlaybackIdentityMatches", "function launchScheduledRoomPlayback");
   const seekThrottle = sourceBetween(bridge, "function sendSeekCommand", "function sendClockPing");
   const audioEvents = sourceBetween(bridge, "function attachAudioEvents", "function blockFollowerControl");
   const controlGuards = sourceBetween(bridge, "function installFollowerControlGuards", "function disableUnavailableQQWebUi");
@@ -878,12 +941,13 @@ test("classic room start is gesture-gated, catches up late timers, and preserves
   assert.match(scheduledStart, /var activeState = lastRoomState/);
   assert.match(scheduledStart, /guard\.timerGeneration !== scheduledPlayGeneration/);
   assert.match(scheduledStart, /guard\.connectionGeneration !== roomConnectionGeneration/);
-  assert.match(scheduledStart, /!activeState\.playing[\s\S]*?activeState\.preparing/);
-  assert.match(scheduledStart, /Number\(activeState\.revision\) !== guard\.revision/);
-  assert.match(scheduledStart, /currentDescriptorId\(\) !== guard\.trackId/);
-  assert.match(scheduledStart, /String\(activeState\.prepareId \|\| ""\) !== guard\.prepareId/);
-  assert.match(scheduledStart, /Number\(activeState\.scheduledAt \|\| 0\) !== guard\.scheduledAt/);
+  assert.match(scheduledIdentity, /!committedRoomPlaybackAllowed\(activeState\)/);
+  assert.match(scheduledIdentity, /Number\(activeState\.revision\) !== guard\.revision/);
+  assert.match(scheduledIdentity, /currentDescriptorId\(\) !== guard\.trackId/);
+  assert.match(scheduledIdentity, /String\(activeState\.prepareId \|\| ""\) !== guard\.prepareId/);
+  assert.match(scheduledIdentity, /Number\(activeState\.scheduledAt \|\| 0\) !== guard\.scheduledAt/);
   assert.match(scheduledStart, /alignScheduledRoomPlayback\(media, activeState\)/);
+  assert.match(scheduledStart, /measureLaunchWindow/);
   assert.match(bridge, /function alignScheduledRoomPlayback[\s\S]*?targetPosition\(state\)[\s\S]*?seekForRoomSync\(media, liveTarget\)/);
   assert.match(
     bridge,
@@ -962,8 +1026,8 @@ test("classic cover fallback preserves aspect ratio and never reuses another son
   assert.match(html, /function resetCoverDepthTexture\(\)/);
   assert.match(apply, /resetCoverDepthTexture\(\);\s*setCoverDepthState\(0, 0, 1\)/);
   assert.doesNotMatch(apply, /uniforms\.uHasDepth\.value > 0\.5 \? 0\.22/);
-  assert.match(urlLoader, /var cv = makeSquareCoverCanvas\(img2, size\)/);
-  assert.doesNotMatch(urlLoader, /drawImage\(img2, 0, 0, size, size\)/);
+  assert.match(urlLoader, /makeSquareCoverCanvas\(result\.image, coverTextureSizeForResolution\(fx\.coverResolution\)\)/);
+  assert.doesNotMatch(urlLoader, /drawImage\(result\.image, 0, 0/);
 });
 
 test("classic adaptive particle quality observes delivered frame cadence", async () => {

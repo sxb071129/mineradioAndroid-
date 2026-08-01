@@ -15,7 +15,14 @@ type MediaBufferSource = {
 type RoomSyncCore = {
   DEFAULT_BUFFER_GOAL_SECONDS: number;
   MAX_BUFFER_GOAL_SECONDS: number;
+  DEFAULT_LAUNCH_GOAL_SECONDS: number;
+  MAX_LAUNCH_GOAL_SECONDS: number;
   measureBufferedWindow(
+    media: MediaBufferSource | null,
+    target: number,
+    network?: { latencyMs?: number; jitterMs?: number },
+  ): BufferReadiness;
+  measureLaunchWindow(
     media: MediaBufferSource | null,
     target: number,
     network?: { latencyMs?: number; jitterMs?: number },
@@ -38,4 +45,12 @@ export function measureBufferedWindow(
   network?: { latencyMs?: number; jitterMs?: number },
 ) {
   return roomSyncCore.measureBufferedWindow(media, target, network);
+}
+
+export function measureLaunchWindow(
+  media: MediaBufferSource | null,
+  target: number,
+  network?: { latencyMs?: number; jitterMs?: number },
+) {
+  return roomSyncCore.measureLaunchWindow(media, target, network);
 }

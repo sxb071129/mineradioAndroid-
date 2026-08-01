@@ -31,11 +31,17 @@ const IDLE_HEALTH: ServiceHealthSnapshot = {
   checkedAt: 0,
 };
 
-function healthUrl(base: string) {
+function healthUrl(base: string, kind: "musicApi" | "relay") {
   try {
     const url = new URL(base);
     if (url.protocol !== "http:" && url.protocol !== "https:") return "";
-    url.pathname = "/health";
+    const throughSecureGateway =
+      typeof window !== "undefined" &&
+      window.location.protocol === "https:" &&
+      url.origin === window.location.origin;
+    url.pathname = throughSecureGateway
+      ? `/.well-known/mr-room/health/${kind === "relay" ? "relay" : "music"}`
+      : "/health";
     url.search = "";
     url.hash = "";
     return url.toString();
@@ -59,7 +65,7 @@ async function probeService(
   kind: "musicApi" | "relay",
   signal: AbortSignal,
 ): Promise<ServiceHealthSnapshot> {
-  const url = healthUrl(base);
+  const url = healthUrl(base, kind);
   if (!url) return offline("服务地址无效");
   const startedAt = performance.now();
   try {

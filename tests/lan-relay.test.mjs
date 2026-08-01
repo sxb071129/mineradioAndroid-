@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { WebSocket } from "ws";
-import { createLanRelay } from "../scripts/lan-relay.mjs";
+import { createLanRelay, rankedNetworkAddresses } from "../scripts/lan-relay.mjs";
 
 function connect(url) {
   const ws = new WebSocket(url);
@@ -43,6 +43,18 @@ function connect(url) {
     },
   };
 }
+
+test("relay advertises physical WLAN before VPN and virtual adapters", () => {
+  const addresses = rankedNetworkAddresses({
+    ProtonVPN: [{ family: "IPv4", internal: false, address: "10.2.0.2" }],
+    "vEthernet (Default Switch)": [
+      { family: "IPv4", internal: false, address: "192.168.64.1" },
+    ],
+    WLAN: [{ family: "IPv4", internal: false, address: "192.168.31.144" }],
+    Loopback: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
+  });
+  assert.deepEqual(addresses, ["192.168.31.144", "192.168.64.1", "10.2.0.2"]);
+});
 
 test("relay uploads ranged audio and synchronizes a room", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-relay-"));
@@ -226,6 +238,9 @@ test("relay uploads ranged audio and synchronizes a room", async (t) => {
       && message.state?.scheduledAt > message.state?.serverTime,
   );
   assert.equal(scheduledState.state.preparing, false);
+  assert.equal(scheduledState.state.strictSync, false);
+  assert.equal(scheduledState.state.commitState, "");
+  assert.equal(scheduledState.state.commitId, "");
   assert.equal(scheduledState.state.updatedAt, scheduledState.state.scheduledAt);
   const scheduledHardDeadline = relay.rooms.get("ROOM42").prepareMaxDeadline;
 
@@ -1255,4 +1270,463 @@ test("joining the current room again is idempotent during playback preparation",
   );
   assert.equal(limited.code, "rate_limited");
   assert.equal(room.clients.size, 1);
+});
+
+test("relay accepts only browser origins from the LAN web or HTTPS gateway", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-origin-"));
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+  });
+  t.after(async () => {
+    await relay.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  const base = `http://127.0.0.1:${relay.port}`;
+
+  const direct = await fetch(`${base}/health`, {
+    headers: { Origin: "http://192.168.1.20:3000" },
+  });
+  assert.equal(direct.status, 200);
+  const secure = await fetch(`${base}/health`, {
+    headers: { Origin: "https://192.168.1.20:3443" },
+  });
+  assert.equal(secure.status, 200);
+  const rejected = await fetch(`${base}/health`, {
+    headers: { Origin: "https://evil.example:3443" },
+  });
+  assert.equal(rejected.status, 403);
+  assert.deepEqual(await rejected.json(), { error: "origin_not_allowed" });
+
+  const allowedSocket = new WebSocket(`ws://127.0.0.1:${relay.port}/ws`, {
+    origin: "https://192.168.1.20:3443",
+  });
+  await new Promise((resolve, reject) => {
+    allowedSocket.once("open", resolve);
+    allowedSocket.once("error", reject);
+  });
+  allowedSocket.close();
+
+  const status = await new Promise((resolve, reject) => {
+    const blockedSocket = new WebSocket(`ws://127.0.0.1:${relay.port}/ws`, {
+      origin: "https://evil.example:3443",
+    });
+    blockedSocket.once("unexpected-response", (_request, response) => {
+      response.resume();
+      resolve(response.statusCode);
+    });
+    blockedSocket.once("open", () => reject(new Error("unexpected_open")));
+    blockedSocket.once("error", () => undefined);
+  });
+  assert.equal(status, 403);
+});
+
+test("v3 counts only capable clients, requires their buffer contract, and commits after every armed ACK", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-v3-commit-"));
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+    playbackPrepareTimeoutMs: 1200,
+    playbackPrepareMaxTimeoutMs: 5000,
+    playbackArmTimeoutMs: 1000,
+    playbackStartLeadMs: 700,
+    roomBroadcastIntervalMs: 20,
+  });
+  const clients = [
+    connect(`ws://127.0.0.1:${relay.port}/ws`),
+    connect(`ws://127.0.0.1:${relay.port}/ws`),
+    connect(`ws://127.0.0.1:${relay.port}/ws`),
+  ];
+  const [leader, follower, legacy] = clients;
+  t.after(async () => {
+    for (const client of clients) client.ws.close();
+    await relay.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await Promise.all(clients.map((client) => client.opened));
+  const welcomes = await Promise.all(
+    clients.map((client) => client.next((message) => message.type === "welcome")),
+  );
+  assert.equal(welcomes[0].protocolVersion, 3);
+  assert.deepEqual(welcomes[0].capabilities, {
+    bufferContract: true,
+    armedPlayback: true,
+  });
+
+  const v3 = {
+    protocolVersion: 3,
+    capabilities: { bufferContract: true, armedPlayback: true },
+  };
+  leader.ws.send(JSON.stringify({ type: "join", room: "V3ROOM", name: "V3 leader", ...v3 }));
+  const leaderJoined = await leader.next((message) => message.type === "joined");
+  assert.equal(leaderJoined.protocolVersion, 3);
+  follower.ws.send(JSON.stringify({ type: "join", room: "V3ROOM", name: "V3 follower", ...v3 }));
+  const followerJoined = await follower.next((message) => message.type === "joined");
+  assert.equal(followerJoined.protocolVersion, 3);
+  legacy.ws.send(JSON.stringify({ type: "join", room: "V3ROOM", name: "Legacy display" }));
+  const legacyJoined = await legacy.next((message) => message.type === "joined");
+  assert.equal(legacyJoined.protocolVersion, 1);
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "track",
+    track: { id: "cloud-314159", name: "Protocol v3" },
+  }));
+  leader.ws.send(JSON.stringify({ type: "command", action: "play" }));
+  const preparing = await follower.next(
+    (message) => message.type === "state"
+      && message.state?.preparing === true
+      && message.state?.strictSync === true
+      && message.state?.requiredCount === 2,
+  );
+  const prepareId = preparing.state.prepareId;
+  assert.equal(preparing.state.deviceCount, 3);
+  assert.equal(preparing.state.strictRequiredCount, 2);
+  assert.equal(
+    preparing.state.devices.filter((device) => device.strictParticipant).length,
+    2,
+  );
+
+  legacy.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId,
+    ready: true,
+  }));
+  const legacyBarrier = Date.now();
+  legacy.ws.send(JSON.stringify({ type: "ping", clientTime: legacyBarrier }));
+  await legacy.next(
+    (message) => message.type === "pong" && message.clientTime === legacyBarrier,
+  );
+  const room = relay.rooms.get("V3ROOM");
+  assert.equal(room.readyClients.has(welcomes[2].clientId), true);
+  assert.equal(room.state.commitState, "");
+  assert.equal(room.strictParticipants.size, 2);
+  assert.equal(
+    [...room.strictParticipants].filter((clientId) => room.readyClients.has(clientId)).length,
+    0,
+  );
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId,
+    ready: true,
+  }));
+  const missingContract = await leader.next(
+    (message) => message.type === "error"
+      && message.code === "buffer_contract_required"
+      && message.prepareId === prepareId,
+  );
+  assert.equal(missingContract.code, "buffer_contract_required");
+  assert.equal(room.readyClients.has(welcomes[0].clientId), false);
+
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId,
+    ready: true,
+    bufferedSeconds: 7,
+    bufferGoalSeconds: 8,
+  }));
+  const insufficient = await follower.next(
+    (message) => message.type === "error"
+      && message.code === "buffer_not_ready"
+      && message.prepareId === prepareId,
+  );
+  assert.equal(insufficient.code, "buffer_not_ready");
+  assert.equal(room.readyClients.has(welcomes[1].clientId), false);
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId,
+    ready: true,
+    bufferedSeconds: 8,
+    bufferGoalSeconds: 8,
+    latencyMs: 20,
+    jitterMs: 5,
+  }));
+  await follower.next(
+    (message) => message.type === "state"
+      && message.state?.prepareId === prepareId
+      && message.state?.readyCount === 1
+      && message.state?.commitState === "",
+  );
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId,
+    ready: true,
+    bufferedSeconds: 8,
+    bufferGoalSeconds: 8,
+    latencyMs: 100,
+    jitterMs: 25,
+  }));
+  const tentative = await follower.next(
+    (message) => message.type === "state"
+      && message.state?.prepareId === prepareId
+      && message.state?.commitState === "tentative"
+      && message.state?.commitId,
+  );
+  const commitId = tentative.state.commitId;
+  assert.equal(tentative.state.playing, false);
+  assert.equal(tentative.state.preparing, true);
+  assert.equal(tentative.state.armedCount, 0);
+  assert.equal(tentative.state.bufferProgress, 1);
+  assert.ok(tentative.state.scheduledAt > tentative.state.serverTime);
+  assert.ok(tentative.state.commitDeadline > tentative.state.serverTime);
+
+  legacy.ws.send(JSON.stringify({
+    type: "command",
+    action: "armed",
+    prepareId,
+    commitId,
+    armed: true,
+  }));
+  const legacyArmed = await legacy.next(
+    (message) => message.type === "error" && message.code === "strict_sync_required",
+  );
+  assert.equal(legacyArmed.code, "strict_sync_required");
+  assert.equal(room.armedClients.size, 0);
+
+  const revisionBeforeStaleAck = room.state.revision;
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "armed",
+    prepareId,
+    commitId: "stale-commit",
+    armed: true,
+  }));
+  const staleBarrier = Date.now();
+  leader.ws.send(JSON.stringify({ type: "ping", clientTime: staleBarrier }));
+  await leader.next(
+    (message) => message.type === "pong" && message.clientTime === staleBarrier,
+  );
+  assert.equal(room.state.commitId, commitId);
+  assert.equal(room.state.revision, revisionBeforeStaleAck);
+  assert.equal(room.armedClients.size, 0);
+
+  leader.ws.send(JSON.stringify({
+    type: "command",
+    action: "armed",
+    prepareId,
+    commitId,
+    armed: true,
+  }));
+  const oneArmed = await follower.next(
+    (message) => message.type === "state"
+      && message.state?.commitId === commitId
+      && message.state?.armedCount === 1,
+  );
+  assert.equal(oneArmed.state.playing, false);
+
+  const finalAckSentAt = Date.now();
+  follower.ws.send(JSON.stringify({
+    type: "command",
+    action: "armed",
+    prepareId,
+    commitId,
+    armed: true,
+  }));
+  const committed = await follower.next(
+    (message) => message.type === "state"
+      && message.state?.commitId === commitId
+      && message.state?.commitState === "committed"
+      && message.state?.playing === true,
+  );
+  assert.equal(committed.state.preparing, false);
+  assert.equal(committed.state.armedCount, 2);
+  assert.equal(committed.state.strictRequiredCount, 2);
+  assert.ok(
+    committed.state.scheduledAt - finalAckSentAt >= 950,
+    `dynamic start window ${committed.state.scheduledAt - finalAckSentAt}ms`,
+  );
+  assert.ok(committed.state.scheduledAt > committed.state.serverTime + 850);
+});
+
+test("v3 arm timeout rotates the commit and canceling armed safely returns to buffering", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "mineradio-v3-replan-"));
+  const relay = await createLanRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dataDir,
+    playbackPrepareTimeoutMs: 1000,
+    playbackPrepareMaxTimeoutMs: 3000,
+    playbackArmTimeoutMs: 300,
+    playbackStartLeadMs: 500,
+    roomBroadcastIntervalMs: 20,
+  });
+  const client = connect(`ws://127.0.0.1:${relay.port}/ws`);
+  t.after(async () => {
+    client.ws.close();
+    await relay.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await client.opened;
+  await client.next((message) => message.type === "welcome");
+  client.ws.send(JSON.stringify({
+    type: "join",
+    room: "REPLAN",
+    name: "Strict device",
+    protocolVersion: 3,
+    capabilities: { bufferContract: true, armedPlayback: true },
+  }));
+  await client.next((message) => message.type === "joined" && message.protocolVersion === 3);
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "track",
+    track: { id: "cloud-271828", name: "Commit rotation" },
+  }));
+  client.ws.send(JSON.stringify({ type: "command", action: "play" }));
+  const preparing = await client.next(
+    (message) => message.type === "state" && message.state?.preparing === true,
+  );
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId: preparing.state.prepareId,
+    ready: true,
+    bufferedSeconds: 8,
+    bufferGoalSeconds: 8,
+    latencyMs: 30,
+    jitterMs: 5,
+  }));
+  const firstTentative = await client.next(
+    (message) => message.type === "state"
+      && message.state?.commitState === "tentative"
+      && message.state?.commitId,
+  );
+  const firstCommitId = firstTentative.state.commitId;
+  const secondTentative = await client.next(
+    (message) => message.type === "state"
+      && message.state?.commitState === "tentative"
+      && message.state?.commitId
+      && message.state.commitId !== firstCommitId,
+    1500,
+  );
+  const secondCommitId = secondTentative.state.commitId;
+  assert.ok(secondTentative.state.revision > firstTentative.state.revision);
+  assert.equal(secondTentative.state.armedCount, 0);
+
+  const room = relay.rooms.get("REPLAN");
+  const revisionBeforeStaleAck = room.state.revision;
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "armed",
+    prepareId: preparing.state.prepareId,
+    commitId: firstCommitId,
+    armed: true,
+  }));
+  const staleBarrier = Date.now();
+  client.ws.send(JSON.stringify({ type: "ping", clientTime: staleBarrier }));
+  await client.next(
+    (message) => message.type === "pong" && message.clientTime === staleBarrier,
+  );
+  assert.equal(room.state.commitId, secondCommitId);
+  assert.equal(room.state.revision, revisionBeforeStaleAck);
+  assert.equal(room.armedClients.size, 0);
+
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "armed",
+    prepareId: preparing.state.prepareId,
+    commitId: secondCommitId,
+    armed: false,
+    bufferState: "buffering",
+  }));
+  const canceled = await client.next(
+    (message) => message.type === "state"
+      && message.state?.commitState === ""
+      && message.state?.commitId === ""
+      && message.state?.preparing === true
+      && message.state?.readyCount === 0,
+  );
+  assert.equal(canceled.state.scheduledAt, 0);
+  assert.equal(room.armedClients.size, 0);
+  assert.equal(room.readyClients.size, 0);
+
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "armed",
+    prepareId: preparing.state.prepareId,
+    commitId: secondCommitId,
+    armed: true,
+  }));
+  const canceledBarrier = Date.now();
+  client.ws.send(JSON.stringify({ type: "ping", clientTime: canceledBarrier }));
+  await client.next(
+    (message) => message.type === "pong" && message.clientTime === canceledBarrier,
+  );
+  assert.equal(room.state.commitId, "");
+  assert.equal(room.armedClients.size, 0);
+
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "ready",
+    prepareId: preparing.state.prepareId,
+    ready: true,
+    bufferedSeconds: 8,
+    bufferGoalSeconds: 8,
+    latencyMs: 30,
+    jitterMs: 5,
+  }));
+  const thirdReadyBarrier = Date.now();
+  client.ws.send(JSON.stringify({ type: "ping", clientTime: thirdReadyBarrier }));
+  await client.next(
+    (message) => message.type === "pong" && message.clientTime === thirdReadyBarrier,
+  );
+  const thirdCommitId = room.state.commitId;
+  assert.equal(room.state.commitState, "tentative");
+  assert.notEqual(thirdCommitId, secondCommitId);
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "armed",
+    prepareId: preparing.state.prepareId,
+    commitId: thirdCommitId,
+    armed: true,
+  }));
+  const committed = await client.next(
+    (message) => message.type === "state"
+      && message.state?.commitId === thirdCommitId
+      && message.state?.commitState === "committed"
+      && message.state?.playing === true,
+  );
+  assert.ok(committed.state.scheduledAt > committed.state.serverTime);
+
+  const committedRevision = room.state.revision;
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "start-failed",
+    prepareId: preparing.state.prepareId,
+    commitId: secondCommitId,
+  }));
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "start-failed",
+    prepareId: preparing.state.prepareId,
+  }));
+  const staleFailureBarrier = Date.now();
+  client.ws.send(JSON.stringify({ type: "ping", clientTime: staleFailureBarrier }));
+  await client.next(
+    (message) => message.type === "pong" && message.clientTime === staleFailureBarrier,
+  );
+  assert.equal(room.state.commitId, thirdCommitId);
+  assert.equal(room.state.revision, committedRevision);
+  assert.equal(room.state.playing, true);
+
+  client.ws.send(JSON.stringify({
+    type: "command",
+    action: "start-failed",
+    prepareId: preparing.state.prepareId,
+    commitId: thirdCommitId,
+  }));
+  const failedCurrentCommit = await client.next(
+    (message) => message.type === "state"
+      && message.state?.prepareError === "start_failed"
+      && message.state?.playing === false,
+  );
+  assert.equal(failedCurrentCommit.state.commitId, "");
 });

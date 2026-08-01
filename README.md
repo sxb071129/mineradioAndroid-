@@ -26,6 +26,32 @@ Windows PowerShell 若阻止 `npm.ps1`，可使用 `npm.cmd run dev:lan`。
 
 也可以直接双击桌面的 `启动-MR-ROOM局域网.cmd`。启动窗口会列出当前局域网 IP、网页端口 `3000`、同步端口 `8787` 和音乐接口端口 `8790`，并使用 Windows 兼容的实时服务同时启动网站、同步中继和受限音乐适配器，无需预先构建。
 
+启动器会优先把物理 WLAN/以太网标为“推荐给手机和平板使用”，并把 ProtonVPN、Wintun、Hyper-V 等地址放到“其他适配器”。首次运行会请求一次 Windows UAC，只创建 `Private + LocalSubnet` 范围的 MR//ROOM 入站规则，不关闭防火墙，也不允许公网来源。
+
+若本机能打开而手机/平板打不开：
+
+1. 确认两台设备连接同一个普通 Wi‑Fi，不是访客网络；手机应打开启动器标为“推荐”的 WLAN 地址，不能使用 `localhost`、VPN 或虚拟网卡地址。
+2. 确认启动器显示 `[OK] Windows firewall`，并且 Windows 当前网络类别是 `Private`。
+3. ProtonVPN 等 VPN 正在运行时，启用它的“Allow LAN connections/允许局域网连接”，或暂时关闭 Kill Switch 后再试。
+4. 路由器若启用了“AP 隔离、客户端隔离、访客网络隔离”，同一 Wi‑Fi 设备也无法互访，需要关闭该隔离。
+
+## 可选安全 HTTPS
+
+普通 `http://主机IP:3000` 可以播放和同步，但浏览器不会把局域网 IP 的 HTTP 页面视为安全上下文，因此无法安装 PWA，也无法启用摄像头手势。需要这些能力时可显式配置专用 HTTPS：
+
+```bash
+npm.cmd run setup:https
+npm.cmd run start:lan:https
+```
+
+- 安全播放器：`https://主机IP:3443`
+- 手机证书安装页：`http://主机IP:3080`
+- 证书和私钥只保存在 `%LOCALAPPDATA%\Mineradio\tls`，不会进入项目、Git 或 OneDrive。
+- `setup:https` 只把专用 MR//ROOM 根证书信任到当前 Windows 用户。手机和平板只下载公开的 `.cer` 根证书，绝不能复制 `root-ca.pfx`、`server.pfx` 或密码文件。
+- iPhone/iPad 安装证书描述文件后，还要到“设置 → 通用 → 关于本机 → 证书信任设置”开启完全信任；Android 从“安全/加密与凭据 → 安装 CA 证书”导入。系统菜单名称可能因版本不同略有差异。
+- 证书警告页中选择“仍然继续”不等于可信安全上下文；必须完成根证书信任，并使用证书中包含的精确 WLAN IP。
+- HTTPS 只保护传输并启用浏览器安全能力，不会增加房间 PIN 或设备审批。
+
 ## 第三方音乐接口
 
 - 搜索、每日推荐与推荐歌曲保持使用网易云兼容接口；登录面板支持网易云和酷狗扫码登录，“我的歌单”读取已登录酷狗账号的云歌单。酷狗沿用原仓库的二维码登录协议，扫码成功后会额外刷新完整 VIP/SVIP 资料，避免只凭二维码简略响应误判会员等级。
@@ -57,7 +83,7 @@ Windows PowerShell 若阻止 `npm.ps1`，可使用 `npm.cmd run dev:lan`。
 - 主控离开后，新主控会自动选举并暂停房间，避免双主控竞争。
 - 同步的是网页播放器内音量，无法修改设备的物理/系统音量。
 
-自用可信局域网模式默认不加房间 PIN 或设备审批。请勿把 `8787` 或 `8790` 端口直接映射到公网。
+自用可信局域网模式默认不加房间 PIN 或设备审批。请勿把 `3000`、`3080`、`3443`、`8787` 或 `8790` 端口直接映射到公网。
 
 ## 命令
 
@@ -65,8 +91,10 @@ Windows PowerShell 若阻止 `npm.ps1`，可使用 `npm.cmd run dev:lan`。
 npm run dev       # 只启动网站
 npm run relay     # 只启动局域网中继
 npm run music     # 只启动第三方音乐适配服务
-npm run dev:lan   # 网站 + 中继
+npm run dev:lan   # 网站 + 中继 + 音乐适配服务
 npm run start:lan # Windows 兼容模式，启动网站 + 中继 + 音乐适配服务
+npm run setup:https     # 生成专用证书并信任到当前 Windows 用户
+npm run start:lan:https # 启动 HTTP 兼容入口及统一 HTTPS/WSS 入口
 npm run build     # 生产构建
 npm test          # 构建、SSR 与中继协议测试
 npm run lint      # ESLint

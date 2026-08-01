@@ -3,6 +3,9 @@ import path from "node:path";
 
 const cli = path.resolve("node_modules", "vinext", "dist", "cli.js");
 const requestedAction = process.argv[2] === "start" ? "start" : "dev";
+const secureGatewayEnabled =
+  process.argv.includes("--https") ||
+  /^(1|true|yes)$/i.test(process.env.MINERADIO_HTTPS || "");
 
 // vinext 0.0.50's production static-file cache keeps Windows path
 // separators, so /assets/*.css and /assets/*.js return 404 on Windows.
@@ -31,6 +34,14 @@ const children = [
     env: process.env,
   }),
 ];
+if (secureGatewayEnabled) {
+  children.push(
+    spawn(process.execPath, ["scripts/lan-gateway.mjs"], {
+      stdio: "inherit",
+      env: process.env,
+    }),
+  );
+}
 
 let closing = false;
 function close(code = 0) {

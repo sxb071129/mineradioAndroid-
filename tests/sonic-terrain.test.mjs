@@ -1,210 +1,200 @@
 import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
 
 const root = path.resolve(import.meta.dirname, "..");
-const source = await readFile(path.join(root, "public", "classic", "sonic-terrain.js"), "utf8");
+const [threeSource, source] = await Promise.all([
+  readFile(path.join(root, "public", "classic", "vendor", "three.r128.min.js"), "utf8"),
+  readFile(path.join(root, "public", "classic", "sonic-terrain.js"), "utf8"),
+]);
 
-function createGradient() {
-  return { addColorStop() {} };
-}
-
-function createHarness({
-  width = 1200,
-  height = 800,
-  devicePixelRatio = 3,
-  mobile = false,
-  coarsePointer = false,
-  reducedMotion = false,
-} = {}) {
-  const bodyClasses = new Set(mobile ? ["mobile-optimized"] : []);
-  const canvases = [];
-  const listeners = new Map();
-
-  function createContext() {
-    return {
-      clearCount: 0,
-      strokeCount: 0,
-      points: [],
-      setTransform() {},
-      clearRect() { this.clearCount += 1; },
-      createRadialGradient: createGradient,
-      createLinearGradient: createGradient,
-      fillRect() {},
-      beginPath() {},
-      moveTo(x, y) { this.points.push(["m", x, y]); },
-      lineTo(x, y) { this.points.push(["l", x, y]); },
-      stroke() { this.strokeCount += 1; },
-      lineCap: "",
-      lineJoin: "",
-      lineWidth: 0,
-      strokeStyle: "",
-      fillStyle: "",
-    };
-  }
-
-  const body = {
-    classList: {
-      contains(value) { return bodyClasses.has(value); },
-    },
-    appendChild(node) {
-      node.parentNode = body;
-      node.isConnected = true;
-      canvases.push(node);
-    },
-    removeChild(node) {
-      node.parentNode = null;
-      node.isConnected = false;
-    },
+function createHarness() {
+  const sandbox = {
+    console: { log() {}, warn() {}, error() {} },
+    Date,
+    Math,
+    performance,
   };
-
-  const document = {
-    body,
-    documentElement: {
-      clientWidth: width,
-      clientHeight: height,
-      contains(node) { return Boolean(node?.isConnected); },
-    },
-    createElement(tagName) {
-      assert.equal(tagName, "canvas");
-      const context = createContext();
-      return {
-        width: 0,
-        height: 0,
-        style: {},
-        dataset: {},
-        parentNode: null,
-        isConnected: false,
-        context,
-        setAttribute() {},
-        getContext() { return context; },
-      };
-    },
-  };
-
-  const window = {
-    innerWidth: width,
-    innerHeight: height,
-    devicePixelRatio,
-    document,
-    addEventListener(type, listener) { listeners.set(type, listener); },
-    removeEventListener(type) { listeners.delete(type); },
-    matchMedia(query) {
-      return {
-        matches: query.includes("prefers-reduced-motion")
-          ? reducedMotion
-          : (query.includes("pointer: coarse") && coarsePointer),
-      };
-    },
-  };
-  window.window = window;
-
-  vm.runInNewContext(source, { window, document }, { filename: "sonic-terrain.js" });
-
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(threeSource, sandbox, { filename: "three.r128.min.js" });
+  vm.runInContext(source, sandbox, { filename: "sonic-terrain.js" });
+  const scene = new sandbox.THREE.Scene();
   return {
-    api: window.MineradioSonicTerrain,
-    bodyClasses,
-    canvases,
-    get canvas() { return canvases.at(-1); },
-    get context() { return canvases.at(-1)?.context; },
+    THREE: sandbox.THREE,
+    api: sandbox.MineradioSonicTerrain,
+    compatibilityApi: sandbox.MineradioSonicTopography,
+    scene,
+    sandbox,
   };
 }
 
-function fx(quality = "high") {
+function terrainFx(overrides = {}) {
   return {
     preset: 7,
-    performanceQuality: quality,
-    sonicTerrainIntensity: 1,
-    sonicTerrainResponse: 1,
-    sonicTerrainTheme: "mono",
+    performanceQuality: "high",
+    sonicTerrainIntensity: 1.15,
+    sonicTerrainResponse: 1.1,
+    sonicTerrainTheme: "cover",
+    ...overrides,
   };
 }
 
-function renderedPoints(frame) {
-  const harness = createHarness({ devicePixelRatio: 1 });
-  assert.equal(harness.api.update(1 / 60, { fx: fx(), ...frame }), true);
-  return harness.context.points;
+function render(harness, fx = terrainFx(), extra = {}) {
+  return harness.api.update(1 / 60, {
+    scene: harness.scene,
+    fx,
+    time: 1,
+    audio: {
+      bass: 0.72,
+      mid: 0.48,
+      treble: 0.34,
+      beat: 0.68,
+      energy: 0.58,
+    },
+    palette: {
+      primary: "#e56a8b",
+      secondary: "#4f8dff",
+      highlight: "#ffd0a3",
+    },
+    ...extra,
+  });
 }
 
-test("explicit normalized bands clamp above one while byte bins normalize from 255", () => {
-  const saturated = renderedPoints({ bass: 1, mid: 1, treble: 1 });
-  const overshooting = renderedPoints({ bass: 2, mid: 4, treble: 8 });
-  const byteBins = renderedPoints({ frequencyData: Array(96).fill(255) });
+function terrainRoot(harness) {
+  return harness.scene.getObjectByName("sonic-topography-root");
+}
 
-  assert.deepEqual(
-    overshooting,
-    saturated,
-    "explicit analyzer bands above one must saturate instead of being divided by 100",
-  );
-  assert.deepEqual(
-    byteBins,
-    saturated,
-    "8-bit frequency bins at 255 must map to the same full-scale signal",
-  );
+test("terrain exports the Classic API without taking ownership of audio or network I/O", () => {
+  const harness = createHarness();
+  assert.equal(harness.api, harness.compatibilityApi);
+  assert.equal(harness.api.INDEX, 7);
+  assert.equal(harness.api.isActive(terrainFx()), true);
+  assert.equal(harness.api.isActive({ preset: 5 }), false);
+  assert.doesNotMatch(source, /AudioContext|\.src\s*=|fetch\(/);
+  assert.match(source, /Copyright \(C\) 2026 XxHuberrr/);
 });
 
-test("reduced-motion preference prevents canvas creation and preset activation", () => {
-  const harness = createHarness({ reducedMotion: true });
+test("terrain creates colored 3D instanced boxes instead of a flat canvas grid", () => {
+  const harness = createHarness();
+  assert.equal(render(harness), true);
 
-  assert.equal(harness.api.update(1 / 60, { fx: fx(), bass: 1 }), false);
-  assert.equal(harness.api.onPresetChange(0, fx()), false);
-  assert.equal(harness.canvases.length, 0);
+  const root = terrainRoot(harness);
+  assert.ok(root);
+  assert.equal(root.visible, true);
+  assert.ok(root.children[0].isInstancedMesh);
+  assert.match(String(root.children[0].geometry.type), /BoxGeometry/);
+  assert.equal(root.children[0].count, 156 * 156);
+  assert.equal(root.children[1].count, 80);
+  assert.ok(root.children[0].material.uniforms.uCoolCore);
+  assert.ok(root.children[0].material.uniforms.uWarmCore);
+  assert.ok(root.children[0].material.uniforms.uRippleColor);
+  assert.match(source, /idlePeaks=pow\(smoothstep\(0\.52,0\.92,baseNoise\),2\.0\)/);
+  assert.match(source, /idleElevation=\(0\.48\+idleShape\*2\.10\+idlePeaks\)\*globalFalloff/);
+  assert.match(source, /max\(0\.22,topIntensity\)/);
 });
 
-test("quality profiles scale DPR and terrain density, with ultra unchanged on mobile", () => {
-  function renderProfile(quality, mobile = false) {
-    const harness = createHarness({ mobile });
-    assert.equal(harness.api.update(1 / 60, { fx: fx(quality), bass: 0.6, mid: 0.4, treble: 0.2 }), true);
-    return {
-      width: harness.canvas.width,
-      strokes: harness.context.strokeCount,
-    };
+test("silent buffering keeps visible idle relief and the current cover palette", () => {
+  const harness = createHarness();
+  const silentAudio = { bass: 0, mid: 0, treble: 0, beat: 0, energy: 0 };
+  const palette = { primary: "#e56a8b", secondary: "#4f8dff", highlight: "#ffd0a3" };
+  for (let frame = 0; frame < 30; frame += 1) {
+    render(harness, terrainFx(), { audio: silentAudio, palette, time: frame / 60 });
   }
 
-  const eco = renderProfile("eco");
-  const balanced = renderProfile("balanced");
-  const high = renderProfile("high");
-  const ultra = renderProfile("ultra");
-  const mobileHigh = renderProfile("high", true);
-  const mobileUltra = renderProfile("ultra", true);
-
-  assert.equal(eco.width, 1200);
-  assert.equal(balanced.width, 1500);
-  assert.equal(high.width, 2100);
-  assert.equal(ultra.width, 2400);
-  assert.equal(mobileHigh.width, 1620);
-  assert.equal(mobileUltra.width, ultra.width);
-
-  assert.ok(eco.strokes < balanced.strokes);
-  assert.ok(balanced.strokes < high.strokes);
-  assert.ok(high.strokes < ultra.strokes);
-  assert.ok(mobileHigh.strokes < high.strokes);
-  assert.equal(mobileUltra.strokes, ultra.strokes);
+  const root = terrainRoot(harness);
+  const uniforms = root.children[0].material.uniforms;
+  assert.equal(uniforms.uSubBass.value, 0);
+  assert.equal(uniforms.uMid.value, 0);
+  assert.ok(root.scale.y > root.scale.x * 1.9);
+  assert.ok(uniforms.uCoolCore.value.r > 0.35, "cover red should replace the blue fallback while silent");
+  assert.ok(uniforms.uWarmCore.value.b > uniforms.uWarmCore.value.r, "cover secondary blue should drive the warm zone while silent");
 });
 
-test("quality profiles throttle draw cadence while ultra renders every supplied frame", () => {
-  function renderCount(quality, mobile = false) {
-    const harness = createHarness({ mobile });
-    for (let index = 0; index < 12; index += 1) {
-      assert.equal(
-        harness.api.update(1 / 60, { fx: fx(quality), bass: 0.5, mid: 0.3, treble: 0.2 }),
-        true,
-      );
+test("quality caps preserve full high and ultra voxel density", () => {
+  function instanceCount(quality) {
+    const harness = createHarness();
+    render(harness, terrainFx({ performanceQuality: quality, sonicGroundDensity: 100 }));
+    return terrainRoot(harness).children[0].count;
+  }
+
+  assert.equal(instanceCount("eco"), 112 * 112);
+  assert.equal(instanceCount("balanced"), 160 * 160);
+  assert.equal(instanceCount("high"), 192 * 192);
+  assert.equal(instanceCount("ultra"), 224 * 224);
+});
+
+test("cover and named DIY themes drive different shader colors", () => {
+  function coolColor(theme, palette) {
+    const harness = createHarness();
+    for (let frame = 0; frame < 18; frame += 1) {
+      render(harness, terrainFx({ sonicTerrainTheme: theme }), { palette });
     }
-    return harness.context.clearCount;
+    return terrainRoot(harness).children[0].material.uniforms.uCoolCore.value.getHexString();
   }
 
-  const ecoFrames = renderCount("eco");
-  const highFrames = renderCount("high");
-  const mobileHighFrames = renderCount("high", true);
-  const ultraFrames = renderCount("ultra");
-  const mobileUltraFrames = renderCount("ultra", true);
+  const coverPink = coolColor("cover", {
+    primary: "#ff477e",
+    secondary: "#ffb86c",
+    highlight: "#ffe2ee",
+  });
+  const coverBlue = coolColor("cover", {
+    primary: "#2f80ff",
+    secondary: "#43e8ff",
+    highlight: "#dff8ff",
+  });
+  const aurora = coolColor("aurora");
+  const ocean = coolColor("ocean");
 
-  assert.ok(ecoFrames < highFrames);
-  assert.ok(mobileHighFrames < highFrames);
-  assert.equal(highFrames, 12);
-  assert.equal(ultraFrames, 12);
-  assert.equal(mobileUltraFrames, ultraFrames);
+  assert.notEqual(coverPink, coverBlue);
+  assert.notEqual(aurora, ocean);
+  assert.notEqual(coverPink, aurora);
+});
+
+test("audio energy raises voxel uniforms and simple DIY intensity remains effective", () => {
+  const harness = createHarness();
+  render(harness, terrainFx({ sonicTerrainIntensity: 1.6, sonicTerrainResponse: 1.4 }));
+  const uniforms = terrainRoot(harness).children[0].material.uniforms;
+
+  assert.ok(uniforms.uBass.value > 0);
+  assert.ok(uniforms.uMid.value > 0);
+  assert.ok(uniforms.uEnergy.value > 0);
+  assert.ok(uniforms.uAmplitude.value > 1);
+});
+
+test("preset switches hide and reuse the GPU layer instead of rebuilding it", () => {
+  const harness = createHarness();
+  render(harness);
+  const root = terrainRoot(harness);
+  const terrain = root.children[0];
+  const matrixBuffer = terrain.instanceMatrix.array;
+
+  assert.equal(harness.api.onPresetChange(7, 5, { scene: harness.scene, fx: { preset: 5 } }), false);
+  assert.equal(root.visible, false);
+  assert.equal(terrainRoot(harness), root);
+
+  assert.equal(harness.api.onPresetChange(5, 7, { scene: harness.scene, fx: terrainFx() }), true);
+  assert.equal(render(harness), true);
+  assert.equal(terrainRoot(harness), root);
+  assert.equal(terrainRoot(harness).children[0], terrain);
+  assert.equal(terrain.instanceMatrix.array, matrixBuffer);
+
+  harness.api.clear();
+  assert.equal(terrainRoot(harness), undefined);
+});
+
+test("terrain initialization writes matrices in bulk and remains bounded", () => {
+  const harness = createHarness();
+  const startedAt = performance.now();
+  render(harness, terrainFx({ performanceQuality: "ultra", sonicGroundDensity: 100 }));
+  const elapsed = performance.now() - startedAt;
+
+  assert.equal(terrainRoot(harness).children[0].count, 224 * 224);
+  assert.match(source, /var matrices = mesh\.instanceMatrix\.array/);
+  assert.ok(elapsed < 1500, `ultra terrain initialization took ${elapsed.toFixed(1)}ms`);
 });

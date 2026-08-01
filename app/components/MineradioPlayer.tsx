@@ -61,9 +61,18 @@ import {
   type RepeatMode,
 } from "../lib/player-queue.mjs";
 import { preferredLanHost } from "../lib/lan-address.mjs";
-import { measureBufferedWindow } from "../lib/room-sync-core";
+import { measureBufferedWindow, measureLaunchWindow } from "../lib/room-sync-core";
 import { playbackCorrection } from "../lib/room-sync-timing.mjs";
-import type { PlaybackQuality, RoomBufferState, TrackDescriptor } from "../lib/sync-types";
+import {
+  accountAvatarSrc,
+  DEFAULT_ACCOUNT_AVATAR,
+} from "../lib/provider-image.mjs";
+import type {
+  PlaybackQuality,
+  RoomBufferState,
+  RoomState,
+  TrackDescriptor,
+} from "../lib/sync-types";
 
 type LocalTrack = TrackDescriptor & {
   url: string;
@@ -219,7 +228,14 @@ function defaultRelayUrl() {
   if (saved) {
     try {
       const parsed = JSON.parse(saved) as { relayUrl?: string };
-      if (parsed.relayUrl) return parsed.relayUrl;
+      if (parsed.relayUrl) {
+        const candidate = new URL(parsed.relayUrl);
+        const mixedContent =
+          window.location.protocol === "https:" && candidate.protocol === "ws:";
+        if (!mixedContent && ["ws:", "wss:"].includes(candidate.protocol)) {
+          return candidate.toString();
+        }
+      }
     } catch {
       // Ignore stale settings and fall back to the current host.
     }
@@ -235,7 +251,14 @@ function defaultMusicApiUrl() {
   if (saved) {
     try {
       const parsed = JSON.parse(saved) as { musicApiUrl?: string };
-      if (parsed.musicApiUrl) return parsed.musicApiUrl;
+      if (parsed.musicApiUrl) {
+        const candidate = new URL(parsed.musicApiUrl);
+        const mixedContent =
+          window.location.protocol === "https:" && candidate.protocol === "http:";
+        if (!mixedContent && ["http:", "https:"].includes(candidate.protocol)) {
+          return candidate.toString().replace(/\/$/, "");
+        }
+      }
     } catch {
       // Ignore stale settings and fall back to the current host.
     }
@@ -544,6 +567,12 @@ export function MineradioPlayer() {
   const audioErrorControllerRef = useRef<AbortController | null>(null);
   const audioErrorProbeSourceRef = useRef("");
   const roomReadyPrepareRef = useRef("");
+  const roomArmedCommitRef = useRef("");
+  const roomPlaybackCommitRef = useRef("");
+  const roomLatestStateRef = useRef<RoomState | null>(null);
+  const roomConnectedRef = useRef(false);
+  const roomClockReadyRef = useRef(false);
+  const roomAudioSourceRef = useRef("");
   const suppressRoomMediaEventsRef = useRef(false);
   const roomPlaybackUnlockedElementRef = useRef<HTMLAudioElement | null>(null);
   const roomPlaybackUnlockPromiseRef = useRef<Promise<boolean> | null>(null);
@@ -578,6 +607,7 @@ export function MineradioPlayer() {
   const roomIsLeader = room.isLeader;
   const roomLatency = room.latency;
   const roomClockJitter = room.clockJitter;
+  const roomClockReady = room.clockReady;
   const sendRoomCommand = room.sendCommand;
   const getRoomTargetPosition = room.targetPosition;
   const getRoomServerNow = room.serverNow;
@@ -588,6 +618,9 @@ export function MineradioPlayer() {
     : "";
   const effectiveTrack = mode === "room" ? roomTrack : localTrack;
   const effectivePlaying = mode === "room"
+    ? Boolean(roomState?.playing)
+    : soloPlaying;
+  const effectivePlaybackActive = mode === "room"
     ? Boolean(roomState?.playing || roomState?.preparing)
     : soloPlaying;
   const effectiveVolume = mode === "room" ? roomState?.volume ?? DEFAULT_VOLUME : soloVolume;
@@ -601,6 +634,13 @@ export function MineradioPlayer() {
     if (!room.httpBase) return "";
     return new URL(effectiveTrack.path, room.httpBase).toString();
   }, [effectiveTrack, localTrack?.url, mode, room.httpBase]);
+
+  useEffect(() => {
+    roomLatestStateRef.current = roomState;
+    roomConnectedRef.current = roomConnected;
+    roomClockReadyRef.current = roomClockReady;
+    roomAudioSourceRef.current = audioSource;
+  }, [audioSource, roomClockReady, roomConnected, roomState]);
 
   const beginPrepareRequest = useCallback(() => {
     prepareSequenceRef.current += 1;
@@ -1410,24 +1450,58 @@ export function MineradioPlayer() {
     let correctionTimer: ReturnType<typeof setInterval> | undefined;
     let playAttempted = false;
     let disposed = false;
+    const strictCommitKey = state.strictSync && state.prepareId && state.commitId
+      ? `${state.prepareId}:${state.commitId}`
+      : "";
+    const playbackCommitKey = state.strictSync
+      ? `${strictCommitKey}:${state.scheduledAt}:${state.revision}`
+      : `legacy:${state.track?.id || ""}:${state.updatedAt}:${state.scheduledAt}:${state.revision}`;
+
+    if (roomReadyPrepareRef.current && roomReadyPrepareRef.current !== state.prepareId) {
+      roomReadyPrepareRef.current = "";
+    }
+    if (roomArmedCommitRef.current && roomArmedCommitRef.current !== strictCommitKey) {
+      roomArmedCommitRef.current = "";
+    }
+    if (!state.playing && !state.preparing) roomPlaybackCommitRef.current = "";
 
     audio.preservesPitch = true;
     audio.preload = "auto";
 
-    const targetPosition = () => {
+    const targetPositionFor = (snapshot: RoomState) => {
       const serverNow = getRoomServerNow();
-      const delayCompensation = state.playing
-        && (!state.scheduledAt || state.scheduledAt <= serverNow)
+      const delayCompensation = snapshot.playing
+        && (!snapshot.scheduledAt || snapshot.scheduledAt <= serverNow)
         ? deviceCalibration.delayMs / 1000
         : 0;
       return Math.min(
-        getRoomTargetPosition(state) + delayCompensation,
+        getRoomTargetPosition(snapshot) + delayCompensation,
         audio.duration || Infinity,
       );
     };
-    const deviceMetrics = (bufferStateOverride?: RoomBufferState) => {
+    const targetPosition = () => targetPositionFor(state);
+    const canStartSnapshot = (snapshot: RoomState | null) => Boolean(
+      snapshot?.playing
+      && (!snapshot.strictSync
+        || (snapshot.commitState === "committed" && Boolean(snapshot.commitId))),
+    );
+    const startGuardMatches = () => {
+      const latest = roomLatestStateRef.current;
+      if (!latest || !roomConnectedRef.current || roomAudioSourceRef.current !== audioSource) return false;
+      if (latest.revision !== state.revision
+        || latest.prepareId !== state.prepareId
+        || latest.commitId !== state.commitId
+        || latest.commitState !== state.commitState
+        || latest.scheduledAt !== state.scheduledAt) return false;
+      if (latest.strictSync && !roomClockReadyRef.current) return false;
+      return canStartSnapshot(latest);
+    };
+    const deviceMetrics = (
+      bufferStateOverride?: RoomBufferState,
+      launchWindow = false,
+    ) => {
       const target = targetPosition();
-      const buffer = measureBufferedWindow(audio, target, {
+      const buffer = (launchWindow ? measureLaunchWindow : measureBufferedWindow)(audio, target, {
         latencyMs: roomLatency,
         jitterMs: roomClockJitter,
       });
@@ -1454,8 +1528,12 @@ export function MineradioPlayer() {
         bufferReady,
       };
     };
-    const reportDeviceStatus = (bufferStateOverride?: RoomBufferState, force = false) => {
-      const metrics = deviceMetrics(bufferStateOverride);
+    const reportDeviceStatus = (
+      bufferStateOverride?: RoomBufferState,
+      force = false,
+      launchWindow = false,
+    ) => {
+      const metrics = deviceMetrics(bufferStateOverride, launchWindow);
       const signature = [
         state.prepareId,
         Math.round(metrics.bufferedSeconds * 4),
@@ -1487,22 +1565,89 @@ export function MineradioPlayer() {
       }
       return metrics;
     };
+    const revokeBarrier = (bufferState: RoomBufferState, metrics = reportDeviceStatus(bufferState, true)) => {
+      const armedForCurrentCommit = Boolean(
+        strictCommitKey && roomArmedCommitRef.current === strictCommitKey,
+      );
+      const committedStartPending = state.playing
+        && state.scheduledAt > getRoomServerNow();
+      if (state.strictSync
+        && state.prepareId
+        && state.commitId
+        && armedForCurrentCommit
+        && (state.commitState === "tentative"
+          || (state.commitState === "committed" && committedStartPending))) {
+        sendRoomCommand({
+          action: "armed",
+          prepareId: state.prepareId,
+          commitId: state.commitId,
+          armed: false,
+          bufferedSeconds: metrics.bufferedSeconds,
+          bufferGoalSeconds: metrics.bufferGoalSeconds,
+          bufferState,
+          latencyMs: metrics.latencyMs,
+          jitterMs: metrics.jitterMs,
+          driftMs: metrics.driftMs,
+          quality: metrics.quality,
+          volumeTrimDb: metrics.volumeTrimDb,
+          delayMs: metrics.delayMs,
+        });
+        roomArmedCommitRef.current = "";
+        roomReadyPrepareRef.current = "";
+        return;
+      }
+      if (state.preparing
+        && state.prepareId
+        && roomReadyPrepareRef.current === state.prepareId) {
+        sendRoomCommand({
+          action: "ready",
+          prepareId: state.prepareId,
+          ready: false,
+          bufferedSeconds: metrics.bufferedSeconds,
+          bufferGoalSeconds: metrics.bufferGoalSeconds,
+          bufferState,
+          latencyMs: metrics.latencyMs,
+          jitterMs: metrics.jitterMs,
+          driftMs: metrics.driftMs,
+          quality: metrics.quality,
+          volumeTrimDb: metrics.volumeTrimDb,
+          delayMs: metrics.delayMs,
+        });
+        roomReadyPrepareRef.current = "";
+      }
+    };
     const reportReady = () => {
-      if (!state.preparing || !state.prepareId) return;
+      if (!state.preparing || !state.prepareId || state.commitState === "tentative") return;
       const target = targetPosition();
       const metrics = reportDeviceStatus();
-      if (roomReadyPrepareRef.current === state.prepareId) return;
-      if (!Number.isFinite(target) || !metrics.bufferReady) return;
+      const eligible = roomConnected
+        && roomClockReady
+        && Number.isFinite(target)
+        && metrics.bufferReady
+        && metrics.bufferState === "ready";
+      if (!eligible) {
+        if (roomReadyPrepareRef.current === state.prepareId) {
+          revokeBarrier(metrics.bufferState || "buffering", metrics);
+        }
+        return;
+      }
       if (Math.abs((audio.currentTime || 0) - target) > 0.08) {
+        if (roomReadyPrepareRef.current === state.prepareId) {
+          revokeBarrier("buffering", metrics);
+        }
         if (audio.readyState >= 1) audio.currentTime = target;
         return;
       }
       if (roomPlaybackUnlockedElementRef.current !== audio) {
+        if (roomReadyPrepareRef.current === state.prepareId) {
+          revokeBarrier("unlock_required", metrics);
+        }
         void primeRoomPlayback(false).then((unlocked) => {
           if (!disposed && unlocked) reportReady();
         });
         return;
       }
+      if (roomReadyPrepareRef.current === state.prepareId) return;
       if (sendRoomCommand({
         action: "ready",
         prepareId: state.prepareId,
@@ -1520,21 +1665,108 @@ export function MineradioPlayer() {
         roomReadyPrepareRef.current = state.prepareId;
       }
     };
+    const reportArmed = () => {
+      if (!state.strictSync
+        || !state.preparing
+        || state.commitState !== "tentative"
+        || !state.prepareId
+        || !state.commitId) return;
+      const target = targetPosition();
+      const metrics = reportDeviceStatus();
+      const eligible = roomConnected
+        && roomClockReady
+        && roomPlaybackUnlockedElementRef.current === audio
+        && Number.isFinite(target)
+        && metrics.bufferReady
+        && metrics.bufferState === "ready"
+        && Math.abs((audio.currentTime || 0) - target) <= 0.08;
+      if (!eligible) {
+        if (roomArmedCommitRef.current === strictCommitKey) {
+          revokeBarrier(metrics.bufferState || "buffering", metrics);
+        } else if (Number.isFinite(target)
+          && audio.readyState >= 1
+          && Math.abs((audio.currentTime || 0) - target) > 0.08) {
+          audio.currentTime = target;
+        } else if (roomPlaybackUnlockedElementRef.current !== audio) {
+          void primeRoomPlayback(false).then((unlocked) => {
+            if (!disposed && unlocked) reportArmed();
+          });
+        }
+        return;
+      }
+      if (roomArmedCommitRef.current === strictCommitKey) return;
+      if (sendRoomCommand({
+        action: "armed",
+        prepareId: state.prepareId,
+        commitId: state.commitId,
+        armed: true,
+        bufferedSeconds: metrics.bufferedSeconds,
+        bufferGoalSeconds: metrics.bufferGoalSeconds,
+        bufferState: "ready",
+        latencyMs: metrics.latencyMs,
+        jitterMs: metrics.jitterMs,
+        driftMs: metrics.driftMs,
+        quality: metrics.quality,
+        volumeTrimDb: metrics.volumeTrimDb,
+        delayMs: metrics.delayMs,
+      })) {
+        roomArmedCommitRef.current = strictCommitKey;
+      }
+    };
     const beginPlayback = () => {
-      if (playAttempted || !state.playing) return;
-      const liveTarget = targetPosition();
+      if (playAttempted
+        || roomPlaybackCommitRef.current === playbackCommitKey
+        || !startGuardMatches()) return;
+      const latest = roomLatestStateRef.current;
+      if (!latest) return;
+      const liveTarget = targetPositionFor(latest);
       if (audio.readyState >= 1
         && Number.isFinite(liveTarget)
         && Math.abs((audio.currentTime || 0) - liveTarget) > 0.05) {
         audio.currentTime = liveTarget;
       }
+      if (state.strictSync && state.commitState === "committed") {
+        const launchMetrics = reportDeviceStatus(undefined, true, true);
+        if (!roomClockReadyRef.current
+          || !launchMetrics.bufferReady
+          || launchMetrics.bufferState !== "ready"
+          || roomPlaybackUnlockedElementRef.current !== audio) {
+          revokeBarrier(launchMetrics.bufferState || "buffering", launchMetrics);
+          if (state.prepareId) {
+            sendRoomCommand({
+              action: "start-failed",
+              prepareId: state.prepareId,
+              commitId: state.commitId || undefined,
+            });
+          }
+          return;
+        }
+      }
       playAttempted = true;
-      void audio.play().then(() => setNeedsUnlock(false)).catch(() => {
+      roomPlaybackCommitRef.current = playbackCommitKey;
+      void audio.play().then(() => {
+        if (!startGuardMatches()) {
+          audio.pause();
+          return;
+        }
+        setNeedsUnlock(false);
+      }).catch(() => {
+        if (!startGuardMatches()) return;
         setNeedsUnlock(true);
-        if (state.prepareId) sendRoomCommand({ action: "start-failed", prepareId: state.prepareId });
+        if (state.prepareId) {
+          sendRoomCommand({
+            action: "start-failed",
+            prepareId: state.prepareId,
+            commitId: state.strictSync ? state.commitId : undefined,
+          });
+        }
       });
     };
     const reconcile = () => {
+      if (!roomConnected) {
+        if (!audio.paused) audio.pause();
+        return;
+      }
       const target = targetPosition();
       const current = audio.currentTime || 0;
       const scheduledInFuture = state.playing && state.scheduledAt > getRoomServerNow();
@@ -1551,14 +1783,31 @@ export function MineradioPlayer() {
         audio.currentTime = target;
       }
       audio.playbackRate = correction.rate;
-      reportDeviceStatus();
-
       if (state.preparing) {
+        reportDeviceStatus();
         if (!audio.paused) audio.pause();
-        if (correction.mode !== "seek") reportReady();
+        if (correction.mode !== "seek") {
+          reportReady();
+          reportArmed();
+        }
         return;
       }
-      if (!state.playing) {
+      const committedStartPending = state.strictSync
+        && state.commitState === "committed"
+        && state.playing
+        && state.scheduledAt > getRoomServerNow();
+      const metrics = reportDeviceStatus(undefined, false, committedStartPending);
+      if (committedStartPending
+        && (!roomClockReady
+          || !metrics.bufferReady
+          || metrics.bufferState !== "ready"
+          || roomPlaybackUnlockedElementRef.current !== audio
+          || Math.abs((audio.currentTime || 0) - target) > 0.08)) {
+        if (!audio.paused) audio.pause();
+        revokeBarrier(metrics.bufferState || "buffering", metrics);
+        return;
+      }
+      if (!canStartSnapshot(state) || (state.strictSync && !roomClockReady)) {
         if (!audio.paused) audio.pause();
         return;
       }
@@ -1578,9 +1827,17 @@ export function MineradioPlayer() {
     const onReady = () => {
       reconcile();
       reportReady();
+      reportArmed();
     };
     const onVisible = () => {
-      if (document.visibilityState === "visible") reconcile();
+      if (document.visibilityState === "visible") {
+        reconcile();
+        return;
+      }
+      if (state.preparing
+        || (state.playing && state.scheduledAt > getRoomServerNow())) {
+        revokeBarrier("buffering");
+      }
     };
     const onUnavailable = (event: Event) => {
       if (suppressRoomMediaEventsRef.current) return;
@@ -1588,23 +1845,7 @@ export function MineradioPlayer() {
         ? "error"
         : event.type === "stalled" ? "stalled" : "buffering";
       const metrics = reportDeviceStatus(bufferState, true);
-      if (!state.prepareId || roomReadyPrepareRef.current !== state.prepareId) return;
-      if (!state.preparing && (!state.scheduledAt || state.scheduledAt <= getRoomServerNow())) return;
-      sendRoomCommand({
-        action: "ready",
-        prepareId: state.prepareId,
-        ready: false,
-        bufferedSeconds: metrics.bufferedSeconds,
-        bufferGoalSeconds: metrics.bufferGoalSeconds,
-        bufferState,
-        latencyMs: metrics.latencyMs,
-        jitterMs: metrics.jitterMs,
-        driftMs: metrics.driftMs,
-        quality: metrics.quality,
-        volumeTrimDb: metrics.volumeTrimDb,
-        delayMs: metrics.delayMs,
-      });
-      roomReadyPrepareRef.current = "";
+      revokeBarrier(bufferState, metrics);
     };
 
     reconcile();
@@ -1616,13 +1857,32 @@ export function MineradioPlayer() {
     audio.addEventListener("waiting", onUnavailable);
     audio.addEventListener("stalled", onUnavailable);
     audio.addEventListener("error", onUnavailable);
+    audio.addEventListener("emptied", onUnavailable);
+    audio.addEventListener("abort", onUnavailable);
     document.addEventListener("visibilitychange", onVisible);
-    if (!roomIsLeader && state.playing && (!state.scheduledAt || state.scheduledAt <= getRoomServerNow())) {
+    if (!roomIsLeader
+      && canStartSnapshot(state)
+      && (!state.scheduledAt || state.scheduledAt <= getRoomServerNow())) {
       correctionTimer = setInterval(reconcile, 250);
     }
     const diagnosticTimer = setInterval(() => {
-      if (state.preparing) reportReady();
-      else reportDeviceStatus();
+      if (state.preparing) {
+        reportReady();
+        reportArmed();
+      } else {
+        const committedStartPending = state.strictSync
+          && state.commitState === "committed"
+          && state.playing
+          && state.scheduledAt > getRoomServerNow();
+        const metrics = reportDeviceStatus(undefined, false, committedStartPending);
+        if (committedStartPending
+          && (!roomClockReady
+            || !metrics.bufferReady
+            || metrics.bufferState !== "ready"
+            || roomPlaybackUnlockedElementRef.current !== audio)) {
+          revokeBarrier(metrics.bufferState || "buffering", metrics);
+        }
+      }
     }, 750);
     return () => {
       disposed = true;
@@ -1637,6 +1897,8 @@ export function MineradioPlayer() {
       audio.removeEventListener("waiting", onUnavailable);
       audio.removeEventListener("stalled", onUnavailable);
       audio.removeEventListener("error", onUnavailable);
+      audio.removeEventListener("emptied", onUnavailable);
+      audio.removeEventListener("abort", onUnavailable);
       document.removeEventListener("visibilitychange", onVisible);
       audio.playbackRate = 1;
     };
@@ -1650,6 +1912,8 @@ export function MineradioPlayer() {
     mode,
     primeRoomPlayback,
     roomClockJitter,
+    roomClockReady,
+    roomConnected,
     roomIsLeader,
     roomLatency,
     roomState,
@@ -2695,7 +2959,9 @@ export function MineradioPlayer() {
       ? "仅本机"
       : room.status === "connected"
         ? room.state?.preparing
-          ? waitingRoomDevices.length
+          ? room.state.commitState === "tentative"
+            ? `确认同步启动 · ${room.state.armedCount}/${room.state.strictRequiredCount || 1}`
+            : waitingRoomDevices.length
             ? `等待 ${waitingRoomDevices[0].name} · ${Math.round(waitingRoomDevices[0].bufferProgress * 100)}%`
             : `等待缓冲 · ${room.state.readyCount}/${room.state.requiredCount || 1}`
           : room.state?.prepareError
@@ -2847,7 +3113,11 @@ export function MineradioPlayer() {
             </p>
             <div className="hero-meta">
               <span>{mode === "room" ? `房间 ${roomCode}` : "本机播放"}</span>
-              <span>{roomState?.preparing ? "正在等待设备缓冲" : effectivePlaying ? "正在播放" : "等待播放"}</span>
+              <span>{roomState?.preparing
+                ? roomState.commitState === "tentative"
+                  ? "设备已缓冲，正在确认同时启动"
+                  : "正在等待设备缓冲"
+                : effectivePlaying ? "正在播放" : "等待播放"}</span>
             </div>
           </div>
 
@@ -2986,7 +3256,18 @@ export function MineradioPlayer() {
             {!cloudLoading && !cloudError && legacyPanel === "login" ? (
               cloudUser?.loggedIn ? (
                 <div className="cloud-profile">
-                  <img src={cloudUser.avatar || "/mineradio-card-art.png"} width="72" height="72" alt="" />
+                  <img
+                    key={`${loginProvider}:${cloudUser.avatar || "fallback"}`}
+                    src={accountAvatarSrc(cloudUser.avatar)}
+                    width="72"
+                    height="72"
+                    alt={`${cloudUser.nickname || (loginProvider === "kugou" ? "酷狗音乐" : "网易云音乐")}头像`}
+                    onError={(event) => {
+                      if (event.currentTarget.dataset.fallbackApplied === "1") return;
+                      event.currentTarget.dataset.fallbackApplied = "1";
+                      event.currentTarget.src = DEFAULT_ACCOUNT_AVATAR;
+                    }}
+                  />
                   <div>
                     <small>{loginProvider === "kugou" ? "酷狗音乐账号" : "网易云账号"}{cloudUser.vipLabel ? ` · ${cloudUser.vipLabel}` : ""}</small>
                     <strong>{cloudUser.nickname || "已登录用户"}</strong>
@@ -3122,7 +3403,9 @@ export function MineradioPlayer() {
               <div><dt>设备</dt><dd>{room.state?.deviceCount || 1} 台</dd></div>
               <div><dt>延迟</dt><dd>{roomConnected ? `${room.latency} ms` : "—"}</dd></div>
               <div><dt>状态</dt><dd>{roomState?.preparing
-                ? `缓冲就绪 ${roomState.readyCount}/${roomState.requiredCount || 1}`
+                ? roomState.commitState === "tentative"
+                  ? `启动确认 ${roomState.armedCount}/${roomState.strictRequiredCount || 1}`
+                  : `缓冲就绪 ${roomState.readyCount}/${roomState.requiredCount || 1}`
                 : roomState?.prepareError
                   ? roomState.prepareError === "start_failed" ? "设备启动失败，请重试" : "缓冲超时，请重试"
                   : roomConnected ? "已同步" : "等待连接"}</dd></div>
@@ -3362,8 +3645,8 @@ export function MineradioPlayer() {
             <button type="button" disabled={mode !== "solo" || !queueState.queue.length} onClick={() => moveQueue("previous")} aria-label="上一首">
               <SkipBack size={21} weight="fill" aria-hidden="true" />
             </button>
-            <button className="dock-play" type="button" onClick={togglePlayback} disabled={!effectiveTrack || !canControl} aria-label={effectivePlaying ? "暂停" : "播放"}>
-              {effectivePlaying ? <Pause size={24} weight="fill" aria-hidden="true" /> : <Play size={24} weight="fill" aria-hidden="true" />}
+            <button className="dock-play" type="button" onClick={togglePlayback} disabled={!effectiveTrack || !canControl} aria-label={effectivePlaybackActive ? "暂停" : "播放"}>
+              {effectivePlaybackActive ? <Pause size={24} weight="fill" aria-hidden="true" /> : <Play size={24} weight="fill" aria-hidden="true" />}
             </button>
             <button type="button" disabled={mode !== "solo" || !queueState.queue.length} onClick={() => moveQueue("next")} aria-label="下一首">
               <SkipForward size={21} weight="fill" aria-hidden="true" />

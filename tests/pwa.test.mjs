@@ -60,7 +60,7 @@ test("Classic direct entry exposes install metadata and secure-context registrat
 
   assert.match(classic, /rel="manifest" href="\/manifest\.webmanifest"/);
   assert.match(classic, /rel="apple-touch-icon" href="\/apple-touch-icon\.png"/);
-  assert.match(classic, /src="\/pwa-register\.js"/);
+  assert.match(classic, /src="\/pwa-register\.js\?v=20260801-v1"/);
   assert.match(script, /window\.isSecureContext/);
   assert.match(script, /serviceWorker[\s\S]*register\("\/sw\.js"/);
 });
@@ -68,19 +68,27 @@ test("Classic direct entry exposes install metadata and secure-context registrat
 test("service worker isolates immutable core assets and bypasses private or streaming data", async () => {
   const worker = await readFile(new URL("public/sw.js", root), "utf8");
 
+  assert.match(worker, /CACHE_VERSION = "20260801-pwa-v7"/);
   assert.match(worker, /CORE_ASSETS[\s\S]*?"\/classic\/index\.html"/);
+  assert.match(worker, /"\/classic\/room-sync-core\.js\?v=20260801-adaptive-v2"/);
+  assert.match(worker, /"\/classic\/classic-web-bridge\.js\?v=20260801-sync-v6"/);
+  assert.match(worker, /"\/classic\/cover-pipeline\.js\?v=20260801-v1"/);
+  assert.match(worker, /"\/classic\/sonic-terrain\.js\?v=20260801-voxel-v5"/);
   assert.match(worker, /CORE_CACHE_NAME/);
   assert.match(worker, /RUNTIME_CACHE_NAME/);
   assert.match(worker, /request\.headers\.has\("range"\)/);
   assert.match(worker, /request\.destination === "audio"/);
   assert.match(worker, /url\.pathname\.startsWith\("\/api\/"\)/);
+  assert.match(worker, /url\.pathname\.startsWith\("\/\.well-known\/mr-room\/"\)/);
+  assert.match(worker, /url\.pathname\.startsWith\("\/__mineradio\/"\)/);
   assert.match(worker, /url\.origin !== self\.location\.origin/);
   assert.match(worker, /request\.mode === "navigate"/);
   assert.match(worker, /Promise\.all\(/);
   assert.doesNotMatch(worker, /Promise\.allSettled/);
   assert.match(worker, /core_asset_unavailable/);
   assert.doesNotMatch(worker, /trimCache\(coreCache\)/);
-  assert.doesNotMatch(worker, /self\.skipWaiting\(\)/);
-  assert.doesNotMatch(worker, /clients\.claim\(\)/);
+  assert.match(worker, /MRROOM_ACTIVATE_UPDATE/);
+  assert.match(worker, /self\.skipWaiting\(\)/);
+  assert.match(worker, /self\.clients\.claim\(\)/);
   assert.doesNotMatch(worker, /caches\.match\([^)]*\/api\//);
 });

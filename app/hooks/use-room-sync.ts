@@ -8,7 +8,13 @@ import {
   type ClockEstimate,
   type ClockSample,
 } from "../lib/room-sync-timing.mjs";
-import type { RoomCommand, RoomState, SyncStatus } from "../lib/sync-types";
+import {
+  ROOM_SYNC_PROTOCOL_VERSION,
+  type RoomCommand,
+  type RoomJoinMessage,
+  type RoomState,
+  type SyncStatus,
+} from "../lib/sync-types";
 
 function asWebSocketUrl(value: string) {
   const input = value.trim();
@@ -46,6 +52,8 @@ type Options = {
 
 function syncErrorMessage(code: string) {
   const messages: Record<string, string> = {
+    buffer_contract_required: "设备没有上报完整缓冲数据，已暂停本轮同步启动",
+    buffer_not_ready: "设备缓冲尚未达到同步启动要求，正在重新等待",
     command_failed: "同步命令执行失败，请稍后重试",
     device_not_found: "目标设备已离开房间，请刷新设备列表后重试",
     invalid_calibration: "设备校准参数无效，请将音量微调设为 -24 至 +12 dB、延迟设为 0 至 500 ms",
@@ -58,6 +66,7 @@ function syncErrorMessage(code: string) {
     quality_unavailable: "当前歌曲或账号暂不支持所选音质",
     rate_limited: "操作过快，请稍后再试",
     room_full: "房间已达到 64 台设备上限",
+    strict_sync_required: "当前设备未启用严格同步协议，请刷新播放器后重试",
   };
   return messages[code] || `同步服务返回错误：${code}`;
 }
@@ -86,21 +95,40 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
   const httpBase = useMemo(() => toHttpBase(relayUrl), [relayUrl]);
 
   useEffect(() => {
-    clockSamplesRef.current = [];
-    clockEstimateRef.current = {
-      samples: [],
-      offsetMs: 0,
-      latencyMs: 0,
-      jitterMs: 0,
-      initialized: false,
-    };
-    offsetRef.current = 0;
-    if (!enabled || !roomCode || !wsUrl) return;
-
     let disposed = false;
+    const resetClockEstimate = () => {
+      clockSamplesRef.current = [];
+      clockEstimateRef.current = {
+        samples: [],
+        offsetMs: 0,
+        latencyMs: 0,
+        jitterMs: 0,
+        initialized: false,
+      };
+      offsetRef.current = 0;
+      setLatency(0);
+      setClockQuality({ ready: false, jitterMs: 0 });
+    };
+    // Reset connection-derived React state at an asynchronous boundary. This
+    // keeps the effect itself focused on wiring the WebSocket lifecycle and
+    // avoids a synchronous cascade when connection inputs change together.
+    queueMicrotask(() => {
+      if (disposed) return;
+      resetClockEstimate();
+      setState(null);
+      setIsLeader(false);
+      setClientId("");
+    });
+    if (!enabled || !roomCode || !wsUrl) {
+      return () => {
+        disposed = true;
+      };
+    }
+
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let pingTimer: ReturnType<typeof setInterval> | undefined;
     let attempt = 0;
+    let hiddenAt = document.visibilityState === "hidden" ? Date.now() : 0;
 
     function connect() {
       if (disposed) return;
@@ -112,18 +140,24 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
       socket.addEventListener("open", () => {
         attempt = 0;
         setStatus("connected");
-        setState(null);
-        setIsLeader(false);
-        setClientId("");
-        setLatency(0);
-        setClockQuality({ ready: false, jitterMs: 0 });
+        resetClockEstimate();
         const ping = () => {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "ping", clientTime: Date.now() }));
           }
         };
         ping();
-        socket.send(JSON.stringify({ type: "join", room: roomCode, name: deviceName }));
+        const joinMessage: RoomJoinMessage = {
+          type: "join",
+          room: roomCode,
+          name: deviceName,
+          protocolVersion: ROOM_SYNC_PROTOCOL_VERSION,
+          capabilities: {
+            bufferContract: true,
+            armedPlayback: true,
+          },
+        };
+        socket.send(JSON.stringify(joinMessage));
         pingTimer = setInterval(ping, 2500);
       });
 
@@ -186,6 +220,7 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
       socket.addEventListener("close", () => {
         if (pingTimer) clearInterval(pingTimer);
         if (disposed) return;
+        resetClockEstimate();
         attempt += 1;
         setStatus("reconnecting");
         const delay = Math.min(8000, 500 * 2 ** Math.min(attempt - 1, 4));
@@ -199,13 +234,29 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
     }
 
     connect();
-    const resync = () => {
+    const resync = (event: Event) => {
+      if (event.type === "visibilitychange") {
+        if (document.visibilityState === "hidden") {
+          hiddenAt = Date.now();
+          return;
+        }
+        if (hiddenAt && Date.now() - hiddenAt >= 10_000) resetClockEstimate();
+        hiddenAt = 0;
+      } else {
+        resetClockEstimate();
+      }
       if (document.visibilityState === "visible" && socketRef.current?.readyState === WebSocket.OPEN) {
         socketRef.current.send(JSON.stringify({ type: "ping", clientTime: Date.now() }));
       }
     };
+    const onOffline = () => {
+      resetClockEstimate();
+      setStatus("reconnecting");
+      socketRef.current?.close(4001, "network_offline");
+    };
     document.addEventListener("visibilitychange", resync);
     window.addEventListener("online", resync);
+    window.addEventListener("offline", onOffline);
 
     return () => {
       disposed = true;
@@ -213,6 +264,7 @@ export function useRoomSync({ enabled, roomCode, relayUrl, deviceName }: Options
       if (pingTimer) clearInterval(pingTimer);
       document.removeEventListener("visibilitychange", resync);
       window.removeEventListener("online", resync);
+      window.removeEventListener("offline", onOffline);
       socketRef.current?.close();
       socketRef.current = null;
     };

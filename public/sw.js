@@ -2,13 +2,13 @@
 "use strict";
 
 const CACHE_PREFIX = "mrroom-shell-";
-const CACHE_VERSION = "20260730-pwa-v2";
+const CACHE_VERSION = "20260801-pwa-v7";
 const CORE_CACHE_NAME = `${CACHE_PREFIX}core-${CACHE_VERSION}`;
 const RUNTIME_CACHE_NAME = `${CACHE_PREFIX}runtime-${CACHE_VERSION}`;
 const CORE_ASSETS = [
   "/manifest.webmanifest",
   "/offline.html",
-  "/pwa-register.js",
+  "/pwa-register.js?v=20260801-v1",
   "/pwa-icon-192.png",
   "/pwa-icon-512.png",
   "/apple-touch-icon.png",
@@ -16,9 +16,10 @@ const CORE_ASSETS = [
   "/mineradio-starfield.png",
   "/classic/index.html",
   "/classic/vendor/qrcode.min.js?v=1.5.4",
-  "/classic/room-sync-core.js?v=20260726-calibration-v1",
-  "/classic/classic-web-bridge.js?v=20260730-sync-v2",
-  "/classic/sonic-terrain.js?v=20260730-v1",
+  "/classic/room-sync-core.js?v=20260801-adaptive-v2",
+  "/classic/classic-web-bridge.js?v=20260801-sync-v6",
+  "/classic/cover-pipeline.js?v=20260801-v1",
+  "/classic/sonic-terrain.js?v=20260801-voxel-v5",
   "/classic/playback-recovery.js?v=20260730-v2",
   "/classic/vendor/three.r128.min.js",
   "/classic/vendor/music-tempo.min.js",
@@ -26,6 +27,7 @@ const CORE_ASSETS = [
 ];
 const STATIC_DESTINATIONS = new Set(["font", "image", "script", "style", "worker"]);
 const MAX_RUNTIME_ENTRIES = 120;
+let explicitUpdateActivation = false;
 
 function cacheKeyForNavigation(url) {
   if (url.pathname.startsWith("/classic/")) {
@@ -39,6 +41,8 @@ function isSensitiveOrStreamingRequest(request, url) {
   if (request.destination === "audio" || request.destination === "video") return true;
   return (
     url.pathname.startsWith("/api/") ||
+    url.pathname.startsWith("/.well-known/mr-room/") ||
+    url.pathname.startsWith("/__mineradio/") ||
     url.pathname.startsWith("/track/") ||
     url.pathname.startsWith("/upload/") ||
     url.pathname.startsWith("/events/") ||
@@ -129,11 +133,15 @@ async function cacheFirstStatic(request) {
 }
 
 self.addEventListener("install", (event) => {
-  // Do not skipWaiting here. A room may be in the middle of a synchronized
-  // preparation barrier; the new worker activates only after every tab using
-  // the previous shell has closed, so one room cannot be split across bridge
-  // versions during playback.
+  // Activation is requested by the page only while playback is idle. This
+  // prevents mixed bridge versions without interrupting an in-flight barrier.
   event.waitUntil(precacheCore());
+});
+
+self.addEventListener("message", (event) => {
+  if (!event.data || event.data.type !== "MRROOM_ACTIVATE_UPDATE") return;
+  explicitUpdateActivation = true;
+  event.waitUntil(self.skipWaiting());
 });
 
 self.addEventListener("activate", (event) => {
@@ -151,7 +159,8 @@ self.addEventListener("activate", (event) => {
             )
             .map((key) => caches.delete(key)),
         ),
-      ),
+      )
+      .then(() => (explicitUpdateActivation ? self.clients.claim() : undefined)),
   );
 });
 

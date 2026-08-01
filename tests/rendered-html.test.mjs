@@ -44,21 +44,37 @@ test("room playback waits for buffered devices and uses the calibrated server st
   const hook = await readFile(new URL("../app/hooks/use-room-sync.ts", import.meta.url), "utf8");
   const relay = await readFile(new URL("../scripts/lan-relay.mjs", import.meta.url), "utf8");
 
-  assert.match(player, /measureBufferedWindow\(audio, target/);
+  assert.match(
+    player,
+    /\(launchWindow \? measureLaunchWindow : measureBufferedWindow\)\(audio, target/,
+  );
+  assert.match(player, /measureLaunchWindow/);
+  assert.match(player, /reportDeviceStatus\(undefined, false, committedStartPending\)/);
+  assert.match(player, /reportDeviceStatus\(undefined, true, true\)/);
   assert.doesNotMatch(player, /function hasBufferedPlaybackWindow/);
   assert.match(player, /const primeRoomPlayback = useCallback/);
   assert.match(player, /roomPlaybackUnlockedElementRef\.current !== audio[\s\S]*?primeRoomPlayback\(false\)/);
-  assert.match(player, /const liveTarget = targetPosition\(\)[\s\S]*?audio\.currentTime = liveTarget/);
+  assert.match(player, /const liveTarget = targetPositionFor\(latest\)[\s\S]*?audio\.currentTime = liveTarget/);
   assert.match(player, /action: "device-status"[\s\S]*?bufferedSeconds:[\s\S]*?bufferGoalSeconds:[\s\S]*?driftMs:/);
   assert.match(player, /action: "ready"[\s\S]*?bufferedSeconds: metrics\.bufferedSeconds[\s\S]*?jitterMs: metrics\.jitterMs/);
   assert.match(player, /ready: false[\s\S]*?bufferState,[\s\S]*?driftMs: metrics\.driftMs/);
+  assert.match(player, /action: "armed"[\s\S]*?commitId: state\.commitId[\s\S]*?bufferGoalSeconds: metrics\.bufferGoalSeconds/);
+  assert.match(player, /snapshot\.commitState === "committed"/);
+  assert.match(player, /roomLatestStateRef\.current[\s\S]*?latest\.commitId !== state\.commitId/);
+  assert.match(player, /roomConnectedRef\.current[\s\S]*?roomClockReadyRef\.current/);
   assert.match(player, /state\.scheduledAt - deviceCalibration\.delayMs - getRoomServerNow\(\)/);
-  assert.match(player, /action: "start-failed"/);
+  assert.match(player, /action: "start-failed"[\s\S]*?commitId: state\.strictSync \? state\.commitId : undefined/);
   assert.match(player, /setInterval\(reconcile, 250\)/);
+  assert.match(hook, /protocolVersion: ROOM_SYNC_PROTOCOL_VERSION/);
+  assert.match(hook, /bufferContract: true,[\s\S]*?armedPlayback: true/);
+  assert.match(hook, /const resetClockEstimate[\s\S]*?setClockQuality\(\{ ready: false[\s\S]*?resetClockEstimate\(\)/);
   assert.match(hook, /sampledServerTime: Date\.now\(\) \+ offsetRef\.current/);
   assert.doesNotMatch(hook, /setState\(\(current\) => current \? \{ \.\.\.current \}/);
   assert.match(relay, /prepareParticipants = new Set/);
-  assert.match(relay, /room\.readyClients\.size >= room\.prepareParticipants\.size/);
+  assert.match(relay, /allRequiredClientsReady\(room\)/);
+  assert.match(relay, /allStrictClientsArmed\(room\)/);
+  assert.match(relay, /commitState = "tentative"/);
+  assert.match(relay, /commitState = strict \? "committed" : ""/);
   assert.match(relay, /room\.playbackStartLeadMs \+ networkLeadMs/);
   assert.match(relay, /prepareError = "start_failed"|cancelPlaybackPreparation\(room, now, "start_failed"(?:,|\))/);
   const togglePlayback = player.slice(
@@ -82,7 +98,7 @@ test("modern room controls preserve leader position, final slider values, and sa
   assert.match(player, /document\.execCommand\("copy"\)/);
 });
 
-test("modern room drawer exposes service health and per-device diagnostics", async () => {
+test("modern room drawer exposes concise service health and automatic device correction", async () => {
   const player = await readFile(new URL("../app/components/MineradioPlayer.tsx", import.meta.url), "utf8");
   const serviceCenter = await readFile(new URL("../app/components/RoomServiceCenter.tsx", import.meta.url), "utf8");
   const healthHook = await readFile(new URL("../app/hooks/use-service-health.ts", import.meta.url), "utf8");
@@ -90,20 +106,23 @@ test("modern room drawer exposes service health and per-device diagnostics", asy
 
   assert.match(player, /<RoomServiceCenter/);
   assert.match(player, /Music API 地址/);
-  assert.match(serviceCenter, /服务与设备中心/);
+  assert.match(serviceCenter, /连接与设备/);
   assert.match(serviceCenter, /device\.bufferProgress/);
-  assert.match(serviceCenter, /device\.latencyMs/);
-  assert.match(serviceCenter, /device\.jitterMs/);
-  assert.match(serviceCenter, /device\.driftMs/);
+  assert.match(serviceCenter, /时钟、进度和音量在后台自动校准/);
+  assert.doesNotMatch(serviceCenter, /device\.latencyMs/);
+  assert.doesNotMatch(serviceCenter, /device\.jitterMs/);
+  assert.doesNotMatch(serviceCenter, /device\.driftMs/);
   assert.match(serviceCenter, /prepareErrorClientIds/);
   assert.match(healthHook, /Promise\.all\(\[/);
-  assert.match(healthHook, /url\.pathname = "\/health"/);
+  assert.match(healthHook, /: "\/health"/);
   assert.match(syncTypes, /devices: RoomDeviceState\[\]/);
   assert.match(syncTypes, /prepareDeadline: number/);
+  assert.match(syncTypes, /commitState: RoomCommitState/);
+  assert.match(syncTypes, /armedCount: number/);
   assert.match(syncTypes, /action: "device-status"/);
 });
 
-test("modern room calibration is persisted, bounded, applied, and leader-addressable", async () => {
+test("modern room calibration stays persisted and automatic without manual diagnostic sliders", async () => {
   const player = await readFile(new URL("../app/components/MineradioPlayer.tsx", import.meta.url), "utf8");
   const serviceCenter = await readFile(new URL("../app/components/RoomServiceCenter.tsx", import.meta.url), "utf8");
   const syncHook = await readFile(new URL("../app/hooks/use-room-sync.ts", import.meta.url), "utf8");
@@ -117,18 +136,14 @@ test("modern room calibration is persisted, bounded, applied, and leader-address
   assert.match(player, /volume\.gain\.value = playbackVolumeRef\.current \* dbToGain/);
   assert.match(player, /volume\.connect\(limiter\);[\s\S]*?limiter\.connect\(calibrationDelay\);/);
   assert.match(player, /context\.createDelay\(1\)/);
-  assert.match(player, /getRoomTargetPosition\(state\) \+ delayCompensation/);
+  assert.match(player, /getRoomTargetPosition\(snapshot\) \+ delayCompensation/);
   assert.match(player, /state\.scheduledAt - deviceCalibration\.delayMs - getRoomServerNow\(\)/);
   assert.match(player, /action: "progress",[\s\S]*?position: Math\.max\(0, \(audio\.currentTime \|\| 0\) - deviceCalibration\.delayMs \/ 1000\)/);
   assert.match(player, /const mediaSessionPosition = mode === "room"[\s\S]*?progress - deviceCalibration\.delayMs \/ 1000/);
-  assert.match(serviceCenter, /min="-24"[\s\S]*?max="12"/);
-  assert.match(serviceCenter, /const calibrationRef = useRef\(/);
-  assert.match(serviceCenter, /const calibrationCommitTimerRef = useRef<number \| null>\(null\)/);
-  assert.match(serviceCenter, /calibrationRef\.current\.volumeTrimDb = next[\s\S]*?setVolumeTrimDb\(next\)/);
-  assert.match(serviceCenter, /calibrationRef\.current\.delayMs = next[\s\S]*?setDelayMs\(next\)/);
-  assert.match(serviceCenter, /scheduleCalibration\(\)/);
-  assert.match(serviceCenter, /onCalibrate\(device\.clientId, \{ \.\.\.calibrationRef\.current \}\)/);
-  assert.match(serviceCenter, /key=\{`\$\{device\.clientId\}:\$\{device\.volumeTrimDb \|\| 0\}:\$\{device\.delayMs \|\| 0\}`\}/);
+  assert.match(serviceCenter, /时钟、进度和音量在后台自动校准/);
+  assert.doesNotMatch(serviceCenter, /type="range"/);
+  assert.doesNotMatch(serviceCenter, /device-metrics/);
+  assert.match(serviceCenter, /key=\{device\.clientId\}/);
   assert.match(syncTypes, /action: "device-calibration";[\s\S]*?targetClientId: string;[\s\S]*?volumeTrimDb: number;[\s\S]*?delayMs: number;/);
   assert.match(syncHook, /device_not_found:/);
   assert.match(syncHook, /invalid_calibration:/);

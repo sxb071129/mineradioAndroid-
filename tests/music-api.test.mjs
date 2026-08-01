@@ -174,6 +174,114 @@ test("cover proxy accepts only bounded HTTPS raster images", async (t) => {
   assert.equal(requests.length, 1);
 });
 
+test("cover proxy normalizes the image/jpg MIME alias returned by Netease artwork", async (t) => {
+  const imageBytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const { base } = await fixture(t, {
+    validateStreamUrl: async (value) => new URL(value),
+    fetchImpl: async () => new Response(imageBytes, {
+      status: 200,
+      headers: {
+        "content-type": "image/jpg; charset=binary",
+        "content-length": String(imageBytes.length),
+      },
+    }),
+  });
+
+  const target = "https://p4.music.126.net/example/emily.jpg?param=400y400";
+  const response = await fetch(`${base}/api/cover?url=${encodeURIComponent(target)}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "image/jpeg");
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), imageBytes);
+});
+
+test("cover proxy retries one transient upstream response and discards its body", async (t) => {
+  const imageBytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  let attempts = 0;
+  let discarded = 0;
+  const { base } = await fixture(t, {
+    validateStreamUrl: async (value) => new URL(value),
+    fetchImpl: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+          },
+          cancel() {
+            discarded += 1;
+          },
+        }), { status: 502 });
+      }
+      return new Response(imageBytes, {
+        status: 200,
+        headers: {
+          "content-type": "image/jpg",
+          "content-length": String(imageBytes.length),
+        },
+      });
+    },
+  });
+
+  const target = "https://p4.music.126.net/example/emily-retry.jpg?param=400y400";
+  const response = await fetch(`${base}/api/cover?url=${encodeURIComponent(target)}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "image/jpeg");
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), imageBytes);
+  assert.equal(attempts, 2);
+  assert.equal(discarded, 1);
+});
+
+test("cover proxy retries a transient fetch exception but not permanent failures", async (t) => {
+  const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+  let transientAttempts = 0;
+  const transient = await fixture(t, {
+    validateStreamUrl: async (value) => new URL(value),
+    fetchImpl: async () => {
+      transientAttempts += 1;
+      if (transientAttempts === 1) throw new TypeError("fetch failed");
+      return new Response(imageBytes, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+    },
+  });
+  const target = "https://p4.music.126.net/example/emily-network-retry.jpg";
+  const recovered = await fetch(`${transient.base}/api/cover?url=${encodeURIComponent(target)}`);
+  assert.equal(recovered.status, 200);
+  assert.equal(transientAttempts, 2);
+
+  let permanentAttempts = 0;
+  const permanent = await fixture(t, {
+    validateStreamUrl: async (value) => new URL(value),
+    fetchImpl: async () => {
+      permanentAttempts += 1;
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const rejected = await fetch(`${permanent.base}/api/cover?url=${encodeURIComponent(target)}`);
+  assert.equal(rejected.status, 502);
+  assert.deepEqual(await rejected.json(), { error: "third_party_unavailable" });
+  assert.equal(permanentAttempts, 1);
+
+  let validationAttempts = 0;
+  let unsafeFetches = 0;
+  const unsafe = await fixture(t, {
+    validateStreamUrl: async () => {
+      validationAttempts += 1;
+      throw Object.assign(new Error("unsafe_provider_url"), { statusCode: 502 });
+    },
+    fetchImpl: async () => {
+      unsafeFetches += 1;
+      throw new Error("must not fetch");
+    },
+  });
+  const unsafeResponse = await fetch(`${unsafe.base}/api/cover?url=${encodeURIComponent(target)}`);
+  assert.equal(unsafeResponse.status, 502);
+  assert.equal(validationAttempts, 1);
+  assert.equal(unsafeFetches, 0);
+});
+
 test("public song and playlist payloads never expose unsafe cover strings", async (t) => {
   const provider = providerStub({
     cloudsearch: async () => ({
@@ -194,6 +302,71 @@ test("public song and playlist payloads never expose unsafe cover strings", asyn
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.songs[0].cover, "");
+});
+
+test("provider HTTP artwork metadata is upgraded to HTTPS for browser-safe cover color extraction", async (t) => {
+  const provider = providerStub({
+    cloudsearch: async () => ({
+      body: {
+        result: {
+          songs: [{
+            id: 31517702,
+            name: "Emily",
+            ar: [{ id: 1, name: "San Fermin" }],
+            al: {
+              name: "Jackrabbit",
+              picUrl: "http://p4.music.126.net/example/109951168556338095.jpg",
+            },
+          }],
+        },
+      },
+    }),
+  });
+  const { base } = await fixture(t, { provider });
+  const response = await fetch(`${base}/api/search?keywords=emily`);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(
+    body.songs[0].cover,
+    "https://p4.music.126.net/example/109951168556338095.jpg",
+  );
+});
+
+test("Netease and Kugou account avatars upgrade trusted HTTP CDN URLs", async (t) => {
+  const provider = providerStub({
+    login_status: async () => ({
+      body: {
+        data: {
+          profile: {
+            userId: 42,
+            nickname: "Avatar User",
+            avatarUrl: "http://p1.music.126.net/avatar.jpg",
+          },
+        },
+      },
+    }),
+  });
+  const kugouProvider = kugouProviderStub({
+    loginStatus: async () => ({
+      provider: "kugou",
+      loggedIn: true,
+      userId: "77",
+      nickname: "Kugou Avatar",
+      avatar: "http://img.kugou.com/avatar.png",
+    }),
+  });
+  const { base } = await fixture(t, {
+    cookie: "MUSIC_U=AVATAR_TEST",
+    provider,
+    kugouProvider,
+  });
+
+  const [netease, kugou] = await Promise.all([
+    fetch(`${base}/api/login/status`).then((response) => response.json()),
+    fetch(`${base}/api/kugou/login/status`).then((response) => response.json()),
+  ]);
+  assert.equal(netease.avatar, "https://p1.music.126.net/avatar.jpg");
+  assert.equal(kugou.avatar, "https://img.kugou.com/avatar.png");
 });
 
 async function registerKugouTrack(base, overrides = {}) {
@@ -229,7 +402,21 @@ test("music API only allows LAN web origins", async (t) => {
   assert.equal(preflight.headers.get("vary"), "Origin");
   assert.equal(preflight.headers.get("access-control-allow-credentials"), null);
 
-  for (const origin of ["http://evil.example:3000", "http://127.0.0.1:3001"]) {
+  const securePreflight = await fetch(`${base}/api/search`, {
+    method: "OPTIONS",
+    headers: { origin: "https://192.168.1.20:3443" },
+  });
+  assert.equal(securePreflight.status, 204);
+  assert.equal(
+    securePreflight.headers.get("access-control-allow-origin"),
+    "https://192.168.1.20:3443",
+  );
+
+  for (const origin of [
+    "http://evil.example:3000",
+    "http://127.0.0.1:3001",
+    "https://192.168.1.20:443",
+  ]) {
     const rejected = await fetch(`${base}/api/search?keywords=x`, { headers: { origin } });
     assert.equal(rejected.status, 403);
     assert.deepEqual(await rejected.json(), { error: "origin_not_allowed" });
@@ -263,6 +450,28 @@ test("stream rejects non-canonical song ids before provider access", async (t) =
   }
   assert.equal(resolves, 0);
   assert.equal(fetches, 0);
+});
+
+test("Netease stream resolver returns a controlled unavailable response when both URL APIs fail", async (t) => {
+  let primaryCalls = 0;
+  let fallbackCalls = 0;
+  const provider = providerStub({
+    song_url_v1: async () => {
+      primaryCalls += 1;
+      throw new Error("primary endpoint unavailable");
+    },
+    song_url: async () => {
+      fallbackCalls += 1;
+      throw new Error("fallback endpoint unavailable");
+    },
+  });
+  const { base } = await fixture(t, { provider });
+
+  const response = await fetch(`${base}/api/stream?id=123456&quality=lossless`);
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), { error: "track_unavailable" });
+  assert.ok(primaryCalls > 0);
+  assert.equal(fallbackCalls, primaryCalls);
 });
 
 test("stream forwards Range without leaking browser or account cookies", async (t) => {

@@ -5,6 +5,13 @@
   var DEVICE_CALIBRATION_KEY = "mineradio-room-device-calibration-v1";
   var ROOM_RE = /^[A-Z0-9]{4,8}$/;
   var QUALITY_RE = /^(jymaster|hires|lossless|exhigh|standard)$/;
+  var ROOM_SYNC_PROTOCOL_VERSION = 3;
+  var ROOM_SYNC_BUILD_ID = "20260801-sync-v6";
+  var ROOM_SYNC_REFRESH_GUARD_KEY = "mineradio-room-sync-refresh-v3";
+  var ROOM_SYNC_CAPABILITIES = Object.freeze({
+    bufferContract: true,
+    armedPlayback: true
+  });
   var nativeFetch = window.fetch.bind(window);
 
   function readSettings() {
@@ -27,17 +34,39 @@
 
   var settings = readSettings();
   var pageHost = window.location.hostname || "localhost";
-  var apiFallback = "http://" + pageHost + ":8790";
-  var relayFallback = "ws://" + pageHost + ":8787/ws";
-  var apiOrigin = safeServiceUrl(settings.musicApiUrl, apiFallback, ["http:", "https:"]);
-  var relayUrl = safeServiceUrl(settings.relayUrl, relayFallback, ["ws:", "wss:"]);
+  var securePage = window.location.protocol === "https:";
+  var apiFallback = securePage ? window.location.origin : "http://" + pageHost + ":8790";
+  var relayFallback = securePage
+    ? "wss://" + window.location.host + "/sync"
+    : "ws://" + pageHost + ":8787/ws";
+  function withoutMixedContent(value, fallback) {
+    try {
+      var url = new URL(String(value || fallback));
+      if (securePage && (url.protocol === "http:" || url.protocol === "ws:")) {
+        return fallback;
+      }
+      return url.toString();
+    } catch {
+      return fallback;
+    }
+  }
+  var apiOrigin = safeServiceUrl(
+    withoutMixedContent(settings.musicApiUrl, apiFallback),
+    apiFallback,
+    ["http:", "https:"]
+  );
+  var relayUrl = safeServiceUrl(
+    withoutMixedContent(settings.relayUrl, relayFallback),
+    relayFallback,
+    ["ws:", "wss:"]
+  );
   var relayHttpOrigin = (function () {
     try {
       var value = new URL(relayUrl);
       value.protocol = value.protocol === "wss:" ? "https:" : "http:";
       return value.origin;
     } catch {
-      return "http://" + pageHost + ":8787";
+      return securePage ? window.location.origin : "http://" + pageHost + ":8787";
     }
   })();
   var requestedRoom = String(new URLSearchParams(window.location.search).get("room") || "HOME")
@@ -312,9 +341,14 @@
       jitter: 0,
       drift: 0,
       clockReady: false,
+      protocolVersion: 1,
+      strictSync: false,
       preparing: false,
       readyCount: 0,
       requiredCount: 0,
+      armedCount: 0,
+      strictRequiredCount: 0,
+      commitState: "",
       prepareError: "",
       bufferProgress: 0,
       prepareDeadline: 0,
@@ -362,6 +396,9 @@
   var scheduledPlayTimer = 0;
   var scheduledPlayGeneration = 0;
   var lastReadyPrepareId = "";
+  var lastArmedCommitKey = "";
+  var strictRoomProtocol = false;
+  var activeBufferLoadPrepareId = "";
   var suppressNextPlayCommand = false;
   var suppressNextPauseCommand = false;
   var suppressNextSeekCommand = false;
@@ -379,9 +416,6 @@
   var serviceHealthTimer = 0;
   var serviceHealthInFlight = false;
   var roomDeviceRenderSignature = "";
-  var lastCalibrationSentAt = 0;
-  var pendingCalibration = null;
-  var calibrationTimer = 0;
   var localCalibrationMinimumUpdatedAt = 0;
   var lastAppliedCalibrationSignature = "";
   var roomQrRenderedValue = "";
@@ -658,7 +692,12 @@
     }, 2800);
     var endpoint;
     try {
-      endpoint = new URL("/health", origin + "/").toString();
+      var serviceOrigin = new URL(origin + "/").origin;
+      var sameSecureGateway = securePage && serviceOrigin === window.location.origin;
+      var healthPath = sameSecureGateway
+        ? "/.well-known/mr-room/health/" + (kind === "relay" ? "relay" : "music")
+        : "/health";
+      endpoint = new URL(healthPath, serviceOrigin + "/").toString();
     } catch {
       window.clearTimeout(timeout);
       setServiceState(kind, "offline", 0, "地址无效");
@@ -719,7 +758,8 @@
   function deviceBufferStateLabel(device) {
     if (device.blocked || device.bufferState === "error") return { text: "设备异常", className: "error" };
     if (device.bufferState === "unlock_required") return { text: "需要点击播放", className: "waiting" };
-    if (device.bufferState === "stalled") return { text: "缓冲停滞", className: "error" };
+    if (device.bufferState === "stalled") return { text: "正在自动恢复", className: "waiting" };
+    if (device.participant && device.armed) return { text: "启动已确认", className: "ready" };
     if (device.participant && device.ready) return { text: "已就绪", className: "ready" };
     if (device.bufferState === "ready") return { text: "缓冲充足", className: "ready" };
     if (device.participant) {
@@ -729,106 +769,9 @@
     return { text: device.leader ? "主控设备" : "已连接", className: "" };
   }
 
-  function appendDeviceStat(container, value) {
-    var item = document.createElement("span");
-    item.textContent = value;
-    container.appendChild(item);
-  }
-
-  function calibrationValueLabel(field, value) {
-    if (field === "volumeTrimDb") {
-      var rounded = Math.round(Number(value) * 2) / 2;
-      return (rounded > 0 ? "+" : "") + rounded.toFixed(rounded % 1 ? 1 : 0) + " dB";
-    }
-    return Math.round(Number(value) || 0) + " ms";
-  }
-
-  function appendCalibrationField(container, device, calibration, options) {
-    var field = document.createElement("label");
-    field.className = "room-device-calibration-field";
-    var caption = document.createElement("span");
-    caption.className = "room-device-calibration-label";
-    var label = document.createElement("span");
-    label.textContent = options.label;
-    var output = document.createElement("output");
-    output.textContent = calibrationValueLabel(options.name, calibration[options.name]);
-    caption.appendChild(label);
-    caption.appendChild(output);
-    var input = document.createElement("input");
-    input.type = "range";
-    input.min = String(options.minimum);
-    input.max = String(options.maximum);
-    input.step = String(options.step);
-    input.value = String(calibration[options.name]);
-    input.setAttribute("aria-label", String(device.name || "设备") + " " + options.label);
-    input.dataset.calibrationField = options.name;
-    input.addEventListener("input", function () {
-      calibration[options.name] = Number(input.value);
-      output.textContent = calibrationValueLabel(options.name, calibration[options.name]);
-      if (String(device.clientId || "") === clientId) applyLocalDeviceCalibration(calibration, false);
-      sendDeviceCalibrationCommand(device.clientId, calibration, false);
-    });
-    input.addEventListener("change", function () {
-      calibration[options.name] = Number(input.value);
-      sendDeviceCalibrationCommand(device.clientId, calibration, true);
-      input.blur();
-    });
-    field.appendChild(caption);
-    field.appendChild(input);
-    container.appendChild(field);
-  }
-
-  function appendDeviceCalibrationControls(row, device) {
-    if (!bridge.sync.leader || !device.clientId) return;
-    var calibration = normalizeDeviceCalibration({
-      volumeTrimDb: device.volumeTrimDb,
-      delayMs: device.delayMs
-    });
-    var controls = document.createElement("div");
-    controls.className = "room-device-calibration";
-    appendCalibrationField(controls, device, calibration, {
-      name: "volumeTrimDb",
-      label: "音量修正",
-      minimum: -24,
-      maximum: 12,
-      step: 0.5
-    });
-    appendCalibrationField(controls, device, calibration, {
-      name: "delayMs",
-      label: "发声延迟",
-      minimum: 0,
-      maximum: 500,
-      step: 5
-    });
-    var reset = document.createElement("button");
-    reset.type = "button";
-    reset.className = "room-device-calibration-reset";
-    reset.textContent = "归零";
-    reset.setAttribute("aria-label", "重置 " + String(device.name || "设备") + " 的音频校准");
-    reset.addEventListener("click", function () {
-      calibration.volumeTrimDb = 0;
-      calibration.delayMs = 0;
-      controls.querySelectorAll("input[data-calibration-field]").forEach(function (input) {
-        var fieldName = String(input.dataset.calibrationField || "");
-        input.value = String(calibration[fieldName] || 0);
-        var output = input.parentElement && input.parentElement.querySelector("output");
-        if (output) output.textContent = calibrationValueLabel(fieldName, calibration[fieldName]);
-      });
-      if (String(device.clientId || "") === clientId) applyLocalDeviceCalibration(calibration, false);
-      sendDeviceCalibrationCommand(device.clientId, calibration, true);
-    });
-    controls.appendChild(reset);
-    row.appendChild(controls);
-  }
-
   function renderRoomDevices() {
     var list = document.getElementById("room-sync-device-list");
     if (!list) return;
-    var activeControl = document.activeElement;
-    if (activeControl
-      && list.contains(activeControl)
-      && activeControl.matches
-      && activeControl.matches(".room-device-calibration input[type=range]")) return;
     var devices = Array.isArray(bridge.sync.devices) ? bridge.sync.devices : [];
     var signature;
     try { signature = clientId + ":" + JSON.stringify(devices); } catch { signature = String(Date.now()); }
@@ -849,7 +792,7 @@
       row.className = "room-sync-device";
       row.setAttribute("role", "listitem");
       if (device.leader) row.classList.add("is-leader");
-      if (device.blocked || device.bufferState === "error" || device.bufferState === "stalled") row.classList.add("is-blocked");
+      if (device.blocked || device.bufferState === "error") row.classList.add("is-blocked");
 
       var top = document.createElement("div");
       top.className = "room-sync-device-top";
@@ -864,32 +807,16 @@
       top.appendChild(state);
       row.appendChild(top);
 
-      var progress = boundedMetric(device.bufferProgress, 0, 1);
-      var progressTrack = document.createElement("div");
-      progressTrack.className = "room-sync-device-progress";
-      var progressFill = document.createElement("i");
-      progressFill.style.width = Math.round(progress * 100) + "%";
-      progressTrack.appendChild(progressFill);
-      row.appendChild(progressTrack);
-
-      var stats = document.createElement("div");
-      stats.className = "room-sync-device-stats";
-      var bufferedSeconds = boundedMetric(device.bufferedSeconds, 0, 86400);
-      var bufferGoalSeconds = boundedMetric(device.bufferGoalSeconds, 0, 120);
-      if (bufferGoalSeconds > 0) {
-        appendDeviceStat(stats, bufferedSeconds.toFixed(1) + " / " + bufferGoalSeconds.toFixed(1) + " 秒");
+      if (device.participant && !device.ready) {
+        var progress = boundedMetric(device.bufferProgress, 0, 1);
+        var progressTrack = document.createElement("div");
+        progressTrack.className = "room-sync-device-progress";
+        progressTrack.setAttribute("aria-label", "同步准备 " + Math.round(progress * 100) + "%");
+        var progressFill = document.createElement("i");
+        progressFill.style.width = Math.round(progress * 100) + "%";
+        progressTrack.appendChild(progressFill);
+        row.appendChild(progressTrack);
       }
-      appendDeviceStat(stats, "延迟 " + Math.round(boundedMetric(device.latencyMs, 0, 5000)) + " ms");
-      appendDeviceStat(stats, "抖动 " + Math.round(boundedMetric(device.jitterMs, 0, 1000)) + " ms");
-      var drift = Math.max(-10000, Math.min(10000, Number(device.driftMs) || 0));
-      appendDeviceStat(stats, "漂移 " + (drift > 0 ? "+" : "") + Math.round(drift) + " ms");
-      var quality = String(device.quality || "").toUpperCase();
-      if (quality) appendDeviceStat(stats, "音质 " + quality);
-      var calibration = normalizeDeviceCalibration(device);
-      appendDeviceStat(stats, "修正 " + calibrationValueLabel("volumeTrimDb", calibration.volumeTrimDb));
-      appendDeviceStat(stats, "延迟 " + calibrationValueLabel("delayMs", calibration.delayMs));
-      row.appendChild(stats);
-      appendDeviceCalibrationControls(row, device);
       fragment.appendChild(row);
     });
     list.appendChild(fragment);
@@ -904,6 +831,9 @@
       invalid_device: "目标设备已离开房间，请刷新设备列表",
       device_not_found: "目标设备已离开房间，请刷新设备列表",
       invalid_calibration: "设备校准参数无效，请重置后重试",
+      buffer_contract_required: "同步服务要求完整的缓冲状态，请刷新播放器",
+      buffer_not_ready: "当前设备缓冲尚未达到同步起播要求",
+      strict_sync_required: "当前同步操作需要协议 v3，请刷新播放器",
       leader_only: "只有房间主控可以执行此操作",
       not_joined: "设备尚未加入房间，正在尝试重新连接",
       quality_unavailable: "当前歌曲或账号暂不支持所选音质",
@@ -914,6 +844,27 @@
       message_too_large: "同步数据超过服务限制"
     };
     return messages[value] || ("同步协议错误：" + value);
+  }
+
+  function refreshForCurrentRoomProtocol() {
+    try {
+      if (window.sessionStorage.getItem(ROOM_SYNC_REFRESH_GUARD_KEY) === ROOM_SYNC_BUILD_ID) return false;
+      window.sessionStorage.setItem(ROOM_SYNC_REFRESH_GUARD_KEY, ROOM_SYNC_BUILD_ID);
+    } catch {}
+    window.setTimeout(function () {
+      var target;
+      try {
+        target = new URL(window.location.href);
+        target.searchParams.set("room", roomCode);
+        target.searchParams.set("syncBuild", ROOM_SYNC_BUILD_ID);
+      } catch {
+        window.location.reload();
+        return;
+      }
+      if (typeof window.location.replace === "function") window.location.replace(target.toString());
+      else window.location.reload();
+    }, 180);
+    return true;
   }
 
   function updateRoomSyncUi() {
@@ -934,9 +885,7 @@
     var connected = Boolean(bridge.sync.connected);
     var connectionError = Boolean(bridge.sync.error);
     var leader = connected && joinedRoom && Boolean(bridge.sync.leader);
-    var timingText = bridge.sync.clockReady
-      ? " · " + Math.round(Math.max(0, Number(bridge.sync.latency) || 0)) + " ms"
-      : " · 校时中";
+    var timingText = bridge.sync.clockReady ? " · 自动校准已开启" : " · 自动校时中";
 
     anchor.classList.toggle("connected", connected);
     anchor.classList.toggle("leader", leader);
@@ -955,9 +904,11 @@
     if (status) status.textContent = !connected
       ? (connectionError ? "同步服务连接失败，正在重试" : "正在连接同步服务")
       : (bridge.sync.preparing
-        ? "等待设备缓冲 · " + bridge.sync.readyCount + "/" + Math.max(1, bridge.sync.requiredCount)
+        ? (bridge.sync.commitState === "tentative"
+          ? "确认同步启动 · " + bridge.sync.armedCount + "/" + Math.max(1, bridge.sync.strictRequiredCount)
+          : "等待设备缓冲 · " + bridge.sync.readyCount + "/" + Math.max(1, bridge.sync.requiredCount))
         : (bridge.sync.prepareError
-          ? (bridge.sync.prepareError === "start_failed" ? "设备启动失败，请重试播放" : "设备缓冲超时，请重试播放")
+          ? (bridge.sync.prepareError === "start_failed" ? "设备启动未完成，请重新点击播放" : "缓冲未完成，请重新点击播放")
           : (joinedRoom ? "同步服务已连接" + timingText : "正在加入同步房间")));
     if (devices) devices.textContent = deviceCount + " 台设备";
     if (dot) dot.classList.toggle("connected", connected);
@@ -984,7 +935,9 @@
     if (bufferBar) bufferBar.style.width = Math.round(bufferProgress * 100) + "%";
     if (bufferLabel) {
       bufferLabel.textContent = bridge.sync.preparing
-        ? (Math.round(bufferProgress * 100) + "% · " + bridge.sync.readyCount + "/" + Math.max(1, bridge.sync.requiredCount) + " 已就绪")
+        ? (bridge.sync.commitState === "tentative"
+          ? ("缓冲完成 · " + bridge.sync.armedCount + "/" + Math.max(1, bridge.sync.strictRequiredCount) + " 已确认")
+          : (Math.round(bufferProgress * 100) + "% · " + bridge.sync.readyCount + "/" + Math.max(1, bridge.sync.requiredCount) + " 已就绪"))
         : (bridge.sync.prepareError
           ? "准备失败"
           : (scheduledInFuture ? "全部就绪 · 即将同步起播" : "等待播放"));
@@ -1176,7 +1129,10 @@
   }
 
   function sendCommand(action, value) {
-    var readiness = action === "ready" || action === "start-failed" || action === "device-status";
+    var readiness = action === "ready"
+      || action === "armed"
+      || action === "start-failed"
+      || action === "device-status";
     if ((!readiness && !bridge.sync.leader) || !joinedRoom || !socket || socket.readyState !== WebSocket.OPEN) return false;
     var message = { type: "command", action: action };
     if (action === "track") message.track = value;
@@ -1185,6 +1141,12 @@
       appendDeviceStatusFields(message, readyValue);
       message.ready = readyValue.ready !== false;
     }
+    else if (action === "armed") {
+      var armedValue = value && typeof value === "object" ? value : {};
+      appendDeviceStatusFields(message, armedValue);
+      message.commitId = String(armedValue.commitId || "");
+      message.armed = armedValue.armed !== false;
+    }
     else if (action === "device-status") appendDeviceStatusFields(message, value);
     else if (action === "device-calibration") {
       var calibrationValue = normalizeDeviceCalibration(value);
@@ -1192,7 +1154,11 @@
       message.volumeTrimDb = calibrationValue.volumeTrimDb;
       message.delayMs = calibrationValue.delayMs;
     }
-    else if (action === "start-failed") message.prepareId = String(value || "");
+    else if (action === "start-failed") {
+      var failureValue = value && typeof value === "object" ? value : { prepareId: value };
+      message.prepareId = String(failureValue.prepareId || "");
+      if (failureValue.commitId) message.commitId = String(failureValue.commitId);
+    }
     else if (action === "seek" || action === "progress") {
       message.position = Number(value) || 0;
       if (action === "progress") {
@@ -1233,38 +1199,6 @@
       pendingDeviceStatus = null;
       if (sendCommand("device-status", trailing)) lastDeviceStatusSentAt = Date.now();
     }, Math.max(0, 320 - elapsed));
-  }
-
-  function sendDeviceCalibrationCommand(targetClientId, value, flush) {
-    if (!bridge.sync.leader || !targetClientId) return false;
-    var calibration = normalizeDeviceCalibration(value);
-    if (String(targetClientId) === clientId) applyLocalDeviceCalibration(calibration, false);
-    pendingCalibration = {
-      targetClientId: String(targetClientId),
-      volumeTrimDb: calibration.volumeTrimDb,
-      delayMs: calibration.delayMs
-    };
-    var elapsed = Date.now() - lastCalibrationSentAt;
-    if (flush || elapsed >= 120) {
-      window.clearTimeout(calibrationTimer);
-      calibrationTimer = 0;
-      var immediate = pendingCalibration;
-      pendingCalibration = null;
-      if (sendCommand("device-calibration", immediate)) {
-        lastCalibrationSentAt = Date.now();
-        return true;
-      }
-      return false;
-    }
-    window.clearTimeout(calibrationTimer);
-    calibrationTimer = window.setTimeout(function () {
-      calibrationTimer = 0;
-      if (!pendingCalibration) return;
-      var trailing = pendingCalibration;
-      pendingCalibration = null;
-      if (sendCommand("device-calibration", trailing)) lastCalibrationSentAt = Date.now();
-    }, Math.max(0, 120 - elapsed));
-    return true;
   }
 
   function sendVolumeCommand(value, flush) {
@@ -1641,6 +1575,32 @@
     return descriptor ? descriptor.id : "";
   }
 
+  function strictCommitRequired(state) {
+    return Boolean(strictRoomProtocol && state && state.strictSync);
+  }
+
+  function committedRoomPlaybackAllowed(state) {
+    if (!state || !state.playing || state.preparing) return false;
+    if (!strictCommitRequired(state)) return true;
+    return Number(state.protocolVersion) >= ROOM_SYNC_PROTOCOL_VERSION
+      && String(state.commitState || "") === "committed"
+      && Boolean(String(state.commitId || ""));
+  }
+
+  function roomCommitKey(state) {
+    var prepareId = String(state && state.prepareId || "");
+    var commitId = String(state && state.commitId || "");
+    return prepareId && commitId ? prepareId + ":" + commitId : "";
+  }
+
+  function strictCommitCanBeRevoked(state) {
+    if (!strictCommitRequired(state) || !roomCommitKey(state)) return false;
+    if (String(state.commitState || "") === "tentative" && state.preparing) return true;
+    return String(state.commitState || "") === "committed"
+      && state.playing
+      && Number(state.scheduledAt || 0) > Date.now() + serverOffset;
+  }
+
   function targetPosition(state) {
     var position = Math.max(0, Number(state.position) || 0);
     if (!state.playing) return position;
@@ -1767,19 +1727,27 @@
     return true;
   }
 
-  function playForRoomSync(media, prepareId) {
+  function reportScheduledStartFailure(guard) {
+    if (!guard || !guard.prepareId) return;
+    sendCommand("start-failed", {
+      prepareId: guard.prepareId,
+      commitId: guard.commitId
+    });
+  }
+
+  function playForRoomSync(media, guard) {
     if (!media || !media.paused) return;
-    var scheduledPrepareId = String(prepareId || "");
     suppressNextPlayCommand = true;
     var result;
     try { result = media.play(); } catch {
       suppressNextPlayCommand = false;
-      if (scheduledPrepareId) sendCommand("start-failed", scheduledPrepareId);
+      if (scheduledPlaybackIdentityMatches(media, guard, false)) reportScheduledStartFailure(guard);
       return;
     }
     window.setTimeout(function () { suppressNextPlayCommand = false; }, 1000);
     if (result && typeof result.then === "function") {
       result.then(function () {
+        if (!scheduledPlaybackIdentityMatches(media, guard, false) || media.paused) return;
         playUnlockNoticeShown = false;
         window.playing = true;
         if (typeof window.setPlayIcon === "function") window.setPlayIcon(true);
@@ -1788,7 +1756,7 @@
         }
       }).catch(function () {
         suppressNextPlayCommand = false;
-        if (scheduledPrepareId) sendCommand("start-failed", scheduledPrepareId);
+        if (scheduledPlaybackIdentityMatches(media, guard, false)) reportScheduledStartFailure(guard);
         if (!playUnlockNoticeShown) notify("点击播放键以允许此设备加入同步播放");
         playUnlockNoticeShown = true;
       });
@@ -1827,25 +1795,43 @@
       revision: Number(state && state.revision) || 0,
       trackId: String(state && state.track && state.track.id || ""),
       prepareId: String(state && state.prepareId || ""),
+      commitId: String(state && state.commitId || ""),
+      commitState: String(state && state.commitState || ""),
+      strictCommit: strictCommitRequired(state),
       scheduledAt: Number(state && state.scheduledAt) || 0
     };
   }
 
-  function launchScheduledRoomPlayback(media, guard) {
-    if (!guard || guard.timerGeneration !== scheduledPlayGeneration) return;
-    if (guard.connectionGeneration !== roomConnectionGeneration) return;
-    scheduledPlayTimer = 0;
+  function scheduledPlaybackIdentityMatches(media, guard, requireRevision) {
     var activeState = lastRoomState;
     if (!media
       || media !== window.audio
+      || !guard
       || !activeState
-      || !activeState.playing
-      || activeState.preparing) return;
-    if (Number(activeState.revision) !== guard.revision
+      || !committedRoomPlaybackAllowed(activeState)) return false;
+    if (guard.connectionGeneration !== roomConnectionGeneration
       || String(activeState.track && activeState.track.id || "") !== guard.trackId
       || currentDescriptorId() !== guard.trackId
       || String(activeState.prepareId || "") !== guard.prepareId
-      || Number(activeState.scheduledAt || 0) !== guard.scheduledAt) return;
+      || Number(activeState.scheduledAt || 0) !== guard.scheduledAt
+      || strictCommitRequired(activeState) !== guard.strictCommit) return false;
+    if (requireRevision && Number(activeState.revision) !== guard.revision) return false;
+    if (guard.strictCommit) {
+      if (String(activeState.commitState || "") !== "committed"
+        || guard.commitState !== "committed"
+        || !guard.commitId
+        || String(activeState.commitId || "") !== guard.commitId) return false;
+    }
+    return true;
+  }
+
+  function launchScheduledRoomPlayback(media, guard) {
+    if (!guard
+      || guard.timerGeneration !== scheduledPlayGeneration
+      || guard.connectionGeneration !== roomConnectionGeneration) return;
+    scheduledPlayTimer = 0;
+    if (!scheduledPlaybackIdentityMatches(media, guard, true)) return;
+    var activeState = lastRoomState;
     var remaining = Number(activeState.scheduledAt) > 0
       ? Number(activeState.scheduledAt) - (Date.now() + serverOffset) - localDeviceDelayMs()
       : 0;
@@ -1856,7 +1842,18 @@
       return;
     }
     alignScheduledRoomPlayback(media, activeState);
-    playForRoomSync(media, guard.prepareId);
+    if (guard.strictCommit) {
+      var liveTarget = targetPosition(activeState);
+      var duration = Number(media.duration) || 0;
+      if (duration > 0) liveTarget = Math.min(liveTarget, Math.max(0, duration - 0.05));
+      var launchStatus = roomDeviceStatus(media, activeState, liveTarget, { launchWindow: true });
+      if (!bridge.sync.clockReady || !launchStatus.ready) {
+        revokeArmedRoomCommit(activeState, launchStatus, true);
+        reportScheduledStartFailure(guard);
+        return;
+      }
+    }
+    playForRoomSync(media, guard);
   }
 
   function measureRoomBufferWindow(media, target) {
@@ -1864,9 +1861,20 @@
     if (!core || typeof core.measureBufferedWindow !== "function") {
       bridge.sync.protocolError = "同步缓冲组件未加载，请刷新页面";
       updateRoomSyncUi();
-      return { bufferedSeconds: 0, bufferGoalSeconds: 8, bufferProgress: 0, ready: false };
+      return { bufferedSeconds: 0, bufferGoalSeconds: 4, bufferProgress: 0, ready: false };
     }
     return core.measureBufferedWindow(media, target, {
+      latencyMs: bridge.sync.latency,
+      jitterMs: bridge.sync.jitter
+    });
+  }
+
+  function measureRoomLaunchWindow(media, target) {
+    var core = window.MineradioRoomSyncCore;
+    if (!core || typeof core.measureLaunchWindow !== "function") {
+      return measureRoomBufferWindow(media, target);
+    }
+    return core.measureLaunchWindow(media, target, {
       latencyMs: bridge.sync.latency,
       jitterMs: bridge.sync.jitter
     });
@@ -1883,7 +1891,9 @@
 
   function roomDeviceStatus(media, state, target, options) {
     var input = options || {};
-    var measurement = measureRoomBufferWindow(media, target);
+    var measurement = input.launchWindow
+      ? measureRoomLaunchWindow(media, target)
+      : measureRoomBufferWindow(media, target);
     var aligned = Math.abs((Number(media && media.currentTime) || 0) - target) <= 0.08;
     var readyState = Number(media && media.readyState) || 0;
     var bufferState = input.bufferState || "";
@@ -1917,6 +1927,62 @@
     };
   }
 
+  function revokeArmedRoomCommit(state, status, force) {
+    var key = roomCommitKey(state);
+    if (!key || !strictCommitCanBeRevoked(state)) return false;
+    if (!force && lastArmedCommitKey !== key) return false;
+    var deviceStatus = status;
+    if (!deviceStatus && window.audio) {
+      var target = targetPosition(state);
+      var duration = Number(window.audio.duration) || 0;
+      if (duration > 0) target = Math.min(target, Math.max(0, duration - 0.05));
+      deviceStatus = roomDeviceStatus(window.audio, state, target);
+    }
+    var payload = Object.assign(
+      {},
+      deviceStatus ? deviceStatus.payload : { prepareId: String(state.prepareId || "") },
+      {
+        commitId: String(state.commitId || ""),
+        armed: false,
+        bufferState: deviceStatus && deviceStatus.payload.bufferState
+          ? deviceStatus.payload.bufferState
+          : "buffering"
+      }
+    );
+    var sent = sendCommand("armed", payload);
+    if (sent && lastArmedCommitKey === key) lastArmedCommitKey = "";
+    return sent;
+  }
+
+  function acknowledgeTentativeRoomCommit(state, deviceStatus, readyForBarrier) {
+    if (!strictCommitRequired(state)
+      || String(state.commitState || "") !== "tentative"
+      || !state.preparing) return false;
+    var key = roomCommitKey(state);
+    if (!key) return false;
+    if (lastArmedCommitKey && lastArmedCommitKey !== key) lastArmedCommitKey = "";
+    var canArm = Boolean(
+      readyForBarrier
+      && deviceStatus
+      && deviceStatus.ready
+      && bridge.sync.clockReady
+    );
+    if (!canArm) {
+      revokeArmedRoomCommit(state, deviceStatus, false);
+      return false;
+    }
+    if (lastArmedCommitKey === key) return true;
+    var payload = Object.assign({}, deviceStatus.payload, {
+      commitId: String(state.commitId || ""),
+      armed: true
+    });
+    if (sendCommand("armed", payload)) {
+      lastArmedCommitKey = key;
+      return true;
+    }
+    return false;
+  }
+
   function reportCurrentRoomDeviceStatus(flush, bufferState) {
     var media = window.audio;
     var state = lastRoomState;
@@ -1927,8 +1993,15 @@
     var target = targetPosition(state);
     var duration = Number(media.duration) || 0;
     if (duration > 0) target = Math.min(target, Math.max(0, duration - 0.05));
-    var status = roomDeviceStatus(media, state, target, { bufferState: bufferState });
+    var committedStartPending = strictCommitRequired(state)
+      && String(state.commitState || "") === "committed"
+      && scheduledInFuture;
+    var status = roomDeviceStatus(media, state, target, {
+      bufferState: bufferState,
+      launchWindow: committedStartPending
+    });
     sendDeviceStatusCommand(status.payload, Boolean(flush));
+    if (!status.ready) revokeArmedRoomCommit(state, status, false);
     return status;
   }
 
@@ -1970,6 +2043,10 @@
   function reconcileRoomPlayback(state, forceSeek) {
     var media = window.audio;
     if (!media || !state || !state.track) return;
+    var activeCommitKey = roomCommitKey(state);
+    if (lastArmedCommitKey && lastArmedCommitKey !== activeCommitKey) {
+      lastArmedCommitKey = "";
+    }
     var target = targetPosition(state);
     var duration = Number(media.duration) || 0;
     if (duration > 0) target = Math.min(target, Math.max(0, duration - 0.05));
@@ -2006,6 +2083,15 @@
       setMediaPlaybackRate(media, 1);
       pauseForRoomSync(media);
       var prepareId = String(state.prepareId || "");
+      if (prepareId && activeBufferLoadPrepareId !== prepareId) {
+        activeBufferLoadPrepareId = prepareId;
+        // Some tablet engines stop after metadata while paused. Restart the
+        // resource fetch once for this preparation so progress cannot stay at
+        // zero forever; subsequent events drive the normal readiness checks.
+        if (media.readyState < 2 && Number(media.networkState) !== 2) {
+          try { media.load(); } catch {}
+        }
+      }
       resetRoomMediaUnlockFor(media);
       var deviceStatus = roomDeviceStatus(media, state, target);
       sendDeviceStatusCommand(deviceStatus.payload, deviceStatus.ready);
@@ -2013,6 +2099,7 @@
         && deviceStatus.ready
         && correction.mode !== "seek"
         && hasBufferedPlaybackWindow(media, target);
+      if (!readyForBarrier) revokeArmedRoomCommit(state, deviceStatus, false);
       if (readyForBarrier && prepareId !== lastReadyPrepareId) {
         var readyPayload = Object.assign({}, deviceStatus.payload, { ready: true });
         if (sendCommand("ready", readyPayload)) lastReadyPrepareId = prepareId;
@@ -2020,6 +2107,7 @@
         sendCommand("ready", Object.assign({}, deviceStatus.payload, { ready: false }));
         lastReadyPrepareId = "";
       }
+      acknowledgeTentativeRoomCommit(state, deviceStatus, readyForBarrier);
       if (deviceStatus.measurement.ready && deviceStatus.aligned && !roomMediaUnlocked) {
         primeRoomMediaForSync(media, false).then(function (unlocked) {
           if (!unlocked
@@ -2035,6 +2123,14 @@
     }
 
     if (state.playing) {
+      if (!committedRoomPlaybackAllowed(state)) {
+        cancelScheduledRoomPlayback();
+        setMediaPlaybackRate(media, 1);
+        pauseForRoomSync(media);
+        bridge.sync.protocolError = "同步启动确认无效，已保持暂停并等待房间重新安排";
+        updateRoomSyncUi();
+        return;
+      }
       var startDelay = Number(state.scheduledAt) > 0
         ? Number(state.scheduledAt) - (Date.now() + serverOffset) - localDeviceDelayMs()
         : 0;
@@ -2058,10 +2154,16 @@
   async function applyRoomState(state, generation) {
     if (generation !== roomConnectionGeneration) return;
     if (!state) return;
+    var revision = Number(state.revision) || 0;
+    if (revision < lastRevision) return;
     bridge.sync.deviceCount = Math.max(0, Number(state.deviceCount) || 0);
+    bridge.sync.strictSync = Boolean(strictRoomProtocol && state.strictSync);
     bridge.sync.preparing = Boolean(state.preparing);
     bridge.sync.readyCount = Math.max(0, Number(state.readyCount) || 0);
     bridge.sync.requiredCount = Math.max(0, Number(state.requiredCount) || 0);
+    bridge.sync.armedCount = Math.max(0, Number(state.armedCount) || 0);
+    bridge.sync.strictRequiredCount = Math.max(0, Number(state.strictRequiredCount) || 0);
+    bridge.sync.commitState = String(state.commitState || "");
     bridge.sync.prepareError = String(state.prepareError || "");
     bridge.sync.bufferProgress = boundedMetric(state.bufferProgress, 0, 1);
     bridge.sync.prepareDeadline = Math.max(0, Number(state.prepareDeadline) || 0);
@@ -2073,10 +2175,12 @@
       var bootstrapOffset = Number(state.serverTime) - Date.now();
       serverOffset = serverOffset ? serverOffset * 0.8 + bootstrapOffset * 0.2 : bootstrapOffset;
     }
-    var revision = Number(state.revision) || 0;
-    if (revision < lastRevision) return;
     var sameRevision = revision === lastRevision;
     lastRoomState = state;
+    if (!state.prepareId) lastReadyPrepareId = "";
+    if (lastArmedCommitKey && lastArmedCommitKey !== roomCommitKey(state)) {
+      lastArmedCommitKey = "";
+    }
     var wasLeader = bridge.sync.leader;
     bridge.sync.leader = String(state.leaderId || "") === clientId;
     updateRoomSyncUi();
@@ -2106,6 +2210,9 @@
       }
       if (!state.track) {
         cancelScheduledRoomPlayback();
+        lastReadyPrepareId = "";
+        lastArmedCommitKey = "";
+        activeBufferLoadPrepareId = "";
         if (window.audio) setMediaPlaybackRate(window.audio, 1);
         if (window.audio && !window.audio.paused) window.audio.pause();
         return;
@@ -2115,6 +2222,7 @@
       var trackChanged = currentDescriptorId() !== String(state.track.id);
       if (trackChanged) {
         cancelScheduledRoomPlayback();
+        activeBufferLoadPrepareId = "";
         leaderBuffering = false;
         if (window.audio) setMediaPlaybackRate(window.audio, 1);
         window.playbackQuality = parsed.quality;
@@ -2301,6 +2409,21 @@
     });
   }
 
+  function refreshRoomTimelineAfterClockSample(generation) {
+    if (generation !== roomConnectionGeneration
+      || applyingRoomState
+      || !lastRoomState
+      || !lastRoomState.track
+      || !window.audio
+      || currentDescriptorId() !== String(lastRoomState.track.id || "")) return;
+    applyingRoomState = true;
+    try {
+      reconcileRoomPlayback(lastRoomState, false);
+    } finally {
+      applyingRoomState = false;
+    }
+  }
+
   function blockFollowerControl() {
     if (!joinedRoom || bridge.sync.leader || applyingRoomState) return false;
     notify("当前设备正在跟随局域网主控播放");
@@ -2453,6 +2576,8 @@
     var originalPlayQueueAt = window.playQueueAt;
     window.playQueueAt = async function classicRoomPlayQueueAt() {
       if (blockFollowerControl()) return;
+      var activation = window.navigator && window.navigator.userActivation;
+      var invokedFromUserGesture = Boolean(activation && activation.isActive);
       cancelScheduledRoomPlayback();
       leaderBuffering = false;
       if (window.audio) setMediaPlaybackRate(window.audio, 1);
@@ -2469,6 +2594,15 @@
       var pendingJoinReady = finalizePendingRoomJoinPlayback(pendingJoinIntent);
       attachAudioEvents();
       updateMediaSessionMetadata();
+      if (invokedFromUserGesture
+        && window.audio
+        && window.audio.src
+        && (deferLeaderStart || holdForRoomJoin)) {
+        // Track selection is itself a trusted playback gesture. Preserve that
+        // intent across provider URL resolution so the first buffered track can
+        // enter the V3 ready barrier without requiring a second click.
+        await primeRoomMediaForSync(window.audio, true);
+      }
       if (holdForRoomJoin && pendingJoinReady && !joinedRoom) {
         notify("正在加入同步房间，歌曲会在全部设备缓冲就绪后统一播放");
       }
@@ -2585,7 +2719,9 @@
       socket.send(JSON.stringify({
         type: "join",
         room: roomCode,
-        name: "Classic " + String(navigator.platform || "Web").slice(0, 20)
+        name: "Classic " + String(navigator.platform || "Web").slice(0, 20),
+        protocolVersion: ROOM_SYNC_PROTOCOL_VERSION,
+        capabilities: ROOM_SYNC_CAPABILITIES
       }));
       clockPingTimer = window.setInterval(sendClockPing, 2500);
     });
@@ -2608,16 +2744,35 @@
       }
       if (message.type === "pong") {
         recordClockPong(message, Date.now());
-        if (lastRoomState && !bridge.sync.leader) enqueueRoomState(lastRoomState, generation);
+        if (lastRoomState
+          && (!bridge.sync.leader
+            || lastRoomState.preparing
+            || Number(lastRoomState.scheduledAt || 0) > Date.now() + serverOffset)) {
+          refreshRoomTimelineAfterClockSample(generation);
+        }
         return;
       }
       if (message.type === "error") {
-        bridge.sync.protocolError = protocolErrorMessage(message.code);
+        var protocolCode = String(message.code || "");
+        var refreshingProtocol = (protocolCode === "strict_sync_required" || protocolCode === "buffer_contract_required")
+          && refreshForCurrentRoomProtocol();
+        bridge.sync.protocolError = refreshingProtocol
+          ? "检测到旧版同步脚本，正在自动刷新并恢复连接"
+          : protocolErrorMessage(protocolCode);
         updateRoomSyncUi();
         return;
       }
       if (message.type === "joined") {
         joinedRoom = true;
+        var joinedCapabilities = message.capabilities && typeof message.capabilities === "object"
+          ? message.capabilities
+          : {};
+        var joinedProtocolVersion = Math.max(1, Math.floor(Number(message.protocolVersion) || 1));
+        strictRoomProtocol = joinedProtocolVersion >= ROOM_SYNC_PROTOCOL_VERSION
+          && joinedCapabilities.bufferContract === true
+          && joinedCapabilities.armedPlayback === true;
+        bridge.sync.protocolVersion = strictRoomProtocol ? ROOM_SYNC_PROTOCOL_VERSION : 1;
+        bridge.sync.strictSync = Boolean(strictRoomProtocol && message.state && message.state.strictSync);
         bridge.sync.leader = Boolean(message.leader);
         bridge.sync.protocolError = "";
         if (message.state) bridge.sync.deviceCount = Math.max(0, Number(message.state.deviceCount) || 0);
@@ -2663,17 +2818,25 @@
       bridge.sync.jitter = 0;
       bridge.sync.drift = 0;
       bridge.sync.clockReady = false;
+      bridge.sync.protocolVersion = 1;
+      bridge.sync.strictSync = false;
       bridge.sync.preparing = false;
       bridge.sync.readyCount = 0;
       bridge.sync.requiredCount = 0;
+      bridge.sync.armedCount = 0;
+      bridge.sync.strictRequiredCount = 0;
+      bridge.sync.commitState = "";
       bridge.sync.prepareError = "";
       bridge.sync.bufferProgress = 0;
       bridge.sync.prepareDeadline = 0;
       bridge.sync.prepareMaxDeadline = 0;
       bridge.sync.devices = [];
       joinedRoom = false;
+      strictRoomProtocol = false;
       leaderBuffering = false;
       lastReadyPrepareId = "";
+      lastArmedCommitKey = "";
+      activeBufferLoadPrepareId = "";
       suppressNextPlayCommand = false;
       suppressNextPauseCommand = false;
       suppressNextSeekCommand = false;
@@ -2705,10 +2868,6 @@
       deviceStatusTimer = 0;
       pendingDeviceStatus = null;
       lastDeviceStatusSentAt = 0;
-      window.clearTimeout(calibrationTimer);
-      calibrationTimer = 0;
-      pendingCalibration = null;
-      lastCalibrationSentAt = 0;
       localCalibrationMinimumUpdatedAt = 0;
       roomDeviceRenderSignature = "";
       leaderStartRequestPending = null;
@@ -2751,7 +2910,12 @@
       if (document.visibilityState !== "visible") return;
       sendClockPing();
       refreshServiceHealth();
-      if (lastRoomState && !bridge.sync.leader) enqueueRoomState(lastRoomState, roomConnectionGeneration);
+      if (lastRoomState
+        && (!bridge.sync.leader
+          || lastRoomState.preparing
+          || Number(lastRoomState.scheduledAt || 0) > Date.now() + serverOffset)) {
+        refreshRoomTimelineAfterClockSample(roomConnectionGeneration);
+      }
     });
     window.addEventListener("online", function () {
       sendClockPing();

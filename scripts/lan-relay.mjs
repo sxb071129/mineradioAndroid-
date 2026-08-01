@@ -13,6 +13,8 @@ import { WebSocketServer, WebSocket } from "ws";
 const DEFAULT_PORT = Number(process.env.MINERADIO_SYNC_PORT || 8787);
 const DEFAULT_HOST = process.env.MINERADIO_SYNC_HOST || "0.0.0.0";
 const MUSIC_API_PORT = Number(process.env.MINERADIO_MUSIC_PORT || 8790);
+const WEB_PORT = String(process.env.MINERADIO_WEB_PORT || 3000);
+const HTTPS_PORT = String(process.env.MINERADIO_HTTPS_PORT || 3443);
 const DEFAULT_DATA_DIR = path.resolve(".mineradio-lan", "tracks");
 const MAX_TRACK_BYTES = Number(
   process.env.MINERADIO_MAX_TRACK_BYTES || 512 * 1024 * 1024,
@@ -25,6 +27,7 @@ const ROOM_BROADCAST_INTERVAL_MS = 1000;
 const PLAYBACK_PREPARE_TIMEOUT_MS = 30_000;
 const PLAYBACK_PREPARE_PROGRESS_GRACE_MS = 10_000;
 const PLAYBACK_START_LEAD_MS = 1_200;
+const PLAYBACK_ARM_TIMEOUT_MS = 4_000;
 const PLAYBACK_PREPARE_COMPLETION_RETENTION_MS = 5_000;
 const MAX_ROOM_CLIENTS = 64;
 const JOIN_WINDOW_MS = 10_000;
@@ -35,6 +38,66 @@ const TRACK_ID_RE = /^[a-f0-9]{24}$/;
 const CLOUD_TRACK_RE = /^cloud-([1-9]\d{0,19})$/;
 const QUALITY_VALUES = new Set(["jymaster", "hires", "lossless", "exhigh", "standard"]);
 const CLOUD_V2_RE = /^cloud-v2-(netease|kugou)-([A-Za-z0-9]+)-(jymaster|hires|lossless|exhigh|standard)$/;
+const ROOM_SYNC_PROTOCOL_VERSION = 3;
+const ROOM_SYNC_CAPABILITIES = Object.freeze({
+  bufferContract: true,
+  armedPlayback: true,
+});
+
+function negotiatedRoomProtocol(message) {
+  const requestedVersion = Math.floor(Number(message?.protocolVersion) || 0);
+  const capabilities = message?.capabilities;
+  const strict = requestedVersion >= ROOM_SYNC_PROTOCOL_VERSION
+    && capabilities
+    && typeof capabilities === "object"
+    && capabilities.bufferContract === true
+    && capabilities.armedPlayback === true;
+  return {
+    protocolVersion: strict ? ROOM_SYNC_PROTOCOL_VERSION : 1,
+    strict,
+    capabilities: strict ? ROOM_SYNC_CAPABILITIES : Object.freeze({}),
+  };
+}
+
+function isPrivateV4(hostname) {
+  const parts = String(hostname || "").split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+  const [first, second] = parts;
+  return (
+    first === 10 ||
+    first === 127 ||
+    (first === 100 && second >= 64 && second <= 127) ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168)
+  );
+}
+
+function isLanHostname(hostname) {
+  const normalized = String(hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    isPrivateV4(normalized) ||
+    /^(?:fc|fd|fe8|fe9|fea|feb)/i.test(normalized)
+  );
+}
+
+function allowedBrowserOrigin(origin) {
+  if (!origin) return true;
+  try {
+    const raw = String(origin);
+    const value = new URL(raw);
+    const allowedPort =
+      (value.protocol === "http:" && value.port === WEB_PORT) ||
+      (value.protocol === "https:" && value.port === HTTPS_PORT);
+    return raw === value.origin && allowedPort && isLanHostname(value.hostname);
+  } catch {
+    return false;
+  }
+}
 
 function corsHeaders(extra = {}) {
   return {
@@ -201,14 +264,46 @@ function isLocalTrack(track) {
   return Boolean(track && TRACK_ID_RE.test(track.id));
 }
 
-function networkAddresses() {
+function interfaceAddressScore(name, address) {
+  const label = String(name || "");
+  let score = 0;
+  if (/wi-?fi|wlan|wireless/i.test(label)) score += 1000;
+  else if (/ethernet|以太网/i.test(label)) score += 900;
+  else if (/vethernet|hyper-v|virtual|vmware|virtualbox|loopback/i.test(label)) score += 100;
+  else if (/vpn|wireguard|wintun|tunnel|tailscale|zerotier|proton|vgate/i.test(label)) score -= 500;
+  else score += 400;
+  if (String(address).startsWith("192.168.")) score += 80;
+  else if (String(address).startsWith("10.")) score += 60;
+  else if (/^172\.(1[6-9]|2\d|3[01])\./.test(String(address))) score += 40;
+  return score;
+}
+
+export function rankedNetworkAddresses(interfaces = os.networkInterfaces()) {
   const values = [];
-  for (const entries of Object.values(os.networkInterfaces())) {
+  let index = 0;
+  for (const [name, entries] of Object.entries(interfaces || {})) {
     for (const entry of entries || []) {
-      if (entry.family === "IPv4" && !entry.internal) values.push(entry.address);
+      if (entry.family === "IPv4" && !entry.internal) {
+        values.push({
+          address: entry.address,
+          score: interfaceAddressScore(name, entry.address),
+          index,
+        });
+        index += 1;
+      }
     }
   }
-  return [...new Set(values)];
+  return [
+    ...new Set(
+      values
+        .sort((left, right) => right.score - left.score || left.index - right.index)
+        .map((entry) => entry.address),
+    ),
+  ];
+}
+
+function networkAddresses() {
+  return rankedNetworkAddresses();
 }
 
 function currentPosition(state, now = Date.now()) {
@@ -298,6 +393,40 @@ function resetDeviceTrackStatus(room, now = Date.now(), clearQuality = false) {
   }
 }
 
+function clientUsesStrictSync(client) {
+  return client?.roomProtocol?.strict === true;
+}
+
+function setIntersectionSize(values, participants) {
+  let count = 0;
+  for (const value of values) {
+    if (participants.has(value)) count += 1;
+  }
+  return count;
+}
+
+function strictSyncActive(room) {
+  return room.strictParticipants.size > 0;
+}
+
+function requiredParticipants(room) {
+  return strictSyncActive(room) ? room.strictParticipants : room.prepareParticipants;
+}
+
+function requiredReadyCount(room) {
+  return setIntersectionSize(room.readyClients, requiredParticipants(room));
+}
+
+function allRequiredClientsReady(room) {
+  const required = requiredParticipants(room);
+  return required.size > 0 && requiredReadyCount(room) >= required.size;
+}
+
+function allStrictClientsArmed(room) {
+  return room.strictParticipants.size > 0
+    && setIntersectionSize(room.armedClients, room.strictParticipants) >= room.strictParticipants.size;
+}
+
 function publicDevices(room) {
   const failedIds = new Set(room.prepareErrorClientIds);
   const barrierVisible = room.state.preparing
@@ -310,8 +439,11 @@ function publicDevices(room) {
         clientId: client.clientId,
         name: client.displayName,
         leader: room.leaderId === client.clientId,
+        protocolVersion: client.roomProtocol?.protocolVersion || 1,
+        strictParticipant: participant && room.strictParticipants.has(client.clientId),
         participant,
         ready: participant && room.readyClients.has(client.clientId),
+        armed: participant && room.armedClients.has(client.clientId),
         prepared: !room.state.preparing && participant && room.readyClients.has(client.clientId),
         blocked: failedIds.has(client.clientId),
         bufferedSeconds: status.bufferedSeconds,
@@ -333,21 +465,34 @@ function publicDevices(room) {
 
 function publicState(room) {
   const devices = publicDevices(room);
+  const strict = strictSyncActive(room);
   const participants = room.state.preparing
     || (room.state.playing && room.state.scheduledAt > Date.now())
     ? devices.filter((device) => device.participant)
     : [];
-  const bufferProgress = participants.length
-    ? participants.reduce((total, device) => total + device.bufferProgress, 0) / participants.length
+  const requiredDevices = strict
+    ? participants.filter((device) => device.strictParticipant)
+    : participants;
+  const bufferProgress = requiredDevices.length
+    ? requiredDevices.reduce((total, device) => total + device.bufferProgress, 0) / requiredDevices.length
     : 0;
   return {
     ...room.state,
+    protocolVersion: ROOM_SYNC_PROTOCOL_VERSION,
+    strictSync: strict,
     deviceCount: room.clients.size,
-    readyCount: room.state.preparing ? room.readyClients.size : 0,
-    requiredCount: room.state.preparing ? room.prepareParticipants.size : 0,
+    readyCount: room.state.preparing ? requiredReadyCount(room) : 0,
+    requiredCount: room.state.preparing ? requiredParticipants(room).size : 0,
+    armedCount: room.state.commitState === "tentative"
+      ? setIntersectionSize(room.armedClients, room.strictParticipants)
+      : room.state.commitState === "committed" ? room.strictParticipants.size : 0,
+    strictRequiredCount: room.state.preparing || room.state.commitState === "committed"
+      ? room.strictParticipants.size
+      : 0,
     bufferProgress,
     prepareDeadline: room.state.preparing ? room.prepareDeadline : 0,
     prepareMaxDeadline: room.state.preparing ? room.prepareMaxDeadline : 0,
+    commitDeadline: room.state.commitState === "tentative" ? room.commitDeadline : 0,
     prepareErrorClientIds: [...room.prepareErrorClientIds],
     devices,
     leaderId: room.leaderId,
@@ -371,22 +516,28 @@ function broadcastRoom(room) {
 }
 
 function cancelPlaybackPreparation(room, now = Date.now(), error = "", errorClientIds = []) {
+  const required = requiredParticipants(room);
   room.prepareErrorClientIds = error
     ? [...new Set(
         errorClientIds.length
           ? errorClientIds
-          : [...room.prepareParticipants].filter((clientId) => !room.readyClients.has(clientId)),
+          : [...required].filter((clientId) => !room.readyClients.has(clientId)),
       )]
     : [];
   room.readyClients.clear();
   room.readyTiming.clear();
+  room.armedClients.clear();
   room.prepareParticipants.clear();
+  room.strictParticipants.clear();
   room.prepareDeadline = 0;
   room.prepareMaxDeadline = 0;
   room.prepareStartedAt = 0;
+  room.commitDeadline = 0;
   room.state.preparing = false;
   room.state.prepareId = "";
   room.state.prepareError = error;
+  room.state.commitId = "";
+  room.state.commitState = "";
   room.state.scheduledAt = 0;
   room.state.playing = false;
   room.state.updatedAt = now;
@@ -396,20 +547,27 @@ function cancelPlaybackPreparation(room, now = Date.now(), error = "", errorClie
 function beginPlaybackPreparation(room, now = Date.now()) {
   room.readyClients.clear();
   room.readyTiming.clear();
+  room.armedClients.clear();
   room.prepareErrorClientIds = [];
-  room.prepareParticipants = new Set(
-    [...room.clients]
-      .filter((client) => client.readyState === WebSocket.OPEN)
-      .map((client) => client.clientId),
+  const openClients = [...room.clients].filter((client) => client.readyState === WebSocket.OPEN);
+  room.prepareParticipants = new Set(openClients.map((client) => client.clientId));
+  room.strictParticipants = new Set(
+    openClients.filter(clientUsesStrictSync).map((client) => client.clientId),
   );
   room.state.playing = false;
   room.state.preparing = Boolean(room.state.track);
   room.state.prepareId = room.state.preparing ? randomUUID() : "";
-  if (!room.state.preparing) room.prepareParticipants.clear();
+  if (!room.state.preparing) {
+    room.prepareParticipants.clear();
+    room.strictParticipants.clear();
+  }
   room.prepareStartedAt = room.state.preparing ? now : 0;
   room.prepareDeadline = room.state.preparing ? now + room.playbackPrepareTimeoutMs : 0;
   room.prepareMaxDeadline = room.state.preparing ? now + room.playbackPrepareMaxTimeoutMs : 0;
+  room.commitDeadline = 0;
   room.state.prepareError = "";
+  room.state.commitId = "";
+  room.state.commitState = "";
   room.state.scheduledAt = 0;
   room.state.updatedAt = now;
   for (const clientId of room.prepareParticipants) {
@@ -428,23 +586,108 @@ function beginPlaybackPreparation(room, now = Date.now()) {
   }
 }
 
+function playbackStartLead(room) {
+  const timingParticipants = strictSyncActive(room)
+    ? room.strictParticipants
+    : room.prepareParticipants;
+  const timing = [...timingParticipants]
+    .map((clientId) => room.readyTiming.get(clientId))
+    .filter(Boolean);
+  const networkLeadMs = Math.max(
+    0,
+    ...timing.map(({ latencyMs, jitterMs }) => 2 * latencyMs + 4 * jitterMs),
+  );
+  return Math.max(750, Math.min(2500, room.playbackStartLeadMs + networkLeadMs));
+}
+
+function beginTentativePlaybackCommit(room, now = Date.now()) {
+  if (!room.state.preparing || !strictSyncActive(room) || !allRequiredClientsReady(room)) {
+    return false;
+  }
+  room.armedClients.clear();
+  room.state.commitId = randomUUID();
+  room.state.commitState = "tentative";
+  room.state.scheduledAt = now + playbackStartLead(room);
+  room.commitDeadline = Math.min(
+    room.prepareMaxDeadline,
+    now + room.playbackArmTimeoutMs,
+  );
+  room.prepareDeadline = room.commitDeadline;
+  room.state.updatedAt = now;
+  room.state.revision += 1;
+  broadcastRoom(room);
+  return true;
+}
+
 function schedulePreparedPlayback(room, now = Date.now()) {
   if (!room.state.preparing) return false;
+  const strict = strictSyncActive(room);
+  if (strict && (room.state.commitState !== "tentative" || !allStrictClientsArmed(room))) {
+    return false;
+  }
   room.prepareDeadline = 0;
+  room.commitDeadline = 0;
   room.prepareErrorClientIds = [];
   room.state.preparing = false;
   room.state.prepareError = "";
+  room.state.commitState = strict ? "committed" : "";
+  if (!strict) room.state.commitId = "";
   room.state.playing = Boolean(room.state.track);
-  const networkLeadMs = Math.max(
-    0,
-    ...room.readyTiming.values().map(({ latencyMs, jitterMs }) => 2 * latencyMs + 4 * jitterMs),
-  );
-  const startLeadMs = Math.max(750, Math.min(2500, room.playbackStartLeadMs + networkLeadMs));
+  const startLeadMs = playbackStartLead(room);
   room.state.scheduledAt = room.state.playing ? now + startLeadMs : 0;
   room.state.updatedAt = room.state.scheduledAt || now;
   room.state.revision += 1;
   broadcastRoom(room);
   return true;
+}
+
+function clearTentativeCommit(room, now = Date.now()) {
+  room.armedClients.clear();
+  room.commitDeadline = 0;
+  room.state.commitId = "";
+  room.state.commitState = "";
+  room.state.scheduledAt = 0;
+  room.state.playing = false;
+  room.state.preparing = Boolean(room.state.track);
+  room.state.updatedAt = now;
+}
+
+function invalidateStrictCommitForClient(room, clientId, now = Date.now(), bufferState = "buffering") {
+  clearTentativeCommit(room, now);
+  room.readyClients.delete(clientId);
+  room.readyTiming.delete(clientId);
+  const status = ensureDeviceStatus(room, clientId, now);
+  room.deviceStatus.set(clientId, {
+    ...status,
+    bufferState: bufferState || status.bufferState || "buffering",
+    updatedAt: now,
+    extensionBufferedSeconds: 0,
+    extensionProgress: 0,
+  });
+  room.prepareDeadline = Math.min(
+    room.prepareMaxDeadline,
+    now + room.playbackPrepareTimeoutMs,
+  );
+  room.prepareErrorClientIds = [];
+  room.state.revision += 1;
+  broadcastRoom(room);
+}
+
+function rescheduleTentativePlaybackCommit(room, now = Date.now()) {
+  if (!room.state.preparing || room.state.commitState !== "tentative") return false;
+  clearTentativeCommit(room, now);
+  if (!strictSyncActive(room) || !allRequiredClientsReady(room)) return false;
+  return beginTentativePlaybackCommit(room, now);
+}
+
+function maybeAdvancePlaybackPreparation(room, now = Date.now()) {
+  if (!room.state.preparing || room.state.commitState === "tentative") return false;
+  if (strictSyncActive(room)) {
+    return allRequiredClientsReady(room) && beginTentativePlaybackCommit(room, now);
+  }
+  return room.prepareParticipants.size > 0
+    && room.readyClients.size >= room.prepareParticipants.size
+    && schedulePreparedPlayback(room, now);
 }
 
 function updateDeviceStatus(
@@ -710,6 +953,7 @@ export async function createLanRelay({
     ),
   ),
   playbackStartLeadMs = PLAYBACK_START_LEAD_MS,
+  playbackArmTimeoutMs = PLAYBACK_ARM_TIMEOUT_MS,
   playbackPrepareCompletionRetentionMs = PLAYBACK_PREPARE_COMPLETION_RETENTION_MS,
   roomBroadcastIntervalMs = ROOM_BROADCAST_INTERVAL_MS,
 } = {}) {
@@ -720,8 +964,11 @@ export async function createLanRelay({
     const room = rooms.get(ws.roomCode);
     ws.roomCode = "";
     if (!room || !room.clients.delete(ws)) return;
+    const wasLeader = room.leaderId === ws.clientId;
+    const removedStrictParticipant = room.strictParticipants.delete(ws.clientId);
     room.readyClients.delete(ws.clientId);
     room.readyTiming.delete(ws.clientId);
+    room.armedClients.delete(ws.clientId);
     room.prepareParticipants.delete(ws.clientId);
     room.deviceStatus.delete(ws.clientId);
     room.prepareErrorClientIds = room.prepareErrorClientIds.filter(
@@ -731,50 +978,65 @@ export async function createLanRelay({
       rooms.delete(room.code);
       return;
     }
-    if (room.leaderId === ws.clientId) {
+    if (wasLeader) {
       room.leaderId = room.clients.values().next().value.clientId;
-      if (room.state.preparing) {
-        if (room.readyClients.size >= room.prepareParticipants.size) {
-          schedulePreparedPlayback(room, now);
-        } else {
-          room.state.revision += 1;
-          broadcastRoom(room);
-        }
-        return;
+    }
+    if (room.state.preparing) {
+      if (removedStrictParticipant && room.state.commitState === "tentative") {
+        clearTentativeCommit(room, now);
+        room.prepareDeadline = Math.min(
+          room.prepareMaxDeadline,
+          now + room.playbackPrepareTimeoutMs,
+        );
       }
-      if (room.state.playing && room.state.scheduledAt > now) {
-        room.state.revision += 1;
-        broadcastRoom(room);
-        return;
-      }
-      if (room.state.playing) {
-        room.state.position = currentPosition(room.state, now);
-        room.readyClients.clear();
-        room.readyTiming.clear();
-        room.prepareParticipants.clear();
-        room.prepareDeadline = 0;
-        room.prepareMaxDeadline = 0;
-        room.prepareStartedAt = 0;
-        room.prepareErrorClientIds = [];
-        room.state.preparing = false;
-        room.state.prepareId = "";
-        room.state.prepareError = "";
-        room.state.scheduledAt = 0;
-        room.state.updatedAt = now;
-      }
-      room.state.revision += 1;
+      if (maybeAdvancePlaybackPreparation(room, now)) return;
+      if (wasLeader || removedStrictParticipant) room.state.revision += 1;
       broadcastRoom(room);
       return;
     }
-    if (room.state.preparing && room.readyClients.size >= room.prepareParticipants.size) {
-      schedulePreparedPlayback(room, now);
+    if (room.state.playing && room.state.scheduledAt > now) {
+      if (removedStrictParticipant && room.state.commitState === "committed") {
+        clearTentativeCommit(room, now);
+        room.prepareDeadline = Math.min(
+          room.prepareMaxDeadline,
+          now + room.playbackPrepareTimeoutMs,
+        );
+        if (maybeAdvancePlaybackPreparation(room, now)) return;
+      }
+      if (wasLeader || removedStrictParticipant) room.state.revision += 1;
+      broadcastRoom(room);
       return;
+    }
+    if (wasLeader && room.state.playing) {
+      room.state.position = currentPosition(room.state, now);
+      room.readyClients.clear();
+      room.readyTiming.clear();
+      room.armedClients.clear();
+      room.prepareParticipants.clear();
+      room.strictParticipants.clear();
+      room.prepareDeadline = 0;
+      room.prepareMaxDeadline = 0;
+      room.prepareStartedAt = 0;
+      room.commitDeadline = 0;
+      room.prepareErrorClientIds = [];
+      room.state.preparing = false;
+      room.state.prepareId = "";
+      room.state.prepareError = "";
+      room.state.commitId = "";
+      room.state.commitState = "";
+      room.state.scheduledAt = 0;
+      room.state.updatedAt = now;
+      room.state.revision += 1;
     }
     broadcastRoom(room);
   }
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://relay.local");
+    if (req.headers.origin && !allowedBrowserOrigin(req.headers.origin)) {
+      json(res, 403, { error: "origin_not_allowed" });
+      return;
+    }
     if (req.method === "OPTIONS") {
       res.writeHead(204, corsHeaders());
       res.end();
@@ -834,7 +1096,8 @@ export async function createLanRelay({
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD });
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url || "/", "http://relay.local");
-    if (url.pathname !== "/ws") {
+    if (url.pathname !== "/ws" || !allowedBrowserOrigin(req.headers.origin)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
@@ -844,6 +1107,7 @@ export async function createLanRelay({
   wss.on("connection", (ws) => {
     ws.clientId = randomUUID();
     ws.roomCode = "";
+    ws.roomProtocol = negotiatedRoomProtocol({});
     ws.displayName = "设备";
     ws.commandWindow = { startedAt: Date.now(), count: 0 };
     ws.joinWindow = { startedAt: Date.now(), count: 0 };
@@ -856,6 +1120,8 @@ export async function createLanRelay({
     send(ws, {
       type: "welcome",
       clientId: ws.clientId,
+      protocolVersion: ROOM_SYNC_PROTOCOL_VERSION,
+      capabilities: ROOM_SYNC_CAPABILITIES,
       serverTime: Date.now(),
       addresses: networkAddresses(),
     });
@@ -893,6 +1159,7 @@ export async function createLanRelay({
           send(ws, { type: "error", code: "invalid_room" });
           return;
         }
+        const requestedProtocol = negotiatedRoomProtocol(message);
         const currentRoom = rooms.get(ws.roomCode);
         if (ws.roomCode === code && currentRoom?.clients.has(ws)) {
           ws.displayName = cleanName(message.name || "设备").slice(0, 32);
@@ -901,6 +1168,8 @@ export async function createLanRelay({
             room: code,
             clientId: ws.clientId,
             leader: currentRoom.leaderId === ws.clientId,
+            protocolVersion: ws.roomProtocol.protocolVersion,
+            capabilities: ws.roomProtocol.capabilities,
             state: publicState(currentRoom),
           });
           return;
@@ -911,6 +1180,7 @@ export async function createLanRelay({
           return;
         }
         if (ws.roomCode) detachClientFromRoom(ws, receivedAt);
+        ws.roomProtocol = requestedProtocol;
         let room = targetRoom;
         if (!room) {
           room = {
@@ -919,11 +1189,14 @@ export async function createLanRelay({
             clients: new Set(),
             readyClients: new Set(),
             readyTiming: new Map(),
+            armedClients: new Set(),
             deviceStatus: new Map(),
             prepareParticipants: new Set(),
+            strictParticipants: new Set(),
             prepareDeadline: 0,
             prepareMaxDeadline: 0,
             prepareStartedAt: 0,
+            commitDeadline: 0,
             prepareErrorClientIds: [],
             playbackPrepareTimeoutMs: Math.max(100, Number(playbackPrepareTimeoutMs) || PLAYBACK_PREPARE_TIMEOUT_MS),
             playbackPrepareMaxTimeoutMs: Math.max(
@@ -936,6 +1209,10 @@ export async function createLanRelay({
               Number(playbackPrepareProgressGraceMs) || PLAYBACK_PREPARE_PROGRESS_GRACE_MS,
             ),
             playbackStartLeadMs: Math.max(0, Number(playbackStartLeadMs) || PLAYBACK_START_LEAD_MS),
+            playbackArmTimeoutMs: Math.max(
+              100,
+              Number(playbackArmTimeoutMs) || PLAYBACK_ARM_TIMEOUT_MS,
+            ),
             playbackPrepareCompletionRetentionMs: Math.max(
               20,
               Number(playbackPrepareCompletionRetentionMs) || PLAYBACK_PREPARE_COMPLETION_RETENTION_MS,
@@ -947,6 +1224,8 @@ export async function createLanRelay({
               preparing: false,
               prepareId: "",
               prepareError: "",
+              commitId: "",
+              commitState: "",
               scheduledAt: 0,
               position: 0,
               volume: 0.72,
@@ -962,6 +1241,13 @@ export async function createLanRelay({
         ensureDeviceStatus(room, ws.clientId, joinedAt);
         if (room.state.preparing) {
           room.prepareParticipants.add(ws.clientId);
+          if (clientUsesStrictSync(ws)) {
+            room.strictParticipants.add(ws.clientId);
+            if (room.state.commitState === "tentative") {
+              clearTentativeCommit(room, joinedAt);
+              room.state.revision += 1;
+            }
+          }
           const status = ensureDeviceStatus(room, ws.clientId, joinedAt);
           room.deviceStatus.set(ws.clientId, {
             ...status,
@@ -974,15 +1260,19 @@ export async function createLanRelay({
             extensionBufferedSeconds: 0,
             extensionProgress: 0,
           });
-          room.prepareDeadline = Math.min(
-            room.prepareMaxDeadline,
-            Math.max(room.prepareDeadline, joinedAt + room.playbackPrepareTimeoutMs),
-          );
+          if (!strictSyncActive(room) || clientUsesStrictSync(ws)) {
+            room.prepareDeadline = Math.min(
+              room.prepareMaxDeadline,
+              Math.max(room.prepareDeadline, joinedAt + room.playbackPrepareTimeoutMs),
+            );
+          }
         } else if (room.state.playing
           && room.state.scheduledAt > joinedAt
           && room.state.prepareId
-          && room.prepareMaxDeadline > joinedAt) {
+          && room.prepareMaxDeadline > joinedAt
+          && (!strictSyncActive(room) || clientUsesStrictSync(ws))) {
           room.prepareParticipants.add(ws.clientId);
+          if (clientUsesStrictSync(ws)) room.strictParticipants.add(ws.clientId);
           const status = ensureDeviceStatus(room, ws.clientId, joinedAt);
           room.deviceStatus.set(ws.clientId, {
             ...status,
@@ -995,11 +1285,8 @@ export async function createLanRelay({
             extensionBufferedSeconds: 0,
             extensionProgress: 0,
           });
-          room.state.playing = false;
-          room.state.preparing = true;
-          room.state.scheduledAt = 0;
+          clearTentativeCommit(room, joinedAt);
           room.state.prepareError = "";
-          room.state.updatedAt = joinedAt;
           room.prepareDeadline = Math.min(
             room.prepareMaxDeadline,
             joinedAt + room.playbackPrepareTimeoutMs,
@@ -1011,6 +1298,8 @@ export async function createLanRelay({
           room: code,
           clientId: ws.clientId,
           leader: room.leaderId === ws.clientId,
+          protocolVersion: ws.roomProtocol.protocolVersion,
+          capabilities: ws.roomProtocol.capabilities,
           state: publicState(room),
         });
         broadcastRoom(room);
@@ -1046,16 +1335,45 @@ export async function createLanRelay({
         const prepareId = String(message.prepareId || "");
         if (!prepareId || prepareId !== state.prepareId || !room.prepareParticipants.has(ws.clientId)) return;
         const deviceStatus = updateDeviceStatus(room, ws.clientId, message, now);
+        const strictClient = room.strictParticipants.has(ws.clientId) && clientUsesStrictSync(ws);
         const hasBufferFields = Object.hasOwn(message, "bufferedSeconds")
           || Object.hasOwn(message, "bufferGoalSeconds");
+        const hasCompleteBufferFields = Object.hasOwn(message, "bufferedSeconds")
+          && Object.hasOwn(message, "bufferGoalSeconds");
         const hasBufferContract = hasBufferFields
           || deviceStatus.bufferContractPrepareId === prepareId;
         const bufferReady = !hasBufferContract
           || (deviceStatus.bufferGoalSeconds > 0
             && deviceStatus.bufferedSeconds + 0.05 >= deviceStatus.bufferGoalSeconds);
-        const ready = message.ready !== false && bufferReady;
+        const strictBufferReady = hasCompleteBufferFields
+          && deviceStatus.bufferContractPrepareId === prepareId
+          && deviceStatus.bufferGoalSeconds > 0
+          && deviceStatus.bufferedSeconds + 0.05 >= deviceStatus.bufferGoalSeconds;
+        const readyRequested = message.ready !== false;
+        const ready = readyRequested && (strictClient ? strictBufferReady : bufferReady);
+        if (strictClient && readyRequested && !strictBufferReady) {
+          send(ws, {
+            type: "error",
+            code: hasCompleteBufferFields && deviceStatus.bufferGoalSeconds > 0
+              ? "buffer_not_ready"
+              : "buffer_contract_required",
+            prepareId,
+          });
+        }
         if (!state.preparing) {
-          if (!ready && state.playing && state.scheduledAt > now) {
+          if (!ready
+            && state.playing
+            && state.scheduledAt > now
+            && (!strictSyncActive(room) || strictClient)) {
+            if (strictClient && state.commitState === "committed") {
+              invalidateStrictCommitForClient(
+                room,
+                ws.clientId,
+                now,
+                deviceStatus.bufferState || "buffering",
+              );
+              return;
+            }
             room.readyClients.delete(ws.clientId);
             room.readyTiming.delete(ws.clientId);
             if (!room.prepareMaxDeadline || now >= room.prepareMaxDeadline) {
@@ -1090,6 +1408,7 @@ export async function createLanRelay({
         if (!ready) {
           const wasReady = room.readyClients.delete(ws.clientId);
           room.readyTiming.delete(ws.clientId);
+          room.armedClients.delete(ws.clientId);
           room.deviceStatus.set(ws.clientId, {
             ...deviceStatus,
             bufferState: message.ready === false
@@ -1098,6 +1417,16 @@ export async function createLanRelay({
             extensionBufferedSeconds: 0,
             extensionProgress: 0,
           });
+          if (strictClient && wasReady && state.commitState === "tentative") {
+            clearTentativeCommit(room, now);
+            room.prepareDeadline = Math.min(
+              room.prepareMaxDeadline,
+              now + room.playbackPrepareTimeoutMs,
+            );
+            state.revision += 1;
+            broadcastRoom(room);
+            return;
+          }
           if (wasReady) {
             state.revision += 1;
             broadcastRoom(room);
@@ -1120,7 +1449,62 @@ export async function createLanRelay({
           ...deviceStatus,
           bufferState: "ready",
         });
-        if (room.readyClients.size >= room.prepareParticipants.size) {
+        if (!maybeAdvancePlaybackPreparation(room, now)) {
+          state.revision += 1;
+          broadcastRoom(room);
+        }
+        return;
+      }
+      if (action === "armed") {
+        const prepareId = String(message.prepareId || "");
+        const commitId = String(message.commitId || "");
+        const strictClient = room.strictParticipants.has(ws.clientId) && clientUsesStrictSync(ws);
+        if (!strictClient) {
+          send(ws, { type: "error", code: "strict_sync_required" });
+          return;
+        }
+        if (!prepareId
+          || prepareId !== state.prepareId
+          || !commitId
+          || commitId !== state.commitId) {
+          return;
+        }
+        const canCancelCurrentCommit = state.commitState === "tentative"
+          || (state.commitState === "committed" && state.playing && state.scheduledAt > now);
+        if (message.armed === false) {
+          if (canCancelCurrentCommit) {
+            invalidateStrictCommitForClient(
+              room,
+              ws.clientId,
+              now,
+              String(message.bufferState || "buffering"),
+            );
+          }
+          return;
+        }
+        if (!state.preparing || state.commitState !== "tentative") return;
+        const deviceStatus = updateDeviceStatus(room, ws.clientId, message, now);
+        const bufferReady = room.readyClients.has(ws.clientId)
+          && deviceStatus.bufferContractPrepareId === prepareId
+          && deviceStatus.bufferGoalSeconds > 0
+          && deviceStatus.bufferedSeconds + 0.05 >= deviceStatus.bufferGoalSeconds;
+        if (!bufferReady) {
+          send(ws, { type: "error", code: "buffer_not_ready", prepareId, commitId });
+          invalidateStrictCommitForClient(
+            room,
+            ws.clientId,
+            now,
+            deviceStatus.bufferState || "buffering",
+          );
+          return;
+        }
+        room.readyTiming.set(ws.clientId, {
+          latencyMs: deviceStatus.latencyMs,
+          jitterMs: deviceStatus.jitterMs,
+        });
+        if (room.armedClients.has(ws.clientId)) return;
+        room.armedClients.add(ws.clientId);
+        if (allStrictClientsArmed(room)) {
           schedulePreparedPlayback(room, now);
         } else {
           state.revision += 1;
@@ -1130,9 +1514,15 @@ export async function createLanRelay({
       }
       if (action === "start-failed") {
         const prepareId = String(message.prepareId || "");
+        const strictClient = strictSyncActive(room)
+          && room.strictParticipants.has(ws.clientId)
+          && clientUsesStrictSync(ws);
+        const commitId = String(message.commitId || "");
         if (prepareId
           && prepareId === state.prepareId
           && room.prepareParticipants.has(ws.clientId)
+          && (!strictSyncActive(room) || room.strictParticipants.has(ws.clientId))
+          && (!strictClient || (commitId && commitId === state.commitId))
           && state.playing
           && state.scheduledAt
           && now <= state.scheduledAt + 5000) {
@@ -1254,8 +1644,21 @@ export async function createLanRelay({
     const now = Date.now();
     for (const room of rooms.values()) {
       if (room.state.preparing
-        && ((room.prepareDeadline && now >= room.prepareDeadline)
-          || (room.prepareMaxDeadline && now >= room.prepareMaxDeadline))) {
+        && room.prepareMaxDeadline
+        && now >= room.prepareMaxDeadline) {
+        cancelPlaybackPreparation(room, now, "timeout");
+        room.state.revision += 1;
+      } else if (room.state.preparing
+        && room.state.commitState === "tentative"
+        && room.commitDeadline
+        && now >= room.commitDeadline) {
+        if (!rescheduleTentativePlaybackCommit(room, now)) {
+          cancelPlaybackPreparation(room, now, "timeout");
+          room.state.revision += 1;
+        }
+      } else if (room.state.preparing
+        && room.prepareDeadline
+        && now >= room.prepareDeadline) {
         cancelPlaybackPreparation(room, now, "timeout");
         room.state.revision += 1;
       } else if (!room.state.preparing
@@ -1265,11 +1668,16 @@ export async function createLanRelay({
         && room.prepareMaxDeadline) {
         room.readyClients.clear();
         room.readyTiming.clear();
+        room.armedClients.clear();
         room.prepareParticipants.clear();
+        room.strictParticipants.clear();
         room.prepareDeadline = 0;
         room.prepareMaxDeadline = 0;
         room.prepareStartedAt = 0;
+        room.commitDeadline = 0;
         room.state.prepareId = "";
+        room.state.commitId = "";
+        room.state.commitState = "";
         resetDeviceTrackStatus(room, now);
       }
       broadcastRoom(room);

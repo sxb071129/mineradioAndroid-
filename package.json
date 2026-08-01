@@ -19,6 +19,9 @@
     "build": "node scripts/run-vinext.mjs build",
     "start": "node scripts/run-vinext.mjs start",
     "start:lan": "node scripts/dev-lan.mjs dev",
+    "start:lan:https": "node scripts/dev-lan.mjs dev --https",
+    "setup:https": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/setup-lan-https.ps1 -TrustOnThisPC",
+    "setup:https:files": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/setup-lan-https.ps1",
     "test": "npm run build && node --test tests/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .upstream-review"
   },

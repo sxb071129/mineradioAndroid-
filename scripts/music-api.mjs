@@ -18,6 +18,7 @@ const netease = require("NeteaseCloudMusicApi");
 const DEFAULT_PORT = Number(process.env.MINERADIO_MUSIC_PORT || 8790);
 const DEFAULT_HOST = process.env.MINERADIO_MUSIC_HOST || "0.0.0.0";
 const WEB_PORT = String(process.env.MINERADIO_WEB_PORT || 3000);
+const HTTPS_PORT = String(process.env.MINERADIO_HTTPS_PORT || 3443);
 const SONG_ID_RE = /^[1-9]\d{0,19}$/;
 const PLAY_KEY_RE = /^[a-f0-9]{24}$/;
 const PLAYLIST_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -48,6 +49,16 @@ const APPLICATION_ID = "mineradio-web-v1";
 const CORS_METHODS = ["GET", "POST", "OPTIONS"];
 const CORS_HEADERS = ["content-type", "range", APPLICATION_HEADER];
 const RETRYABLE_STREAM_STATUSES = new Set([401, 403, 404, 410]);
+const RETRYABLE_COVER_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_COVER_ERROR_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENETUNREACH",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
 const RESTRICTION_CODES = new Set([
   "login_required",
   "stale_session",
@@ -154,7 +165,7 @@ function mapSong(song) {
     artists,
     artistId: artists[0]?.id || "",
     album: String(album?.name || ""),
-    cover: safeHttpsImage(album?.picUrl || album?.coverUrl),
+    cover: safeProviderImage(album?.picUrl || album?.coverUrl),
     duration: Math.max(0, Number(song?.dt || song?.duration) || 0),
     fee: Number(song?.fee) || 0,
   };
@@ -164,7 +175,7 @@ function mapPlaylist(playlist) {
   return {
     id: String(playlist?.id || ""),
     name: String(playlist?.name || ""),
-    cover: safeHttpsImage(playlist?.picUrl || playlist?.coverImgUrl),
+    cover: safeProviderImage(playlist?.picUrl || playlist?.coverImgUrl),
     trackCount: Math.max(0, Number(playlist?.trackCount) || 0),
   };
 }
@@ -176,6 +187,45 @@ function safeHttpsImage(value) {
     const parsed = new URL(raw);
     if (parsed.protocol !== "https:" || parsed.username || parsed.password) return "";
     return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+const TRUSTED_PROVIDER_IMAGE_HOST_SUFFIXES = [
+  ".music.126.net",
+  ".music.163.com",
+  ".kugou.com",
+  ".kgimg.com",
+  ".qpic.cn",
+  ".gtimg.cn",
+  ".qq.com",
+];
+
+function trustedProviderImageHostname(hostname) {
+  const value = String(hostname || "").toLowerCase();
+  return TRUSTED_PROVIDER_IMAGE_HOST_SUFFIXES.some(
+    (suffix) => value === suffix.slice(1) || value.endsWith(suffix),
+  );
+}
+
+function safeProviderImage(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw.length > 2_048) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.username || parsed.password) return "";
+    // Netease and Kugou still return HTTP artwork URLs from some otherwise
+    // valid search/detail endpoints. Their CDN endpoints support HTTPS, so
+    // upgrade trusted provider metadata before exposing it to the browser.
+    if (parsed.protocol === "http:") {
+      if (!trustedProviderImageHostname(parsed.hostname) || (parsed.port && parsed.port !== "80")) {
+        return "";
+      }
+      parsed.protocol = "https:";
+      parsed.port = "";
+    }
+    return safeHttpsImage(parsed.toString());
   } catch {
     return "";
   }
@@ -194,7 +244,7 @@ function mapUserPlaylist(playlist) {
     source: "netease",
     id: String(playlist?.id || ""),
     name: cleanPublicText(playlist?.name, 160),
-    cover: safeHttpsImage(playlist?.picUrl || playlist?.coverImgUrl),
+    cover: safeProviderImage(playlist?.picUrl || playlist?.coverImgUrl),
     trackCount: Math.max(0, Math.min(1_000_000, Number(playlist?.trackCount) || 0)),
     subscribed: Boolean(playlist?.subscribed),
     specialType: Math.max(0, Math.min(10_000, Number(playlist?.specialType) || 0)),
@@ -206,7 +256,7 @@ function mapArtist(artist, fallbackId) {
   return {
     id,
     name: cleanPublicText(artist?.name, 160),
-    avatar: safeHttpsImage(
+    avatar: safeProviderImage(
       artist?.cover || artist?.avatar || artist?.picUrl || artist?.img1v1Url,
     ),
     description: cleanPublicText(artist?.briefDesc || artist?.description, 2_000),
@@ -231,7 +281,7 @@ function mapComment(comment) {
     user: {
       userId: validSongId(user?.userId || user?.id),
       nickname: cleanPublicText(user?.nickname, 80),
-      avatar: safeHttpsImage(user?.avatarUrl || user?.avatar),
+      avatar: safeProviderImage(user?.avatarUrl || user?.avatar),
     },
   };
 }
@@ -275,7 +325,7 @@ function mapPodcastRadio(value) {
     id,
     rid: id,
     name: cleanPodcastText(radio.name || radio.radioName, 160),
-    cover: safeHttpsImage(
+    cover: safeProviderImage(
       radio.picUrl || radio.picURL || radio.coverUrl || radio.coverImgUrl || radio.avatarUrl,
     ),
     desc: cleanPodcastText(radio.desc || radio.description || radio.rcmdText, 2_000),
@@ -318,7 +368,7 @@ function mapPodcastProgram(value, fallbackRadio = {}) {
     artists,
     artistId: artists[0]?.id || "",
     album: cleanPodcastText(radio.name || album.name || "Podcast", 200),
-    cover: safeHttpsImage(
+    cover: safeProviderImage(
       program.coverUrl || program.cover || program.blurCoverUrl || radio.cover || album.picUrl,
     ),
     duration: boundedPublicInteger(program.duration || mainSong.dt || mainSong.duration, 604_800_000),
@@ -375,7 +425,7 @@ function mapPodcastVoice(value) {
     name: cleanPodcastText(voice.name || voice.songName || voice.title || mainSong.name, 200),
     artist: cleanPodcastText(radioName || voice.djName || "Voice", 200),
     album: cleanPodcastText(radioName || "Podcast", 200),
-    cover: safeHttpsImage(
+    cover: safeProviderImage(
       voice.coverUrl || voice.cover || voice.picUrl || voice.coverImgUrl || radio.picUrl || radio.coverUrl,
     ),
     duration: boundedPublicInteger(
@@ -411,7 +461,7 @@ function podcastCollectionMeta(key, items) {
   return {
     ...metadata,
     count: safeItems.length,
-    cover: safeHttpsImage(safeItems[0]?.cover),
+    cover: safeProviderImage(safeItems[0]?.cover),
   };
 }
 
@@ -426,7 +476,7 @@ function loginInfoFromResponse(value) {
     loggedIn: true,
     userId: String(userId),
     nickname: String(profile.nickname || profile.userName || "网易云用户"),
-    avatar: String(profile.avatarUrl || profile.avatar || ""),
+    avatar: safeProviderImage(profile.avatarUrl || profile.avatar),
   };
 }
 
@@ -550,12 +600,22 @@ async function fetchProviderStream(
   return response;
 }
 
+function retryableCoverFetchError(error) {
+  if (String(error?.message || "") === "provider_timeout") return true;
+  const code = String(error?.code || error?.cause?.code || "").toUpperCase();
+  if (RETRYABLE_COVER_ERROR_CODES.has(code)) return true;
+  return error instanceof TypeError && /fetch failed|network error/i.test(String(error.message || ""));
+}
+
 function allowedOrigin(origin) {
   if (!origin) return "";
   try {
     const raw = String(origin);
     const value = new URL(raw);
-    if (raw !== value.origin || value.protocol !== "http:" || value.port !== WEB_PORT) return "";
+    const allowedPort =
+      (value.protocol === "http:" && value.port === WEB_PORT) ||
+      (value.protocol === "https:" && value.port === HTTPS_PORT);
+    if (raw !== value.origin || !allowedPort) return "";
     return isLanHostname(value.hostname) ? value.origin : "";
   } catch {
     return "";
@@ -930,7 +990,7 @@ function safeAccountInfo(value, provider) {
     loggedIn: Boolean(info.loggedIn),
     userId: numericUserId,
     nickname: String(info.nickname || (provider === "kugou" ? "酷狗音乐" : "网易云音乐")).slice(0, 80),
-    avatar: safeHttpsImage(info.avatar),
+    avatar: safeProviderImage(info.avatar),
     vipType: Math.max(0, Number(info.vipType) || 0),
     svipLevel: Math.max(0, Number(info.svipLevel) || 0),
     vipLevel: String(info.vipLevel || "none").slice(0, 16),
@@ -1000,7 +1060,7 @@ function normalizeKugouTrack(raw) {
       name: String(raw?.name || "未命名歌曲").slice(0, 160),
       artist: String(raw?.artist || "").slice(0, 160),
       album: String(raw?.album || "").slice(0, 160),
-      cover: safeHttpsImage(raw?.cover),
+      cover: safeProviderImage(raw?.cover),
       duration: Math.max(0, Number(raw?.duration) || 0),
       qualities: QUALITY_LEVELS.filter((quality) => Boolean(qualityHashes[quality])),
     },
@@ -1126,7 +1186,7 @@ export async function createMusicApi({
         loggedIn: true,
         userId: info.userId,
         nickname: cleanPublicText(info.nickname, 80),
-        avatar: safeHttpsImage(info.avatar),
+        avatar: safeProviderImage(info.avatar),
       },
       playlists,
     };
@@ -1525,7 +1585,6 @@ export async function createMusicApi({
             cookie: userCookie || undefined,
           });
         } catch {
-          streamUrls.delete(`${providerName}:${sourceId}:${fallbackQuality}`);
           continue;
         }
       }
@@ -1691,27 +1750,44 @@ export async function createMusicApi({
       sendJson(req, res, 400, { error: "invalid_cover_url" });
       return;
     }
-    const upstream = await fetchProviderStream(
-      fetchImpl,
-      validateStreamUrl,
-      target,
-      {
-        headers: {
-          Accept: "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8",
-          "User-Agent": "MR-ROOM/1.0",
-        },
+    const requestInit = {
+      headers: {
+        Accept: "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8",
+        "User-Agent": "MR-ROOM/1.0",
       },
-      0,
-      streamConnectTimeoutMs,
-    );
-    if (!upstream.ok || !upstream.body) {
+    };
+    let upstream;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        upstream = await fetchProviderStream(
+          fetchImpl,
+          validateStreamUrl,
+          target,
+          requestInit,
+          0,
+          streamConnectTimeoutMs,
+        );
+      } catch (error) {
+        if (attempt === 0 && retryableCoverFetchError(error)) continue;
+        throw error;
+      }
+      if (attempt === 0 && RETRYABLE_COVER_STATUSES.has(upstream.status)) {
+        await discardUpstream(upstream);
+        continue;
+      }
+      break;
+    }
+    if (!upstream?.ok || !upstream.body) {
       await discardUpstream(upstream);
       throw Object.assign(new Error("provider_cover_failed"), { statusCode: 502 });
     }
-    const contentType = String(upstream.headers.get("content-type") || "")
+    const upstreamContentType = String(upstream.headers.get("content-type") || "")
       .split(";")[0]
       .trim()
       .toLowerCase();
+    const contentType = upstreamContentType === "image/jpg"
+      ? "image/jpeg"
+      : upstreamContentType;
     if (!new Set([
       "image/avif",
       "image/gif",
@@ -2257,7 +2333,7 @@ export async function createMusicApi({
             provider: "kugou",
             id: String(item?.id || "").slice(0, 64),
             name: String(item?.name || "酷狗歌单").slice(0, 160),
-            cover: safeHttpsImage(item?.cover),
+            cover: safeProviderImage(item?.cover),
             trackCount: Math.max(0, Number(item?.trackCount) || 0),
           }))
           .filter((item) => PLAYLIST_ID_RE.test(item.id));

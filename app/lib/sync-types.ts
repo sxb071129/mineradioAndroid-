@@ -13,6 +13,23 @@ export type TrackDescriptor = {
 
 export type PlaybackQuality = "jymaster" | "hires" | "lossless" | "exhigh" | "standard";
 
+export const ROOM_SYNC_PROTOCOL_VERSION = 3;
+
+export type RoomSyncCapabilities = {
+  bufferContract: true;
+  armedPlayback: true;
+};
+
+export type RoomJoinMessage = {
+  type: "join";
+  room: string;
+  name: string;
+  protocolVersion?: number;
+  capabilities?: Partial<RoomSyncCapabilities>;
+};
+
+export type RoomCommitState = "" | "tentative" | "committed";
+
 export type RoomBufferState =
   | ""
   | "loading"
@@ -26,8 +43,11 @@ export type RoomDeviceState = {
   clientId: string;
   name: string;
   leader: boolean;
+  protocolVersion: number;
+  strictParticipant: boolean;
   participant: boolean;
   ready: boolean;
+  armed: boolean;
   prepared: boolean;
   blocked: boolean;
   bufferedSeconds: number;
@@ -44,18 +64,25 @@ export type RoomDeviceState = {
 };
 
 export type RoomState = {
+  protocolVersion: number;
+  strictSync: boolean;
   revision: number;
   track: TrackDescriptor | null;
   playing: boolean;
   preparing: boolean;
   prepareId: string;
   prepareError: "" | "timeout" | "start_failed";
+  commitId: string;
+  commitState: RoomCommitState;
   scheduledAt: number;
   readyCount: number;
   requiredCount: number;
+  armedCount: number;
+  strictRequiredCount: number;
   bufferProgress: number;
   prepareDeadline: number;
   prepareMaxDeadline: number;
+  commitDeadline: number;
   prepareErrorClientIds: string[];
   position: number;
   volume: number;
@@ -100,7 +127,22 @@ export type RoomCommand =
       volumeTrimDb?: number;
       delayMs?: number;
     }
-  | { action: "start-failed"; prepareId: string }
+  | {
+      action: "armed";
+      prepareId: string;
+      commitId: string;
+      armed?: boolean;
+      bufferedSeconds?: number;
+      bufferGoalSeconds?: number;
+      bufferState?: RoomBufferState;
+      latencyMs?: number;
+      jitterMs?: number;
+      driftMs?: number;
+      quality?: PlaybackQuality;
+      volumeTrimDb?: number;
+      delayMs?: number;
+    }
+  | { action: "start-failed"; prepareId: string; commitId?: string }
   | {
       action: "device-calibration";
       targetClientId: string;

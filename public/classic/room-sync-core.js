@@ -1,8 +1,13 @@
 (function installMineradioRoomSyncCore(root) {
   "use strict";
 
-  var DEFAULT_BUFFER_GOAL_SECONDS = 8;
-  var MAX_BUFFER_GOAL_SECONDS = 16;
+  // Four seconds is enough runway for a LAN stream without making every
+  // device wait for the old eight-to-sixteen second window. Slower links still
+  // receive a larger, bounded goal from their measured latency and jitter.
+  var DEFAULT_BUFFER_GOAL_SECONDS = 4;
+  var MAX_BUFFER_GOAL_SECONDS = 8;
+  var DEFAULT_LAUNCH_GOAL_SECONDS = 0.75;
+  var MAX_LAUNCH_GOAL_SECONDS = 2;
 
   function finiteNumber(value, fallback) {
     var number = Number(value);
@@ -19,11 +24,33 @@
     var duration = finiteNumber(input.duration, Number.POSITIVE_INFINITY);
     var latencyMs = clamp(input.latencyMs, 0, 5000);
     var jitterMs = clamp(input.jitterMs, 0, 1000);
-    var networkAllowance = Math.min(8, latencyMs / 250 + jitterMs / 125);
+    var networkAllowance = Math.min(4, latencyMs / 800 + jitterMs / 250);
     var desired = clamp(
       DEFAULT_BUFFER_GOAL_SECONDS + networkAllowance,
       DEFAULT_BUFFER_GOAL_SECONDS,
       MAX_BUFFER_GOAL_SECONDS
+    );
+    desired = Math.round(desired * 4) / 4;
+    if (Number.isFinite(duration)) {
+      desired = Math.min(desired, Math.max(0, duration - target));
+    }
+    return desired;
+  }
+
+  function adaptiveLaunchGoal(options) {
+    var input = options || {};
+    var target = Math.max(0, finiteNumber(input.target, 0));
+    var duration = finiteNumber(input.duration, Number.POSITIVE_INFINITY);
+    var latencyMs = clamp(input.latencyMs, 0, 5000);
+    var jitterMs = clamp(input.jitterMs, 0, 1000);
+    var networkAllowance = Math.min(
+      MAX_LAUNCH_GOAL_SECONDS - DEFAULT_LAUNCH_GOAL_SECONDS,
+      latencyMs / 2000 + jitterMs / 500
+    );
+    var desired = clamp(
+      DEFAULT_LAUNCH_GOAL_SECONDS + networkAllowance,
+      DEFAULT_LAUNCH_GOAL_SECONDS,
+      MAX_LAUNCH_GOAL_SECONDS
     );
     desired = Math.round(desired * 4) / 4;
     if (Number.isFinite(duration)) {
@@ -75,11 +102,42 @@
     };
   }
 
+  // The full preparation contract above guarantees that data has arrived
+  // before the relay commits. Immediately before the scheduled play call we
+  // only need to prove that a safe audible runway remains; asking for the full
+  // preparation goal again caused Edge and tablet browsers to revoke a valid
+  // commit after their paused media pipeline stopped read-ahead.
+  function measureLaunchWindow(media, target, network) {
+    var input = network || {};
+    var duration = media ? finiteNumber(media.duration, Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
+    var point = Math.max(0, finiteNumber(target, 0));
+    var bufferGoalSeconds = adaptiveLaunchGoal({
+      target: point,
+      duration: duration,
+      latencyMs: input.latencyMs,
+      jitterMs: input.jitterMs
+    });
+    var bufferedSeconds = bufferedSecondsAt(media, point);
+    var bufferProgress = bufferGoalSeconds <= 0.08
+      ? 1
+      : clamp(bufferedSeconds / bufferGoalSeconds, 0, 1);
+    return {
+      bufferedSeconds: bufferedSeconds,
+      bufferGoalSeconds: bufferGoalSeconds,
+      bufferProgress: bufferProgress,
+      ready: bufferGoalSeconds <= 0.08 || bufferedSeconds + 0.05 >= bufferGoalSeconds
+    };
+  }
+
   root.MineradioRoomSyncCore = Object.freeze({
     DEFAULT_BUFFER_GOAL_SECONDS: DEFAULT_BUFFER_GOAL_SECONDS,
     MAX_BUFFER_GOAL_SECONDS: MAX_BUFFER_GOAL_SECONDS,
+    DEFAULT_LAUNCH_GOAL_SECONDS: DEFAULT_LAUNCH_GOAL_SECONDS,
+    MAX_LAUNCH_GOAL_SECONDS: MAX_LAUNCH_GOAL_SECONDS,
     adaptiveBufferGoal: adaptiveBufferGoal,
+    adaptiveLaunchGoal: adaptiveLaunchGoal,
     bufferedSecondsAt: bufferedSecondsAt,
-    measureBufferedWindow: measureBufferedWindow
+    measureBufferedWindow: measureBufferedWindow,
+    measureLaunchWindow: measureLaunchWindow
   });
 })(typeof globalThis !== "undefined" ? globalThis : this);
